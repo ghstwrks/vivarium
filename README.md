@@ -114,6 +114,21 @@ volume by name as a fallback, and once that fallback is confirmed to work
 unaided this can return to `false`. Either way the value used is recorded in
 `run.json`, and `--no-auto-login` selects the plan's original behaviour.
 
+### Guest discovery leads with the DHCP lease database, not ARP
+
+The plan orders discovery ARP first. In practice `arp -a` enumerates the local
+network, which macOS gates behind Local Network privacy: an interactive shell
+inherits the terminal's grant, but this binary has none, and denial is silent —
+exit 0, no output, empty stderr, indistinguishable from an empty cache. A CLI
+cannot raise the approval prompt, so the strategy contributes nothing on a
+stock host.
+
+Discovery therefore leads with `/var/db/dhcpd_leases`, written by the DHCP
+server behind Virtualization's NAT. It is world-readable, needs no permission,
+and maps the bundle's persisted MAC straight to an address. ARP remains as a
+second strategy for hosts where the permission has been granted, and Bonjour
+last, confined to the NAT bridge subnet.
+
 ### The template digest covers four files, not the bundle
 
 `template.json` records a SHA-256 over `AuxiliaryStorage`, `HardwareModel`,

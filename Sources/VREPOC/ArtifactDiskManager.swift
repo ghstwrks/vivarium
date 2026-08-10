@@ -55,10 +55,59 @@ enum ArtifactDiskManager {
             throw error
         }
 
+        do {
+            try await makeGuestWritable(wholeDisk: device, volumeName: volumeName)
+        } catch {
+            await DiskUtil.ejectQuietly(deviceIdentifier: device)
+            throw error
+        }
+
         // `partitionDisk` mounts the new volume; detach it so the image is free
         // for the VM to claim.
         try await DiskUtil.eject(deviceIdentifier: device, stage: .bundlePreparation)
         log.info("Artifact disk ready at \(paths.artifactDisk.path) with volume \(volumeName).")
+    }
+
+    /// Opens the new volume's root to the guest's provisioned account.
+    ///
+    /// `diskutil` creates an APFS volume root owned by `root:wheel` with mode
+    /// 0775. The provisioned guest account is in `staff` and `admin` but not
+    /// `wheel`, so it lands on the `other` bits and cannot write — the guest
+    /// mounts the volume with ownership enforced, and the acceptance script
+    /// fails its `test -w` before writing anything. Observed as an acceptance
+    /// command exiting 1 with no output at all, since `set -eu` makes a failed
+    /// `test` silent.
+    ///
+    /// The host can fix this without privileges only because it mounts
+    /// image-backed volumes `noowners`, which is exactly the difference that
+    /// made the failure confusing: the same directory is writable from the host
+    /// and not from the guest. The mode is stored on disk, so the guest honours
+    /// it.
+    ///
+    /// 1777 rather than 0777: the sticky bit keeps one account from deleting
+    /// another's marker, which costs nothing and preserves the meaning of a
+    /// marker found later.
+    private static func makeGuestWritable(wholeDisk device: String, volumeName: String) async throws {
+        let volume = try await DiskUtil.apfsVolume(
+            onWholeDisk: device,
+            named: volumeName,
+            stage: .bundlePreparation
+        )
+
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o1777))],
+                ofItemAtPath: volume.mountPoint
+            )
+        } catch {
+            throw POCError(
+                .bundlePreparation,
+                "Could not make \(volume.mountPoint) writable by the guest.",
+                underlying: error,
+                inspectionHints: ["ls -ld \(volume.mountPoint)"]
+            )
+        }
+        log.debug("Set mode 1777 on \(volume.mountPoint) so the guest account can write to it.")
     }
 
     /// Creates a sparse file of the target size.

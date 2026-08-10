@@ -49,10 +49,29 @@ enum AcceptanceScript {
         fi
 
         # Assert on the real mounts rather than trusting that they appeared.
-        test -d "$share"
-        test -w "$share"
-        test -d "$artifact"
-        test -w "$artifact"
+        #
+        # Each check reports which one failed and exits a distinct status. A
+        # bare `test` under `set -e` exits 1 with nothing on either stream,
+        # which is indistinguishable from the script never running at all — the
+        # exact ambiguity that made an unwritable artifact volume look like a
+        # broken harness.
+        require_writable_directory() {
+            label=$1
+            path=$2
+            if [ ! -d "$path" ]; then
+                printf 'acceptance: the %s directory is missing: %s\\n' "$label" "$path" >&2
+                exit 10
+            fi
+            if [ ! -w "$path" ]; then
+                printf 'acceptance: the %s directory is not writable by %s: %s\\n' \\
+                    "$label" "$(/usr/bin/id -un)" "$path" >&2
+                /bin/ls -ld "$path" >&2 || true
+                exit 11
+            fi
+        }
+
+        require_writable_directory share "$share"
+        require_writable_directory artifact "$artifact"
 
         printf '%s\\n' "$marker" > "$share/vre-result.txt"
         printf '%s\\n' "$marker" > "$artifact/vre-result.txt"

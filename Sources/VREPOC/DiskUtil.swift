@@ -178,6 +178,67 @@ enum DiskUtil {
         )
     }
 
+    /// Locates the single APFS volume created on a freshly partitioned image.
+    ///
+    /// Resolved by following the image's own partition to its container rather
+    /// than by asking `diskutil` for the volume name: names are not unique
+    /// across attached disks, and this result is used to change permissions, so
+    /// picking a same-named volume belonging to something else would be a
+    /// destructive mistake. The name is still checked, as an assertion that the
+    /// chain led where it was supposed to.
+    static func apfsVolume(
+        onWholeDisk deviceIdentifier: String,
+        named expectedVolumeName: String,
+        stage: POCStage
+    ) async throws -> (deviceIdentifier: String, mountPoint: String) {
+        let partition = "\(deviceIdentifier)s1"
+        let partitionInfo = try await infoPlist(deviceIdentifier: partition, stage: stage)
+        guard let container = partitionInfo["APFSContainerReference"] as? String,
+              !container.isEmpty else {
+            throw POCError(
+                stage,
+                "\(partition) reports no APFS container reference.",
+                inspectionHints: ["diskutil info \(partition)"]
+            )
+        }
+
+        let volume = "\(container)s1"
+        let volumeInfo = try await infoPlist(deviceIdentifier: volume, stage: stage)
+        guard let name = volumeInfo["VolumeName"] as? String, name == expectedVolumeName else {
+            throw POCError(
+                stage,
+                "\(volume) is named \(volumeInfo["VolumeName"] as? String ?? "<none>"), "
+                    + "not \(expectedVolumeName).",
+                inspectionHints: ["diskutil list \(container)"]
+            )
+        }
+        guard let mountPoint = volumeInfo["MountPoint"] as? String, !mountPoint.isEmpty else {
+            throw POCError(
+                stage,
+                "\(volume) (\(expectedVolumeName)) is not mounted.",
+                inspectionHints: ["diskutil info \(volume)"]
+            )
+        }
+        return (volume, mountPoint)
+    }
+
+    private static func infoPlist(
+        deviceIdentifier: String,
+        stage: POCStage
+    ) async throws -> [String: Any] {
+        let result = try await ProcessRunner.runChecked(
+            executable, ["info", "-plist", deviceIdentifier],
+            timeout: .seconds(60),
+            stage: stage
+        )
+        guard let plist = try? PropertyListSerialization.propertyList(
+            from: result.stdout, options: [], format: nil
+        ) as? [String: Any] else {
+            throw POCError(stage, "Could not parse `diskutil info -plist \(deviceIdentifier)`.")
+        }
+        return plist
+    }
+
     /// Ejects a device, retrying while the resource is still busy.
     ///
     /// A disk image released by the Virtualization framework moments earlier is
