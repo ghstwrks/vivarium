@@ -620,7 +620,7 @@ final class Orchestrator {
 
             The guest is still running — \(reason)
               guest    \(credentials.username)@\(address)
-              run      \(paths.root.path)
+              run      \(layout?.root.path ?? paths.root.path)
 
             The password is generated per run and lives only in this process's \
             memory: it is never printed, logged, or written down, so there is no \
@@ -631,6 +631,11 @@ final class Orchestrator {
             with nothing flushed — and cleans nothing up. The run directory is \
             left exactly as it is, for `viv gc` later.
             """)
+        // Flushed by hand: this process is about to block until someone
+        // interrupts it, and stdout redirected to a file or a pipe is
+        // block-buffered — the instructions for the wait would arrive after the
+        // wait ended, which is no use to the person waiting.
+        fflush(stdout)
 
         signal(SIGINT, SIG_IGN)
         let resumed = AtomicFlag()
