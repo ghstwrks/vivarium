@@ -159,7 +159,12 @@ struct GuestAddressResolver: Sendable {
             await withTaskGroup(of: Void.self) { group in
                 var running = 0
                 for host in hosts {
-                    if running >= 32 {
+                    // Each subprocess parks two threads on the global concurrent
+                    // queue for its lifetime, one per pipe. At 32 in flight that
+                    // is 64 threads — libdispatch's default pool limit exactly,
+                    // leaving nothing for the reads to complete on. A /24 still
+                    // primes in under ten seconds at this width.
+                    if running >= 12 {
                         await group.next()
                         running -= 1
                     }

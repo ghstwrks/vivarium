@@ -111,6 +111,13 @@ enum ProcessRunner {
             stdinPipe = nil
         }
 
+        // Installed before `run()`, never after. Foundation delivers termination
+        // exactly once, and a handler attached afterwards races the child: a
+        // short-lived process can exit first, and the notification is then lost
+        // with nothing left to wake the waiter.
+        let exited = TerminationLatch()
+        process.terminationHandler = { _ in exited.signal() }
+
         do {
             try process.run()
         } catch {
@@ -134,7 +141,7 @@ enum ProcessRunner {
         async let stdoutData = readToEnd(stdoutPipe.fileHandleForReading)
         async let stderrData = readToEnd(stderrPipe.fileHandleForReading)
 
-        let timedOut = await waitForExit(process, timeout: timeout)
+        let timedOut = await waitForExit(process, exited: exited, timeout: timeout)
 
         let out = await stdoutData
         let err = await stderrData
@@ -192,17 +199,24 @@ enum ProcessRunner {
         }
     }
 
+    /// Applied whenever a caller passes no timeout of its own.
+    ///
+    /// Every subprocess this POC runs is a quick query or a `diskutil`
+    /// operation measured in seconds. An unbounded wait has no legitimate use
+    /// here and turns any surprise into a run that hangs until someone notices.
+    static let defaultTimeout = Duration.seconds(600)
+
     /// Waits for the process, terminating it if `timeout` elapses first.
     /// Returns whether the timeout fired.
-    private static func waitForExit(_ process: Process, timeout: Duration?) async -> Bool {
-        guard let timeout else {
-            await blockingWait(process)
-            return false
-        }
-
+    private static func waitForExit(
+        _ process: Process,
+        exited: TerminationLatch,
+        timeout: Duration?
+    ) async -> Bool {
+        let deadline = timeout ?? defaultTimeout
         let didTimeOut = AtomicFlag()
         let killer = Task {
-            try await Task.sleep(for: timeout)
+            try await Task.sleep(for: deadline)
             guard process.isRunning else { return }
             didTimeOut.set()
             log.warn("Process \(process.processIdentifier) exceeded its timeout; sending SIGTERM.")
@@ -213,16 +227,48 @@ enum ProcessRunner {
             kill(process.processIdentifier, SIGKILL)
         }
 
-        await blockingWait(process)
+        await exited.wait()
         killer.cancel()
         return didTimeOut.value
     }
+}
 
-    private static func blockingWait(_ process: Process) async {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                process.waitUntilExit()
+/// A one-shot gate between Foundation's termination callback and the waiting
+/// task.
+///
+/// This replaces `Process.waitUntilExit()`, which is a run-loop poll performed
+/// on whichever thread calls it. If the child exits before that thread has
+/// installed its wakeup source the event is lost and the thread blocks in
+/// `mach_msg` forever — observed here as a run that sat in address discovery
+/// for over two hours with no child process alive, no pipes open, and a
+/// ten-minute timeout that could never fire because it is only evaluated
+/// between loop iterations. Being edge-triggered by the termination handler
+/// rather than polling removes the race: `signal()` is safe whether it lands
+/// before or after `wait()`.
+final class TerminationLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hasExited = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func signal() {
+        lock.lock()
+        guard !hasExited else { return lock.unlock() }
+        hasExited = true
+        let waiter = continuation
+        continuation = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if hasExited {
+                lock.unlock()
                 continuation.resume()
+            } else {
+                self.continuation = continuation
+                lock.unlock()
             }
         }
     }

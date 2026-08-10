@@ -40,6 +40,10 @@ enum Timeouts {
     static let installation = Duration.seconds(90 * 60)
     static let firstBoot = Duration.seconds(15 * 60)
     static let addressDiscovery = Duration.seconds(10 * 60)
+    /// The ceiling on a *single* poll attempt, as distinct from the budget for
+    /// all of them. An attempt that overruns it is abandoned and retried, so a
+    /// stuck one costs an interval instead of the whole run.
+    static let discoveryAttempt = Duration.seconds(5 * 60)
     static let sshReadiness = Duration.seconds(10 * 60)
     static let acceptanceCommand = Duration.seconds(120)
     static let gracefulShutdown = Duration.seconds(5 * 60)
@@ -578,7 +582,15 @@ final class POCOrchestrator {
 
         while ContinuousClock.now < deadline {
             attempt += 1
-            let candidates = await resolver.candidates()
+            guard let candidates = await withTimeout(Timeouts.discoveryAttempt, operation: {
+                await resolver.candidates()
+            }) else {
+                log.warn(
+                    "Attempt \(attempt) did not finish within \(Timeouts.discoveryAttempt); "
+                        + "abandoning it and retrying."
+                )
+                continue
+            }
             if let best = candidates.first {
                 log.info("Guest address \(best.address) found by \(best.strategy) after \(attempt) attempts.")
                 manifest.guestAddress = best.address
@@ -598,7 +610,11 @@ final class POCOrchestrator {
             // which can only ever produce candidates.
             if attempt >= 2 {
                 log.debug("No ARP entry for \(manifest.macAddress) yet; priming the ARP cache.")
-                await resolver.primeARPCache()
+                if await withTimeout(Timeouts.discoveryAttempt, operation: {
+                    await resolver.primeARPCache()
+                }) == nil {
+                    log.warn("ARP priming did not finish within \(Timeouts.discoveryAttempt).")
+                }
             }
 
             log.debug("Attempt \(attempt): no address for \(manifest.macAddress) yet.")
@@ -644,10 +660,24 @@ final class POCOrchestrator {
             }
             lastReadinessGate = "TCP 22 accepted a connection"
 
-            let result = try await ssh.run(
-                remoteCommand: AcceptanceScript.readinessCommand,
-                timeout: .seconds(30)
-            )
+            let attempted = await withTimeout(Timeouts.discoveryAttempt) { () -> Result<SSHResult, any Error> in
+                do {
+                    return .success(
+                        try await ssh.run(
+                            remoteCommand: AcceptanceScript.readinessCommand,
+                            timeout: .seconds(30)
+                        )
+                    )
+                } catch {
+                    return .failure(error)
+                }
+            }
+            guard let attempted else {
+                lastReason = "the readiness probe did not return within \(Timeouts.discoveryAttempt)"
+                log.warn("Readiness attempt \(attempt): \(lastReason); retrying.")
+                continue
+            }
+            let result = try attempted.get()
 
             switch result.outcome {
             case let .remoteExit(code) where code == 0:
