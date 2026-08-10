@@ -97,6 +97,11 @@ struct VivError: Error, CustomStringConvertible, Sendable {
         if let pocError = error as? VivError {
             return pocError.description
         }
+        if let wrapper = error as? InfrastructureFailure {
+            // The wrapper says how to exit, not what went wrong; the operator
+            // gets the error that actually happened.
+            return describe(wrapper.underlying)
+        }
         let nsError = error as NSError
         var text = "\(nsError.domain) code \(nsError.code): \(nsError.localizedDescription)"
         if let failureReason = nsError.localizedFailureReason {
@@ -107,6 +112,26 @@ struct VivError: Error, CustomStringConvertible, Sendable {
         }
         return text
     }
+}
+
+/// An error that is Vivarium's own failure, whatever stage it names.
+///
+/// `viv run` promises exit 1 for exactly one thing: the user's test command
+/// failing or running out of time. That verdict always arrives as a report and
+/// never as an error, so everything the run pipeline *throws* — a guest that
+/// never took a DHCP lease, a share that did not mount, an SSH session that
+/// would not open — is Vivarium failing to reach the question rather than an
+/// answer to it, and exits 70. Wrapping is how `run` says so without changing
+/// what `selftest` means by the same errors: there, the guest's behaviour is
+/// the result under test, so `VivStage.describesGuestBehaviour` still decides.
+struct InfrastructureFailure: Error, CustomStringConvertible {
+    let underlying: any Error
+
+    init(_ underlying: any Error) {
+        self.underlying = underlying
+    }
+
+    var description: String { VivError.describe(underlying) }
 }
 
 /// A machine-readable record of a failed run, written next to the run's other

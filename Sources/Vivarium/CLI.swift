@@ -61,6 +61,13 @@ enum ExitStatus {
     /// `EX_SOFTWARE`: Vivarium could not do its job.
     static let infrastructure: Int32 = 70
 
+    /// Classifies a thrown error.
+    ///
+    /// Stage-based, because for `selftest` — the one command whose subject *is*
+    /// the guest — a guest that would not boot or answer SSH is the finding,
+    /// not a tooling fault. `run` means the opposite by the same errors and
+    /// says so by wrapping them in `InfrastructureFailure`, which lands on the
+    /// default below with everything else Vivarium could not do.
     static func of(_ error: any Error) -> Int32 {
         guard let vivError = error as? VivError else { return infrastructure }
         return vivError.stage.describesGuestBehaviour ? testFailure : infrastructure
@@ -467,8 +474,17 @@ struct RunCommand: AsyncParsableCommand {
         // which exists to prove the disk path works, still asks for it.
         options.includesArtifactDisk = false
 
-        let report = try await withOrchestrator(options) { orchestrator in
-            try await orchestrator.runTest(plan: plan)
+        let report: TestRunReport
+        do {
+            report = try await withOrchestrator(options) { orchestrator in
+                try await orchestrator.runTest(plan: plan)
+            }
+        } catch {
+            // Exit 1 belongs to the test command alone, and the test command's
+            // verdict is in the report below. Anything thrown out of the
+            // pipeline — including a guest that misbehaved — means Vivarium
+            // never got to ask, which CI must not read as "your tests failed".
+            throw InfrastructureFailure(error)
         }
 
         print("")
