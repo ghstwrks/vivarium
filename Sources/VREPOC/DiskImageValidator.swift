@@ -206,25 +206,46 @@ enum DiskImageValidator {
     }
 
     /// Finds the APFS volume whose role is Data.
+    ///
+    /// Roles come from `diskutil apfs list`, not from `diskutil info`. An
+    /// earlier version asked `diskutil info -plist` for `APFSVolumeRoles` on
+    /// each volume in turn; that key is simply absent from `info` output, so
+    /// the search silently found nothing and reported "No APFS Data volume
+    /// found" while `disk23s5` sat in the very device list printed alongside
+    /// the error. `diskutil apfs list -plist` reports a `Roles` array per
+    /// volume, and does it for every container in one call.
+    ///
+    /// Matching stays keyed on role rather than on the name: the name is
+    /// localised, and the Signed System Volume must not be the one opened.
+    /// Candidates are restricted to the devices this attachment produced —
+    /// `apfs list` also enumerates the *host's* disks, and its Data volume
+    /// would otherwise be a perfectly plausible match for a marker search.
     private static func findAPFSDataVolume(
         among attachment: DiskAttachment,
         stage: POCStage
     ) async throws -> DiskSystemEntity? {
-        for entity in attachment.entities where entity.contentHint == "Apple_APFS_Volume" {
-            let result = try? await ProcessRunner.run(
-                DiskUtil.executable, ["info", "-plist", entity.deviceIdentifier],
-                timeout: .seconds(60),
-                stage: stage
-            )
-            guard let result, result.succeeded,
-                  let plist = try? PropertyListSerialization.propertyList(
-                      from: result.stdout, options: [], format: nil
-                  ) as? [String: Any] else { continue }
+        let result = try await ProcessRunner.runChecked(
+            DiskUtil.executable, ["apfs", "list", "-plist"],
+            timeout: .seconds(120),
+            stage: stage,
+            inspectionHints: ["diskutil apfs list"]
+        )
+        guard let plist = try? PropertyListSerialization.propertyList(
+            from: result.stdout, options: [], format: nil
+        ) as? [String: Any],
+            let containers = plist["Containers"] as? [[String: Any]] else {
+            throw POCError(stage, "Could not parse `diskutil apfs list -plist`.")
+        }
 
-            // APFSVolumeRoles is an array of role strings; "Data" identifies
-            // the writable half of a macOS system volume group.
-            if let roles = plist["APFSVolumeRoles"] as? [String], roles.contains("Data") {
-                return entity
+        let attached = Set(attachment.allDeviceIdentifiers)
+        for container in containers {
+            guard let volumes = container["Volumes"] as? [[String: Any]] else { continue }
+            for volume in volumes {
+                guard let identifier = volume["DeviceIdentifier"] as? String,
+                      attached.contains(identifier),
+                      let roles = volume["Roles"] as? [String],
+                      roles.contains("Data") else { continue }
+                return attachment.entities.first { $0.deviceIdentifier == identifier }
             }
         }
         return nil

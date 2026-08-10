@@ -22,6 +22,19 @@ enum RestoreImageManager {
     /// Assistant, which no acceptance criterion can satisfy.
     static let minimumGuestMajorVersion = 27
 
+    /// Whether a recorded `major.minor.patch` string clears the version gate.
+    ///
+    /// Used by the runs that do not perform an install — a template clone or an
+    /// adopted bundle — to answer the same acceptance criterion from what the
+    /// install recorded, since `load(ipsw:)` enforced it at the time. An unknown
+    /// or unparsable version is not a pass.
+    static func satisfiesGuestVersionGate(_ version: String?) -> Bool {
+        guard let major = version?.split(separator: ".").first.flatMap({ Int($0) }) else {
+            return false
+        }
+        return major >= minimumGuestMajorVersion
+    }
+
     /// Loads a local IPSW and applies the version gate.
     ///
     /// The gate runs before anything expensive so that pointing the tool at the

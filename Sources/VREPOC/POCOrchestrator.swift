@@ -424,6 +424,12 @@ final class POCOrchestrator {
         manifest.restoreImageVersion = templateManifest.ipswVersion
         manifest.cpuCount = VMConfigurationFactory.computeCPUCount()
         manifest.memorySizeBytes = VMConfigurationFactory.computeMemorySize()
+        // The version gate was enforced when the template was installed, and
+        // `materialize` has just checked this clone against that build. Leaving
+        // the criterion at its `false` default would fail an otherwise perfect
+        // run for a check that did happen, only in an earlier process.
+        report.restoreImageVerifiedAsMacOS27OrLater =
+            RestoreImageManager.satisfiesGuestVersionGate(templateManifest.ipswVersion)
         report.installSucceeded = true
         try manifest.write(to: paths.runManifest)
     }
@@ -442,8 +448,7 @@ final class POCOrchestrator {
         manifest = try RunManifest.read(from: paths.runManifest)
         report = RunReport.empty(runID: manifest.runID)
         report.restoreImageVerifiedAsMacOS27OrLater =
-            (manifest.restoreImageVersion?.split(separator: ".").first).flatMap { Int($0) }
-                .map { $0 >= RestoreImageManager.minimumGuestMajorVersion } ?? false
+            RestoreImageManager.satisfiesGuestVersionGate(manifest.restoreImageVersion)
         report.installSucceeded = true
 
         // A password is generated per run and never persisted, so a bundle
