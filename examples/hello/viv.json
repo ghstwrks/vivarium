@@ -1,0 +1,6 @@
+{
+  "name": "hello",
+  "test": "sh test.sh",
+  "artifacts": ["logs/**/*"],
+  "env": { "GREETING": "hello from viv.json" }
+}
