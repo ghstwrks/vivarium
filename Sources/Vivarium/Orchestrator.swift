@@ -1022,9 +1022,8 @@ final class Orchestrator {
         }
 
         if primarySucceeded {
-            try confirmStopped(machine)
+            try await confirmStoppedOrForce(machine)
             report.gracefulGuestStopObserved = true
-            releaseRunVM()
             return
         }
 
@@ -1040,9 +1039,8 @@ final class Orchestrator {
         }
 
         if fallbackSucceeded {
-            try confirmStopped(machine)
+            try await confirmStoppedOrForce(machine)
             report.gracefulGuestStopObserved = true
-            releaseRunVM()
             return
         }
 
@@ -1114,6 +1112,26 @@ final class Orchestrator {
             log.warn("The guest had not stopped after \(timeout).")
             return false
         }
+    }
+
+    /// Confirms the guest reached `.stopped`, and lets go of it either way.
+    ///
+    /// A confirmation that throws used to leave the machine object alive with
+    /// the disk images still open. `viv run` demotes a shutdown error to a
+    /// warning on a report it has already earned, and then deletes the bundle —
+    /// out from under a guest that, by the definition of this failure, might
+    /// still be running on it. So anything not verifiably stopped is stopped by
+    /// force before the error travels: the caller was asking for a stop, and
+    /// this is the one that cannot be refused.
+    private func confirmStoppedOrForce(_ machine: VZVirtualMachine) async throws {
+        do {
+            try confirmStopped(machine)
+        } catch {
+            log.warn("The guest is not verifiably stopped; forcing it. \(VivError.describe(error))")
+            await forceStopForCleanup()
+            throw error
+        }
+        releaseRunVM()
     }
 
     private func confirmStopped(_ machine: VZVirtualMachine) throws {
