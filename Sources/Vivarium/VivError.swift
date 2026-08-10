@@ -10,10 +10,18 @@ enum VivStage: String, Codable, Sendable {
     case installation
     case templateSnapshot
     case runConfiguration
+    /// Copying the user's project into the run's share, before any guest
+    /// exists. Vivarium's own job, and never the test's fault.
+    case codeStaging
     case provisioning
     case addressDiscovery
     case sshReadiness
     case sshCommand
+    /// Running the user's test command in the guest. A failure here is a
+    /// statement about the test or the guest it ran in.
+    case testExecution
+    /// Collecting what the test produced and getting it back to the host.
+    case harvest
     case guestShutdown
     case virtioFSValidation
     case artifactAttach
@@ -35,10 +43,10 @@ enum VivStage: String, Codable, Sendable {
     var describesGuestBehaviour: Bool {
         switch self {
         case .preflight, .bundlePreparation, .restoreImage, .installation,
-             .templateSnapshot, .runConfiguration, .cleanup:
+             .templateSnapshot, .runConfiguration, .codeStaging, .harvest, .cleanup:
             return false
         case .provisioning, .addressDiscovery, .sshReadiness, .sshCommand,
-             .guestShutdown, .virtioFSValidation, .artifactAttach,
+             .testExecution, .guestShutdown, .virtioFSValidation, .artifactAttach,
              .artifactValidation, .acceptance:
             return true
         }

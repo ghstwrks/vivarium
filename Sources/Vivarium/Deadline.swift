@@ -19,6 +19,13 @@ import Foundation
 /// it returns. Every subprocess Vivarium spawns is bounded by
 /// `ProcessRunner.defaultTimeout`, so such a thread is temporary rather than
 /// permanent, and the caller resumes either way.
+extension Duration {
+    /// Seconds as a `Double`, for reports and log lines.
+    var elapsedSeconds: Double {
+        Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
+}
+
 func withTimeout<T: Sendable>(
     _ timeout: Duration,
     operation: @escaping @Sendable () async -> T
