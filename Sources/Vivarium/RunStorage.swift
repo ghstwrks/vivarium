@@ -57,28 +57,41 @@ enum RunStorage {
         return kibibytes * 1024
     }
 
-    /// Clears `uchg`/`schg` and restores owner write permission across the
-    /// tree, which is what a failed `removeItem` is almost always about.
+    /// Clears `uchg`/`schg` and restores owner access across the tree, which is
+    /// what a failed `removeItem` is almost always about.
+    ///
+    /// A directory is given read and search permission as well as write,
+    /// because deleting one means listing it first: macOS creates a `.Trashes`
+    /// on every volume the guest mounts, mode `d-wx--x--t`, which neither the
+    /// enumerator below nor `removeItem` can descend into until it is readable.
+    /// Each entry is fixed as it is visited rather than afterwards, so that
+    /// making a directory readable is what allows its children to be reached.
     private static func clearRemovalObstacles(at url: URL) {
         let manager = FileManager.default
-        var targets = [url]
-        if let enumerator = manager.enumerator(
-            at: url,
-            includingPropertiesForKeys: nil,
-            options: []
-        ) {
-            targets.append(contentsOf: enumerator.compactMap { $0 as? URL })
-        }
+        relax(url)
 
-        for target in targets {
-            _ = try? manager.setAttributes([.immutable: false], ofItemAtPath: target.path)
-            guard let attributes = try? manager.attributesOfItem(atPath: target.path),
-                  let permissions = attributes[.posixPermissions] as? NSNumber else { continue }
-            let writable = permissions.uint16Value | 0o200
-            _ = try? manager.setAttributes(
-                [.posixPermissions: NSNumber(value: writable)],
-                ofItemAtPath: target.path
-            )
+        guard let enumerator = manager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: []
+        ) else { return }
+        for case let child as URL in enumerator {
+            relax(child)
         }
+    }
+
+    private static func relax(_ url: URL) {
+        let manager = FileManager.default
+        _ = try? manager.setAttributes([.immutable: false], ofItemAtPath: url.path)
+
+        guard let attributes = try? manager.attributesOfItem(atPath: url.path),
+              let permissions = attributes[.posixPermissions] as? NSNumber else { return }
+        let isDirectory = (attributes[.type] as? FileAttributeType) == .typeDirectory
+        let relaxed = permissions.uint16Value | (isDirectory ? 0o700 : 0o200)
+        guard relaxed != permissions.uint16Value else { return }
+        _ = try? manager.setAttributes(
+            [.posixPermissions: NSNumber(value: relaxed)],
+            ofItemAtPath: url.path
+        )
     }
 }
