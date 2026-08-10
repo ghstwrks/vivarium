@@ -38,9 +38,7 @@ enum CodeStager {
         let byteCount = await onDiskByteCount(of: source) ?? 0
         try checkSpace(for: byteCount, stagingInto: destination, from: source)
 
-        if manager.fileExists(atPath: destination.path) {
-            try remove(destination)
-        }
+        try remove(destination)
         try createParent(of: destination)
 
         let cloned = try await copy(from: source, to: destination)
@@ -73,9 +71,12 @@ enum CodeStager {
             "Cloning \(source.path) failed (\(clone.stderrText.trimmed(to: 300))); "
                 + "falling back to a full copy, which is slower and costs the space."
         )
-        // A partial clone may have been left behind; a full copy onto it would
-        // merge two trees rather than replace one.
-        try? FileManager.default.removeItem(at: destination)
+        // A partial clone may have been left behind, and a full copy onto it
+        // would merge two trees rather than replace one — `cp -R` descends into
+        // an existing destination and nests the project inside it. Failing to
+        // clear it is therefore fatal: continuing would stage something that is
+        // not the project and blame the test for whatever came of it.
+        try remove(destination)
         try await ProcessRunner.runChecked(
             "/bin/cp", ["-R", source.path, destination.path],
             timeout: .seconds(3600),
@@ -137,9 +138,13 @@ enum CodeStager {
         return kibibytes * 1024
     }
 
+    /// Removes `url` if there is anything there, including a dangling symlink,
+    /// which `fileExists` would deny the existence of.
     private static func remove(_ url: URL) throws {
         do {
             try FileManager.default.removeItem(at: url)
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return
         } catch {
             throw VivError(
                 .codeStaging,

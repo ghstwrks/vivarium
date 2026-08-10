@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Deleting things Vivarium created.
 ///
@@ -87,8 +90,20 @@ enum RunStorage {
         }
     }
 
+    /// A symlink is left exactly as it is.
+    ///
+    /// `setAttributes` is `chmod`/`chflags`, not their `l`-prefixed forms, so
+    /// it resolves the link and acts on whatever is at the far end — and the
+    /// enumerator above walks the share, which is the surface the guest writes
+    /// to as itself. A guest that leaves `$VIV_ARTIFACTS/x -> ~/something`
+    /// would otherwise have the host clear that file's `uchg` and add `u+w` to
+    /// it during cleanup. Nothing is lost by skipping: unlinking a symlink
+    /// needs permission on the directory holding it, never on its target.
     private static func relax(_ url: URL) {
         let manager = FileManager.default
+        var link = stat()
+        guard lstat(url.path, &link) == 0, (link.st_mode & S_IFMT) != S_IFLNK else { return }
+
         _ = try? manager.setAttributes([.immutable: false], ofItemAtPath: url.path)
 
         guard let attributes = try? manager.attributesOfItem(atPath: url.path),

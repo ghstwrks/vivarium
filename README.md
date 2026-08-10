@@ -252,9 +252,11 @@ completely and correctly and your command was unhappy about something; a
   file with `StrictHostKeyChecking=accept-new`, which records the guest's
   key on first contact, still refuses a *changed* key, and keeps a recycled
   NAT address from poisoning the operator's own `known_hosts`.
-- Marker and manifest files on guest-writable volumes are read with
-  `O_NOFOLLOW`, so a symlink planted by the guest cannot redirect a host
-  read.
+- Every file the host reads back from a guest — the VirtioFS marker, the
+  markers and manifests on the artifact volume — is opened with `O_NOFOLLOW`,
+  so a symlink planted by the guest cannot redirect a host read. Cleanup
+  likewise never relaxes permissions or flags through a symlink it finds in
+  the share.
 
 ## How it works
 

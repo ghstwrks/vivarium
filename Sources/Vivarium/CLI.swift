@@ -507,7 +507,14 @@ struct RunCommand: AsyncParsableCommand {
     /// a missing code directory, a manifest with a typo in it — is found here,
     /// where the cost of being told is a message rather than a two-minute boot.
     private func makePlan() async throws -> TestPlan {
+        // Resolved, not merely standardized: `cp -R` copies a symlinked
+        // directory as the link, so staging `--code ~/work` where that is a
+        // link would put a dangling link in the share and the guest would fail
+        // several minutes later complaining that its staged code is missing.
+        // The manifest is looked for at the resolved path too, so both halves
+        // of the run agree on which directory the project is.
         let codeDirectory = (code?.url ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+            .resolvingSymlinksInPath()
             .standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: codeDirectory.path, isDirectory: &isDirectory),

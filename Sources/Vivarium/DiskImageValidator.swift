@@ -85,7 +85,7 @@ enum DiskImageValidator {
         try await assertReadOnly(mountPoint: mountPoint)
 
         let markerURL = URL(fileURLWithPath: mountPoint).appendingPathComponent("viv-result.txt")
-        let contents = try readWithoutFollowingSymlinks(at: markerURL, stage: .artifactValidation)
+        let contents = try GuestWritableFile.read(at: markerURL, stage: .artifactValidation)
 
         let digest = Digest.sha256Hex(contents)
         let expected = expectations.markerFileContents
@@ -166,7 +166,7 @@ enum DiskImageValidator {
                 .appendingPathComponent("Users")
                 .appendingPathComponent(username)
                 .appendingPathComponent("viv-result.txt")
-            let contents = try readWithoutFollowingSymlinks(at: markerURL, stage: .artifactValidation)
+            let contents = try GuestWritableFile.read(at: markerURL, stage: .artifactValidation)
             let matched = contents == expectations.markerFileContents
 
             var ejected = false
@@ -276,31 +276,5 @@ enum DiskImageValidator {
             return
         }
         log.warn("mount(8) did not list \(mountPoint); cannot confirm the read-only flag.")
-    }
-
-    /// Reads a file, refusing to follow a symlink at the final path component.
-    ///
-    /// The guest controls the contents of these volumes, so the marker path
-    /// could be a link pointing anywhere on the host. `O_NOFOLLOW` keeps a
-    /// validation read from becoming a way for guest-controlled data to
-    /// redirect a host read.
-    private static func readWithoutFollowingSymlinks(at url: URL, stage: VivStage) throws -> Data {
-        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
-        guard descriptor != -1 else {
-            let reason = String(cString: strerror(errno))
-            throw VivError(
-                stage,
-                "Cannot read \(url.path): \(reason)",
-                inspectionHints: ["ls -la \(url.deletingLastPathComponent().path)"]
-            )
-        }
-        defer { close(descriptor) }
-
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-        do {
-            return try handle.readToEnd() ?? Data()
-        } catch {
-            throw VivError(stage, "Failed while reading \(url.path).", underlying: error)
-        }
     }
 }

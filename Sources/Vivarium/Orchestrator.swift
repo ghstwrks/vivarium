@@ -949,11 +949,19 @@ final class Orchestrator {
         transition(to: .validatingVirtioFS)
 
         let markerURL = paths.sharedMarker
-        guard let contents = try? Data(contentsOf: markerURL) else {
+        let contents: Data
+        do {
+            // O_NOFOLLOW, like every other read of something the guest wrote:
+            // the share is the most guest-writable surface there is, and a
+            // marker replaced by a symlink would otherwise have the host read —
+            // and report — a file of the guest's choosing.
+            contents = try GuestWritableFile.read(at: markerURL, stage: .virtioFSValidation)
+        } catch {
             throw VivError(
                 .virtioFSValidation,
-                "The guest reported success, but \(markerURL.path) does not exist on the host. "
-                    + "The VirtioFS share did not carry the write.",
+                "The guest reported success, but \(markerURL.path) is not a readable file on the "
+                    + "host. The VirtioFS share did not carry the write.",
+                underlying: error,
                 inspectionHints: ["ls -la \(paths.sharedDirectory.path)"]
             )
         }
