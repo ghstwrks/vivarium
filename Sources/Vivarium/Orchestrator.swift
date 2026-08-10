@@ -570,14 +570,61 @@ final class Orchestrator {
     private func abandonGuest(after error: any Error) async {
         await captureFailureDiagnostics(error: error)
         if options.keepGoing {
-            log.warn(
-                "--keep-going: leaving the VM booted at "
-                    + (report.guestAddress ?? "an undiscovered address")
-                    + " so the guest can be inspected. Stop it with Ctrl-C when finished."
-            )
+            await holdForInspection(reason: "the run failed: " + VivError.describe(error).trimmed(to: 300))
         } else {
             await forceStopForCleanup()
         }
+    }
+
+    /// Keeps the guest executing, and this process alive with it, until the
+    /// operator interrupts.
+    ///
+    /// The virtual machine is an object in this process, so "leave it running"
+    /// can only mean "do not return yet": the guest dies with the process
+    /// whatever else happens. SIGINT is taken over rather than left to its
+    /// default disposition, which would kill the process — and the guest —
+    /// before any handler saw it. The wait is a dispatch source on the main
+    /// queue because that is the main actor's own executor: suspending here
+    /// lets the queue run, and the handler arrives back on the actor that owns
+    /// the machine.
+    private func holdForInspection(reason: String) async {
+        let address = report?.guestAddress ?? "an address that was never discovered"
+        print("""
+
+            The guest is still running — \(reason)
+              guest    \(credentials.username)@\(address)
+              run      \(paths.root.path)
+
+            The password is generated per run and lives only in this process's \
+            memory: it is never printed, logged, or written down, so there is no \
+            new SSH session to be had. What is inspectable is the run directory \
+            above and any session already open.
+
+            Ctrl-C force-stops the guest — the equivalent of pulling its power, \
+            with nothing flushed — and cleans nothing up. The run directory is \
+            left exactly as it is, for `viv gc` later.
+            """)
+
+        signal(SIGINT, SIG_IGN)
+        let resumed = AtomicFlag()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+            source.setEventHandler {
+                // A second SIGINT can be delivered before the cancel takes
+                // effect, and resuming a continuation twice is a crash.
+                guard !resumed.value else { return }
+                resumed.set()
+                source.cancel()
+                continuation.resume()
+            }
+            source.resume()
+        }
+        // Back to the default disposition, so a second Ctrl-C during the stop
+        // below ends the process rather than being swallowed.
+        signal(SIGINT, SIG_DFL)
+
+        log.warn("Interrupted: force-stopping the guest.")
+        await forceStopForCleanup()
     }
 
     private func createAndStartRunVM() async throws {
@@ -1144,6 +1191,7 @@ final class Orchestrator {
         try await startProvisionedGuest()
 
         let execution: TestExecution
+        let status: TestRunStatus
         var artifacts: [ArtifactEntry] = []
         var warnings: [String] = []
         var shutdownError: (any Error)?
@@ -1156,25 +1204,35 @@ final class Orchestrator {
                 await harvest(ssh: ssh, plan: plan, layout: layout, execution: execution)
             }
 
-            // A guest that will not shut down is reported, not fatal: the test
-            // has already produced its verdict, and throwing here would throw
-            // the report away with it. `viv run` leads with the in-guest
-            // shutdown — see ShutdownOrder — because it is the one
-            // POC-RESULTS.md measured as actually working with auto-login on.
-            do {
-                try await measure("shutdown") { try await shutdown(ssh: ssh, order: .inGuestFirst) }
-            } catch {
-                shutdownError = error
-                log.error("The guest did not shut down cleanly: \(VivError.describe(error))")
+            status = execution.timedOut
+                ? .timedOut
+                : (execution.exitCode == 0 ? .passed : .failed)
+
+            // --keep-going is about a run that did not go well, so a passing
+            // one is never held: it has nothing left to look at, and holding it
+            // would strand every green CI job. The hold comes after the harvest
+            // so that what the report describes is what the test left, not what
+            // an operator did to it afterwards.
+            if options.keepGoing, status != .passed {
+                await holdForInspection(reason: "the test \(status == .timedOut ? "timed out" : "failed").")
+            } else {
+                // A guest that will not shut down is reported, not fatal: the
+                // test has already produced its verdict, and throwing here
+                // would throw the report away with it. `viv run` leads with the
+                // in-guest shutdown — see ShutdownOrder — because it is the one
+                // POC-RESULTS.md measured as actually working with auto-login
+                // on.
+                do {
+                    try await measure("shutdown") { try await shutdown(ssh: ssh, order: .inGuestFirst) }
+                } catch {
+                    shutdownError = error
+                    log.error("The guest did not shut down cleanly: \(VivError.describe(error))")
+                }
             }
         } catch {
             await abandonGuest(after: error)
             throw error
         }
-
-        let status: TestRunStatus = execution.timedOut
-            ? .timedOut
-            : (execution.exitCode == 0 ? .passed : .failed)
 
         // Everything that writes inside the bundle happens before the bundle is
         // deleted, and everything that writes inside `results/` happens after,

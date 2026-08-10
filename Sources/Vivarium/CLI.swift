@@ -435,10 +435,15 @@ struct RunCommand: AsyncParsableCommand {
 
     @Flag(
         name: .customLong("keep-going"),
-        help: """
-            On infrastructure failure, leave the guest running for inspection \
-            instead of stopping it. Stop it with Ctrl-C when finished.
-            """
+        help: ArgumentHelp(
+            "On a run that did not pass, hold the guest for inspection.",
+            discussion: """
+                The guest lives inside this process, so holding it means this \
+                command does not return: it waits, guest still executing, until \
+                Ctrl-C. That force-stops the guest and exits with the status the \
+                run had already earned. A passing run is never held.
+                """
+        )
     )
     var keepGoing: Bool = false
 
@@ -666,10 +671,15 @@ struct SelftestCommand: AsyncParsableCommand {
 
     @Flag(
         name: .customLong("keep-going"),
-        help: """
-            On failure, leave the guest running for inspection instead of \
-            stopping it. Stop it with Ctrl-C when finished.
-            """
+        help: ArgumentHelp(
+            "On failure, hold the guest for inspection instead of stopping it.",
+            discussion: """
+                The guest lives inside this process, so holding it means this \
+                command does not return: it waits, guest still executing, until \
+                Ctrl-C. That force-stops the guest and exits with the status the \
+                failure had already earned.
+                """
+        )
     )
     var keepGoing: Bool = false
 
