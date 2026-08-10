@@ -81,6 +81,10 @@ the working directory), `--manifest <path>` overrides the default
 `<code>/viv.json`, `--template <path>` overrides the newest template in the
 Vivarium home, `--timeout <seconds>` bounds the test command (default 600),
 and `--keep-vm` keeps `VM.bundle` even when the test passes.
+`--keep-going` goes further: when a run fails, it leaves the guest running
+and prints its address so you can SSH in and look at it, holding until you
+press Ctrl-C — which force-stops the guest and exits with the status the run
+had earned. A passing run is never held.
 
 ### `viv selftest [options]`
 
@@ -107,10 +111,11 @@ from the proof of concept.
 Deletes run directories under the Vivarium home. A run that already
 succeeded has nothing left to collect — its `VM.bundle` and `Shared/` are
 removed automatically when it finishes — so `gc` matters for runs kept for
-inspection after a failure or a timeout: it removes their heavy `VM.bundle`
-and `Shared/` remains while keeping `results/`. `--dry-run` lists what would
-be deleted and deletes nothing; `--older-than <days>` and `--all` choose
-which runs qualify. `gc` only ever touches `<home>/runs`; it never touches
+inspection after a failure or a timeout: by default it removes their heavy
+`VM.bundle` and `Shared/` remains while keeping `results/`. `--dry-run`
+lists what would be deleted and deletes nothing. The two widening flags are
+not more of the same: `--older-than <days>` and `--all` delete **whole run
+directories, `results/` included**. `gc` only ever touches `<home>/runs`; it never touches
 `<home>/templates`, and it never touches `~/VRE-POC`, the proof of concept's
 home, which Vivarium does not read or write.
 

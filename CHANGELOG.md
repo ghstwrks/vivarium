@@ -34,7 +34,21 @@ not edited.
   `env`), read strictly — an unrecognised key is a hard error rather than a
   silently ignored typo.
 - Live-streamed guest output: the test command's stdout and stderr reach
-  the host terminal as they are produced, not only after the command exits.
+  the host terminal as they are produced, not only after the command exits,
+  and are written to `results/test-stdout.txt` and `results/test-stderr.txt`
+  at the same time — so a run in progress can be followed with `tail -f`,
+  and a run that dies mid-test still has everything printed up to then.
+- An exit-code contract `viv run` keeps: `0` for a test command that
+  exited 0, `1` for one that failed or timed out, `2` for a usage error,
+  and `70` for every failure of Vivarium's own — a guest that never took a
+  lease, a share that did not mount, an SSH session that would not open.
+  Exit `1` means the tests failed and nothing else.
+- `--keep-going`, which holds a failed run's guest at the point of failure
+  and prints its address, so an operator can SSH in and look; Ctrl-C then
+  force-stops the guest and exits with the status the run had earned.
+- The test command runs as the shell script it is: `set -e` and `set -u`
+  cover Vivarium's own preamble but are turned off for the user's command,
+  which behaves as it would in their own shell.
 - Artifact harvesting: manifest globs resolved by the guest's own shell,
   plus everything written to `$VIV_ARTIFACTS`, copied back through the
   VirtioFS share into `results/artifacts/`.
@@ -45,9 +59,12 @@ not edited.
 - Automatic cleanup: a passing run deletes its own `VM.bundle` and staged
   `Shared/` directory, keeping only `results/`; a failing or timed-out run
   keeps everything for inspection.
-- `viv gc`, for cleaning up runs kept after a failure or timeout:
-  `--dry-run`, `--older-than <days>`, and `--all`, touching only
-  `<home>/runs`.
+- `viv gc`, for cleaning up runs kept after a failure or timeout. By
+  default it reclaims only the heavy remains — `VM.bundle` and `Shared/` —
+  of runs that finished, and keeps every `results/`; `--older-than <days>`
+  and `--all` delete whole run directories, `results/` included.
+  `--dry-run` shows what any of them would do. Only `<home>/runs` is ever
+  touched.
 - `viv preflight`, `viv template create`/`viv template list`, `viv
   validate`, and `viv selftest` (the POC's thirteen-criterion acceptance
   proof, preserved as Vivarium's own integration test), each carried over
