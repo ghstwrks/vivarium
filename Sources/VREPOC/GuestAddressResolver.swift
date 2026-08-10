@@ -10,8 +10,12 @@ struct AddressCandidate: Sendable, Equatable {
 ///
 /// Virtualization's NAT attachment does not expose the guest's DHCP lease
 /// through any public API, so this has to be inferred from the host. Discovery
-/// is therefore a replaceable component with three independent strategies,
-/// ordered by how deterministic they are.
+/// is therefore a replaceable component with four independent strategies,
+/// ordered by how deterministic they are: a caller-supplied override, the
+/// vmnet DHCP lease database, the ARP cache, and Bonjour. The first three
+/// match on the MAC persisted in the bundle; Bonjour cannot, and is filtered
+/// to the NAT subnet so it can only ever offer an address the guest could
+/// plausibly hold.
 struct GuestAddressResolver: Sendable {
     let macAddress: String
     /// A caller-supplied address, which wins outright. This is the most
@@ -32,7 +36,12 @@ struct GuestAddressResolver: Sendable {
 
         var found: [AddressCandidate] = []
 
+        for address in dhcpLeaseAddresses(matching: macAddress) {
+            found.append(AddressCandidate(address: address, strategy: "dhcp-lease"))
+        }
+
         for address in await arpAddresses(matching: macAddress) {
+            guard !found.contains(where: { $0.address == address }) else { continue }
             found.append(AddressCandidate(address: address, strategy: "arp"))
         }
 
@@ -62,6 +71,104 @@ struct GuestAddressResolver: Sendable {
         return found
     }
 
+    // MARK: - Strategy A: the vmnet DHCP lease database
+
+    /// The lease database written by the DHCP server behind Virtualization's
+    /// NAT attachment.
+    static let dhcpLeasesPath = "/var/db/dhcpd_leases"
+
+    /// Returns addresses currently leased to `mac`.
+    ///
+    /// This is the most deterministic strategy available and the reason it
+    /// outranks ARP: the same daemon that hands the guest its address records
+    /// the mapping here, so a match is authoritative rather than inferred from
+    /// traffic the guest may not have sent yet. It is also a plain file read of
+    /// a world-readable file, which matters more than it should — see
+    /// `arpAddresses(matching:)`.
+    ///
+    /// Entries look like:
+    /// ```
+    /// {
+    ///     name=AppleViMachine1
+    ///     ip_address=192.168.64.2
+    ///     hw_address=1,5a:35:3c:62:83:f9
+    ///     lease=0x6a7a1797
+    /// }
+    /// ```
+    /// The `1,` prefix on `hw_address` is the ARP hardware type (Ethernet).
+    func dhcpLeaseAddresses(matching mac: String) -> [String] {
+        guard let wanted = Self.normalizeMAC(mac) else { return [] }
+        guard let text = try? String(contentsOfFile: Self.dhcpLeasesPath, encoding: .utf8) else {
+            log.debug("No DHCP lease database at \(Self.dhcpLeasesPath).")
+            return []
+        }
+
+        var addresses: [String] = []
+        for lease in Self.parseDHCPLeases(text) where lease.mac == wanted {
+            // Leases outlive the VM that held them, and a template hands every
+            // clone the same MAC, so an expired entry can name an address whose
+            // guest is long gone. Preferring unexpired ones keeps discovery
+            // from confidently pointing the SSH gate at nothing.
+            if let expiry = lease.expiry, expiry < Date() {
+                log.debug("Ignoring expired DHCP lease for \(mac): \(lease.address) expired \(expiry).")
+                continue
+            }
+            addresses.append(lease.address)
+        }
+        return addresses
+    }
+
+    struct DHCPLease: Sendable {
+        let address: String
+        let mac: String
+        let expiry: Date?
+    }
+
+    static func parseDHCPLeases(_ text: String) -> [DHCPLease] {
+        var leases: [DHCPLease] = []
+        var address: String?
+        var mac: String?
+        var expiry: Date?
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line == "{" {
+                address = nil
+                mac = nil
+                expiry = nil
+                continue
+            }
+            if line == "}" {
+                if let address, let mac, isIPv4(address) {
+                    leases.append(DHCPLease(address: address, mac: mac, expiry: expiry))
+                }
+                address = nil
+                mac = nil
+                expiry = nil
+                continue
+            }
+
+            guard let equals = line.firstIndex(of: "=") else { continue }
+            let key = String(line[line.startIndex..<equals])
+            let value = String(line[line.index(after: equals)...])
+            switch key {
+            case "ip_address":
+                address = value
+            case "hw_address":
+                // "1,5a:35:..." — drop the hardware-type prefix if present.
+                let raw = value.contains(",") ? String(value.split(separator: ",", maxSplits: 1)[1]) : value
+                mac = normalizeMAC(raw)
+            case "lease":
+                if value.hasPrefix("0x"), let seconds = UInt32(value.dropFirst(2), radix: 16) {
+                    expiry = Date(timeIntervalSince1970: TimeInterval(seconds))
+                }
+            default:
+                continue
+            }
+        }
+        return leases
+    }
+
     // MARK: - Strategy B: ARP by persisted MAC
 
     /// Reads the host ARP cache and returns addresses whose hardware address
@@ -70,6 +177,19 @@ struct GuestAddressResolver: Sendable {
     /// `arp` prints hardware addresses without leading zeroes (`6:a7:...`
     /// rather than `06:a7:...`), so both sides are normalised octet by octet
     /// instead of being compared as strings.
+    ///
+    /// Demoted below the DHCP lease database because it cannot be relied on
+    /// from a command-line tool. `arp -a` enumerates the local network, which
+    /// macOS gates behind Local Network privacy, and an unapproved process gets
+    /// an empty table with exit status 0 and nothing on stderr — indistinguish-
+    /// able from a genuinely empty cache. Measured here: the same `arp -an`
+    /// returns 2020 bytes from an interactive shell (which inherits the
+    /// terminal's grant) and 0 bytes from this binary, while `netstat -rnl`
+    /// over the same routing socket returns data from both. A CLI has no way to
+    /// raise the approval prompt, so this strategy silently contributes nothing
+    /// until the operator grants Local Network access to whatever launched it.
+    /// It is kept because when it does work it matches on the persisted MAC,
+    /// and it costs one cheap subprocess.
     private func arpAddresses(matching mac: String) async -> [String] {
         guard let wanted = Self.normalizeMAC(mac) else { return [] }
 
@@ -242,7 +362,16 @@ struct GuestAddressResolver: Sendable {
             }
             guard let name = currentName, name.hasPrefix("bridge") else { continue }
 
-            let fields = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            // ifconfig indents with a tab, so splitting on " " alone yields
+            // "\tinet" as the first field and no lookup for "inet" ever
+            // matches. Every address line was silently skipped, which made this
+            // function return an empty list on a host that plainly had a NAT
+            // bridge: ARP priming was skipped as "no bridge found", and the
+            // Bonjour subnet filter rejected every candidate including genuine
+            // ones, since nothing can fall inside a set of zero subnets.
+            let fields = line
+                .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .map(String.init)
             guard let inetIndex = fields.firstIndex(of: "inet"), inetIndex + 1 < fields.count else { continue }
             let address = fields[inetIndex + 1]
             guard isIPv4(address) else { continue }
@@ -367,6 +496,12 @@ struct GuestAddressResolver: Sendable {
             ) else { continue }
             let body = result.stdoutText + "\n--- stderr ---\n" + result.stderrText
             try? Data(body.utf8).write(to: directory.appendingPathComponent(filename))
+        }
+
+        // The primary strategy's input. Captured verbatim so a discovery
+        // failure can be told apart from a guest that never got a lease.
+        if let leases = try? String(contentsOfFile: dhcpLeasesPath, encoding: .utf8) {
+            try? Data(leases.utf8).write(to: directory.appendingPathComponent("dhcpd_leases.txt"))
         }
 
         let logResult = try? await ProcessRunner.run(
