@@ -1,7 +1,7 @@
 import Foundation
 import Virtualization
 
-/// Builds the two distinct VM configurations this POC needs.
+/// Builds the two distinct VM configurations Vivarium needs.
 ///
 /// Apple's sample builds exactly one configuration and reuses it. This splits
 /// it in two, because the install VM must expose only the system disk — the
@@ -9,7 +9,7 @@ import Virtualization
 /// not documented, and guessing wrong costs a ninety-minute restore — while the
 /// run VM needs the artifact disk and the VirtioFS share the proof depends on.
 enum VMConfigurationFactory {
-    static let artifactBlockDeviceIdentifier = "vre-artifacts"
+    static let artifactBlockDeviceIdentifier = "viv-artifacts"
 
     // MARK: - Sizing
 
@@ -45,7 +45,7 @@ enum VMConfigurationFactory {
                 options: []
             )
         } catch {
-            throw POCError(
+            throw VivError(
                 .installation,
                 "Failed to create auxiliary storage at \(paths.auxiliaryStorage.path).",
                 underlying: error
@@ -59,7 +59,7 @@ enum VMConfigurationFactory {
             try platform.hardwareModel.dataRepresentation.write(to: paths.hardwareModel)
             try platform.machineIdentifier.dataRepresentation.write(to: paths.machineIdentifier)
         } catch {
-            throw POCError(
+            throw VivError(
                 .installation,
                 "Failed to persist the platform identity into the bundle.",
                 underlying: error
@@ -78,7 +78,7 @@ enum VMConfigurationFactory {
         let platform = VZMacPlatformConfiguration()
 
         guard FileManager.default.fileExists(atPath: paths.auxiliaryStorage.path) else {
-            throw POCError(.runConfiguration, "Missing \(paths.auxiliaryStorage.path).")
+            throw VivError(.runConfiguration, "Missing \(paths.auxiliaryStorage.path).")
         }
         platform.auxiliaryStorage = VZMacAuxiliaryStorage(url: paths.auxiliaryStorage)
 
@@ -88,7 +88,7 @@ enum VMConfigurationFactory {
             hardwareModelData = try Data(contentsOf: paths.hardwareModel)
             machineIdentifierData = try Data(contentsOf: paths.machineIdentifier)
         } catch {
-            throw POCError(
+            throw VivError(
                 .runConfiguration,
                 "Failed to read the saved platform identity from \(paths.root.path).",
                 underlying: error
@@ -96,16 +96,16 @@ enum VMConfigurationFactory {
         }
 
         guard let hardwareModel = VZMacHardwareModel(dataRepresentation: hardwareModelData) else {
-            throw POCError(.runConfiguration, "\(paths.hardwareModel.path) is not a valid hardware model.")
+            throw VivError(.runConfiguration, "\(paths.hardwareModel.path) is not a valid hardware model.")
         }
         guard hardwareModel.isSupported else {
-            throw POCError(
+            throw VivError(
                 .runConfiguration,
                 "The bundle's hardware model is not supported on this host."
             )
         }
         guard let machineIdentifier = VZMacMachineIdentifier(dataRepresentation: machineIdentifierData) else {
-            throw POCError(
+            throw VivError(
                 .runConfiguration,
                 "\(paths.machineIdentifier.path) is not a valid machine identifier."
             )
@@ -118,7 +118,7 @@ enum VMConfigurationFactory {
 
     // MARK: - Devices
 
-    static func makeSystemDisk(paths: VMBundlePaths, stage: POCStage) throws -> VZVirtioBlockDeviceConfiguration {
+    static func makeSystemDisk(paths: VMBundlePaths, stage: VivStage) throws -> VZVirtioBlockDeviceConfiguration {
         do {
             let attachment = try VZDiskImageStorageDeviceAttachment(
                 url: paths.systemDisk,
@@ -128,7 +128,7 @@ enum VMConfigurationFactory {
             )
             return VZVirtioBlockDeviceConfiguration(attachment: attachment)
         } catch {
-            throw POCError(
+            throw VivError(
                 stage,
                 "Failed to attach the system disk at \(paths.systemDisk.path).",
                 underlying: error
@@ -157,7 +157,7 @@ enum VMConfigurationFactory {
             device.blockDeviceIdentifier = artifactBlockDeviceIdentifier
             return device
         } catch {
-            throw POCError(
+            throw VivError(
                 .runConfiguration,
                 "Failed to attach the artifact disk at \(paths.artifactDisk.path).",
                 underlying: error
@@ -214,7 +214,7 @@ enum VMConfigurationFactory {
 
         let cpuCount = computeCPUCount()
         guard cpuCount >= requirements.minimumSupportedCPUCount else {
-            throw POCError(
+            throw VivError(
                 .installation,
                 "\(cpuCount) CPUs configured, but the restore image requires at least "
                     + "\(requirements.minimumSupportedCPUCount)."
@@ -224,7 +224,7 @@ enum VMConfigurationFactory {
 
         let memorySize = computeMemorySize()
         guard memorySize >= requirements.minimumSupportedMemorySize else {
-            throw POCError(
+            throw VivError(
                 .installation,
                 "\(memorySize) bytes of memory configured, but the restore image requires at least "
                     + "\(requirements.minimumSupportedMemorySize)."
@@ -247,7 +247,7 @@ enum VMConfigurationFactory {
             // reasons unrelated to this experiment.
             try configuration.validateSaveRestoreSupport()
         } catch {
-            throw POCError(.installation, "The install VM configuration is invalid.", underlying: error)
+            throw VivError(.installation, "The install VM configuration is invalid.", underlying: error)
         }
 
         return configuration
@@ -287,7 +287,7 @@ enum VMConfigurationFactory {
         do {
             try configuration.validate()
         } catch {
-            throw POCError(.runConfiguration, "The run VM configuration is invalid.", underlying: error)
+            throw VivError(.runConfiguration, "The run VM configuration is invalid.", underlying: error)
         }
 
         return configuration
@@ -301,7 +301,7 @@ enum VMConfigurationFactory {
         do {
             try Data(address.string.utf8).write(to: paths.macAddress, options: .atomic)
         } catch {
-            throw POCError(
+            throw VivError(
                 .bundlePreparation,
                 "Failed to persist the MAC address to \(paths.macAddress.path).",
                 underlying: error
@@ -310,12 +310,12 @@ enum VMConfigurationFactory {
         return address
     }
 
-    static func loadMACAddress(paths: VMBundlePaths, stage: POCStage) throws -> VZMACAddress {
+    static func loadMACAddress(paths: VMBundlePaths, stage: VivStage) throws -> VZMACAddress {
         let text: String
         do {
             text = try String(contentsOf: paths.macAddress, encoding: .utf8)
         } catch {
-            throw POCError(
+            throw VivError(
                 stage,
                 "Failed to read the persisted MAC address from \(paths.macAddress.path).",
                 underlying: error
@@ -323,7 +323,7 @@ enum VMConfigurationFactory {
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let address = VZMACAddress(string: trimmed) else {
-            throw POCError(stage, "\(trimmed) is not a valid MAC address.")
+            throw VivError(stage, "\(trimmed) is not a valid MAC address.")
         }
         return address
     }

@@ -23,14 +23,14 @@ enum Entitlement {
     }
 
     /// Throws with the exact command that fixes the problem.
-    static func require(stage: POCStage) throws {
+    static func require(stage: VivStage) throws {
         guard hasVirtualizationEntitlement() else {
-            throw POCError(
+            throw VivError(
                 stage,
                 """
                 This binary is missing the \(virtualization) entitlement, so it cannot \
                 create a virtual machine. Sign it before running:
-                  codesign -s - --entitlements VREPOC.entitlements -f \(CommandLine.arguments[0])
+                  codesign -s - --entitlements Vivarium.entitlements -f \(CommandLine.arguments[0])
                 or build through the Makefile, which signs as part of every build.
                 """,
                 inspectionHints: ["codesign -d --entitlements - \(CommandLine.arguments[0])"]

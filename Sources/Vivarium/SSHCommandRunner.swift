@@ -36,11 +36,11 @@ struct SSHResult: Sendable {
 
 /// Runs commands in the guest over the system OpenSSH client.
 ///
-/// `/usr/bin/ssh` keeps this first proof dependency-free and makes stdout,
-/// stderr, and termination status trivially separable through `Process`. The
-/// cost is the password: OpenSSH will not read one from an argument or from
-/// stdin, so an askpass helper is required. That is acceptable for an isolated
-/// POC against a NAT-local VM whose credential lives for one run; it is not a
+/// `/usr/bin/ssh` needs no library and makes stdout, stderr, and termination
+/// status trivially separable through `Process`. The cost is the password:
+/// OpenSSH will not read one from an argument or from stdin, so an askpass
+/// helper is required. That is acceptable against a NAT-local VM whose
+/// credential is generated per run and never persisted; it is not a
 /// credential-management design, and the limitations are documented on
 /// `AskpassHelper`.
 struct SSHCommandRunner: Sendable {
@@ -158,7 +158,8 @@ struct SSHCommandRunner: Sendable {
 /// the child's environment, never in the script, never in an argument vector,
 /// and never in a file.
 ///
-/// Limitations, accepted for a POC and not suitable beyond one:
+/// Limitations, accepted for a single-run per-run credential and not suitable
+/// for a password with a longer life:
 ///  - environment variables are readable by sufficiently privileged local
 ///    processes;
 ///  - the helper exists on disk, mode 0700 in a mode-0700 directory, for the
@@ -169,7 +170,7 @@ struct AskpassHelper: Sendable {
 
     init() throws {
         directory = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("vre-askpass-\(UUID().uuidString)")
+            .appendingPathComponent("viv-askpass-\(UUID().uuidString)")
         script = directory.appendingPathComponent("askpass.sh")
 
         do {
@@ -180,7 +181,7 @@ struct AskpassHelper: Sendable {
             )
             let contents = """
             #!/bin/sh
-            printf '%s\\n' "$VRE_SSH_PASSWORD"
+            printf '%s\\n' "$VIV_SSH_PASSWORD"
 
             """
             try Data(contents.utf8).write(to: script, options: .atomic)
@@ -189,7 +190,7 @@ struct AskpassHelper: Sendable {
                 ofItemAtPath: script.path
             )
         } catch {
-            throw POCError(.sshCommand, "Failed to create the askpass helper.", underlying: error)
+            throw VivError(.sshCommand, "Failed to create the askpass helper.", underlying: error)
         }
     }
 
@@ -201,8 +202,8 @@ struct AskpassHelper: Sendable {
             "SSH_ASKPASS_REQUIRE": "force",
             // SSH_ASKPASS is historically gated on DISPLAY being set; the value
             // is never connected to.
-            "DISPLAY": "vre-poc",
-            "VRE_SSH_PASSWORD": password,
+            "DISPLAY": "viv",
+            "VIV_SSH_PASSWORD": password,
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "HOME": NSHomeDirectory()
         ]

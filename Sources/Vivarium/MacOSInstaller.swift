@@ -30,7 +30,7 @@ final class MacOSInstaller {
     /// in Apple's sample is unreachable here and is not carried over.
     func createSystemDiskImage(sizeGiB: Int = 128) async throws {
         guard !FileManager.default.fileExists(atPath: paths.systemDisk.path) else {
-            throw POCError(
+            throw VivError(
                 .installation,
                 "\(paths.systemDisk.path) already exists; refusing to overwrite an existing system disk."
             )
@@ -90,9 +90,9 @@ final class MacOSInstaller {
                 }
             }
         } catch {
-            installLogWriter.write("Installation failed: \(POCError.describe(error))")
+            installLogWriter.write("Installation failed: \(VivError.describe(error))")
             releaseInstallationObjects()
-            throw POCError(
+            throw VivError(
                 .installation,
                 "VZMacOSInstaller failed.",
                 underlying: error,
@@ -130,7 +130,7 @@ final class MacOSInstaller {
             do {
                 try await machine.stop()
             } catch {
-                log.warn("Stopping the install VM failed: \(POCError.describe(error))")
+                log.warn("Stopping the install VM failed: \(VivError.describe(error))")
             }
         }
 

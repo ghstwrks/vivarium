@@ -12,9 +12,9 @@ enum Digest {
 
     /// Streams a file through SHA-256 so that hashing a 22 GB IPSW does not
     /// require a 22 GB allocation.
-    static func sha256HexOfFile(at url: URL, stage: POCStage) throws -> String {
+    static func sha256HexOfFile(at url: URL, stage: VivStage) throws -> String {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
-            throw POCError(stage, "Cannot open \(url.path) for hashing.")
+            throw VivError(stage, "Cannot open \(url.path) for hashing.")
         }
         defer { try? handle.close() }
 

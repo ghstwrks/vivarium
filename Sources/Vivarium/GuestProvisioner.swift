@@ -50,7 +50,7 @@ enum GuestProvisioner {
             // starting anyway would burn the guest's one provisionable boot.
             try options.setGuestProvisioning(provisioning)
         } catch {
-            throw POCError(
+            throw VivError(
                 .provisioning,
                 "The Virtualization framework rejected the guest provisioning options. "
                     + "Neither the options nor the password are logged; check the username "
@@ -78,7 +78,7 @@ enum GuestProvisioner {
                 }
             }
         } catch {
-            throw POCError(
+            throw VivError(
                 .provisioning,
                 "The virtual machine failed to start.",
                 underlying: error,

@@ -6,8 +6,8 @@ import Foundation
 /// restore, and the framework cannot use them to reconfigure a guest it has
 /// already provisioned. Every failed provisioning experiment therefore consumes
 /// one restore. Without a template that is roughly ninety minutes per attempt,
-/// which is the difference between a POC that can be iterated on in an
-/// afternoon and one that cannot.
+/// which is the difference between a guest that can be rebuilt in seconds and
+/// one that costs an afternoon.
 enum TemplateManager {
     /// Snapshots a freshly restored bundle.
     ///
@@ -31,7 +31,7 @@ enum TemplateManager {
         do {
             try manager.createDirectory(at: template.root, withIntermediateDirectories: true)
         } catch {
-            throw POCError(
+            throw VivError(
                 .templateSnapshot,
                 "Failed to create \(template.root.path).",
                 underlying: error
@@ -45,7 +45,7 @@ enum TemplateManager {
             let source = bundle.root.appendingPathComponent(filename)
             let destination = template.root.appendingPathComponent(filename)
             guard manager.fileExists(atPath: source.path) else {
-                throw POCError(
+                throw VivError(
                     .templateSnapshot,
                     "Cannot snapshot \(bundle.root.path): \(filename) is missing."
                 )
@@ -79,7 +79,7 @@ enum TemplateManager {
     ) async throws -> TemplateManifest {
         let manager = FileManager.default
         guard manager.fileExists(atPath: template.manifest.path) else {
-            throw POCError(
+            throw VivError(
                 .templateSnapshot,
                 "\(template.root.path) has no template.json; it is not a template bundle.",
                 inspectionHints: ["ls -la \(template.root.path)"]
@@ -91,7 +91,7 @@ enum TemplateManager {
         )
 
         if let expectedIPSWBuild, manifest.ipswBuild != expectedIPSWBuild {
-            throw POCError(
+            throw VivError(
                 .templateSnapshot,
                 "Template \(template.root.path) was restored from IPSW build "
                     + "\(manifest.ipswBuild), but this run requested build \(expectedIPSWBuild). "
@@ -103,7 +103,7 @@ enum TemplateManager {
             let source = template.root.appendingPathComponent(filename)
             let destination = bundle.root.appendingPathComponent(filename)
             guard manager.fileExists(atPath: source.path) else {
-                throw POCError(
+                throw VivError(
                     .templateSnapshot,
                     "Template \(template.root.path) is incomplete: \(filename) is missing."
                 )
@@ -116,7 +116,7 @@ enum TemplateManager {
 
         let digest = try platformIdentityDigest(root: bundle.root)
         guard digest == manifest.platformIdentitySHA256 else {
-            throw POCError(
+            throw VivError(
                 .templateSnapshot,
                 "The cloned platform identity digest (\(digest)) does not match the template's "
                     + "recorded digest (\(manifest.platformIdentitySHA256)). The clone is not trustworthy."
@@ -134,7 +134,7 @@ enum TemplateManager {
     /// requested explicitly rather than relying on `FileManager` doing it,
     /// because a silent fall back to a byte copy would turn a "seconds" step
     /// into a "minutes and tens of gigabytes" step without saying so.
-    private static func clone(from source: URL, to destination: URL, stage: POCStage) async throws {
+    private static func clone(from source: URL, to destination: URL, stage: VivStage) async throws {
         let result = try await ProcessRunner.run(
             "/bin/cp", ["-c", "-R", source.path, destination.path],
             timeout: .seconds(300),
@@ -164,7 +164,7 @@ enum TemplateManager {
         for filename in ["AuxiliaryStorage", "HardwareModel", "MachineIdentifier", "MACAddress"] {
             let url = root.appendingPathComponent(filename)
             guard let data = try? Data(contentsOf: url) else {
-                throw POCError(.templateSnapshot, "Cannot read \(url.path) for digesting.")
+                throw VivError(.templateSnapshot, "Cannot read \(url.path) for digesting.")
             }
             combined.append(Data(filename.utf8))
             combined.append(data)

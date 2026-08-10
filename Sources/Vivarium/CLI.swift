@@ -25,7 +25,7 @@ struct CLI {
         do {
             options = try parseOptions(Array(arguments.dropFirst()))
         } catch {
-            FileHandle.standardError.write(Data(("error: \(POCError.describe(error))\n\n").utf8))
+            FileHandle.standardError.write(Data(("error: \(VivError.describe(error))\n\n").utf8))
             print(usage)
             exit(2)
         }
@@ -41,7 +41,7 @@ struct CLI {
     private static func dispatch(subcommand: String, options: OrchestratorOptions) async -> Int32 {
         switch subcommand {
         case "preflight":
-            let report = await POCOrchestrator.preflight(options: options)
+            let report = await Orchestrator.preflight(options: options)
             print(report.text)
             return report.passed ? 0 : 1
 
@@ -56,7 +56,7 @@ struct CLI {
                 let report = try await orchestrator.runProvision()
                 print(report.summaryText)
                 guard report.allAcceptanceCriteriaPassed else {
-                    throw POCError(.cleanup, "One or more acceptance criteria failed.")
+                    throw VivError(.cleanup, "One or more acceptance criteria failed.")
                 }
             }
 
@@ -65,7 +65,7 @@ struct CLI {
                 let report = try await orchestrator.runAll()
                 print(report.summaryText)
                 guard report.allAcceptanceCriteriaPassed else {
-                    throw POCError(.cleanup, "One or more acceptance criteria failed.")
+                    throw VivError(.cleanup, "One or more acceptance criteria failed.")
                 }
             }
 
@@ -76,7 +76,7 @@ struct CLI {
                     ? "pass  artifact-disk marker matched (\(result.markerByteCount) bytes)"
                     : "FAIL  artifact-disk marker did not match")
                 guard result.markerMatched else {
-                    throw POCError(.artifactValidation, "The artifact marker did not match.")
+                    throw VivError(.artifactValidation, "The artifact marker did not match.")
                 }
             }
 
@@ -91,14 +91,14 @@ struct CLI {
     /// non-zero status and a written failure report.
     private static func run(
         options: OrchestratorOptions,
-        body: @escaping @Sendable (POCOrchestrator) async throws -> Void
+        body: @escaping @Sendable (Orchestrator) async throws -> Void
     ) async -> Int32 {
-        let orchestrator = await POCOrchestrator(options: options)
+        let orchestrator = await Orchestrator(options: options)
         do {
             try await body(orchestrator)
             return 0
         } catch {
-            log.error(POCError.describe(error))
+            log.error(VivError.describe(error))
             await orchestrator.recordFailure(error)
             return 1
         }
@@ -113,7 +113,7 @@ struct CLI {
         func nextValue(for flag: String) throws -> String {
             index += 1
             guard index < arguments.count else {
-                throw POCError(.preflight, "\(flag) requires a value.")
+                throw VivError(.preflight, "\(flag) requires a value.")
             }
             return arguments[index]
         }
@@ -162,7 +162,7 @@ struct CLI {
             case "--disable-remote-login":
                 options.disableRemoteLogin = true
             default:
-                throw POCError(.preflight, "unknown option \(argument)")
+                throw VivError(.preflight, "unknown option \(argument)")
             }
             index += 1
         }
@@ -200,10 +200,10 @@ struct CLI {
                                Defaults to ~/VRE-POC/templates/<build>.bundle.
       --from-template <path>   Clone this template instead of restoring.
       --guest-address <ip>     Skip address discovery and use this address.
-      --username <name>        Provisioned account short name (default vreadmin).
+      --username <name>        Provisioned account short name (default vivadmin).
       --full-name <name>       Provisioned account full name.
       --artifact-volume-name   Volume name for the artifact disk (default
-                               VREArtifacts).
+                               VivArtifacts).
       --reuse                  Allow a non-empty existing bundle directory.
       --keep-going             On failure, leave the guest running for manual
                                inspection instead of stopping it.
@@ -225,7 +225,7 @@ struct CLI {
                                so the run must fail at the SSH readiness gate.
 
     ENVIRONMENT
-      VRE_DEBUG=1              Emit debug-level logging.
+      VIV_DEBUG=1              Emit debug-level logging.
 
     NOTES
       The generated guest password is held in memory only. It is never written

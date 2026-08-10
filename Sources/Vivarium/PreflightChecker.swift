@@ -66,7 +66,7 @@ enum PreflightChecker {
                         ? " — new enough to provision; the local-IPSW requirement could be lifted"
                         : " — too old to provision; a local macOS 27 IPSW remains required")
             case let .failure(error):
-                latest = "query failed: \(POCError.describe(error))"
+                latest = "query failed: \(VivError.describe(error))"
             }
         }
 
@@ -103,7 +103,7 @@ enum PreflightChecker {
             passed: present,
             detail: present
                 ? "\(Entitlement.virtualization) present on this binary"
-                : "missing; run: codesign -s - --entitlements VREPOC.entitlements -f "
+                : "missing; run: codesign -s - --entitlements Vivarium.entitlements -f "
                     + CommandLine.arguments[0]
         )
     }
@@ -132,7 +132,7 @@ enum PreflightChecker {
             return PreflightCheck(
                 name: "free space",
                 passed: false,
-                detail: "cannot determine free space at \(probe.path): \(POCError.describe(error))"
+                detail: "cannot determine free space at \(probe.path): \(VivError.describe(error))"
             )
         }
     }
@@ -180,7 +180,7 @@ enum PreflightChecker {
             return [PreflightCheck(
                 name: "restore image",
                 passed: false,
-                detail: POCError.describe(error)
+                detail: VivError.describe(error)
             )]
         }
     }

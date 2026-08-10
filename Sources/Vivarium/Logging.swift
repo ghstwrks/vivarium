@@ -50,7 +50,7 @@ final class Logger: @unchecked Sendable {
     func warn(_ message: String) { emit(level: "WARN ", message: message) }
     func error(_ message: String) { emit(level: "ERROR", message: message) }
     func debug(_ message: String) {
-        guard ProcessInfo.processInfo.environment["VRE_DEBUG"] != nil else { return }
+        guard ProcessInfo.processInfo.environment["VIV_DEBUG"] != nil else { return }
         emit(level: "DEBUG", message: message)
     }
 

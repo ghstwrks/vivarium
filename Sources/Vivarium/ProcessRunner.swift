@@ -83,7 +83,7 @@ enum ProcessRunner {
         stdinData: Data? = nil,
         timeout: Duration? = nil,
         redactedArguments: [String]? = nil,
-        stage: POCStage
+        stage: VivStage
     ) async throws -> CommandResult {
         let startedAt = Date()
         let process = Process()
@@ -121,7 +121,7 @@ enum ProcessRunner {
         do {
             try process.run()
         } catch {
-            throw POCError(
+            throw VivError(
                 stage,
                 "Failed to launch \(executable).",
                 underlying: error
@@ -168,7 +168,7 @@ enum ProcessRunner {
         _ arguments: [String],
         environment: [String: String]? = nil,
         timeout: Duration? = nil,
-        stage: POCStage,
+        stage: VivStage,
         inspectionHints: [String] = []
     ) async throws -> CommandResult {
         let result = try await run(
@@ -178,7 +178,7 @@ enum ProcessRunner {
             stage: stage
         )
         guard result.succeeded else {
-            throw POCError(
+            throw VivError(
                 stage,
                 "\(executable) \(arguments.joined(separator: " ")) failed: \(result.summary)\n"
                     + "  stdout: \(result.stdoutText.trimmed(to: 2000))\n"
@@ -201,7 +201,7 @@ enum ProcessRunner {
 
     /// Applied whenever a caller passes no timeout of its own.
     ///
-    /// Every subprocess this POC runs is a quick query or a `diskutil`
+    /// Every subprocess Vivarium runs is a quick query or a `diskutil`
     /// operation measured in seconds. An unbounded wait has no legitimate use
     /// here and turns any surprise into a run that hangs until someone notices.
     static let defaultTimeout = Duration.seconds(600)

@@ -30,7 +30,7 @@ struct VMBundlePaths: Sendable {
 
     /// The marker the guest writes into the VirtioFS share. Written by the
     /// guest, read by the host: this is the whole point of the share.
-    var sharedMarker: URL { sharedDirectory.appendingPathComponent("vre-result.txt") }
+    var sharedMarker: URL { sharedDirectory.appendingPathComponent("viv-result.txt") }
 
     init(root: URL) {
         self.root = root.standardizedFileURL
@@ -55,17 +55,52 @@ struct TemplatePaths: Sendable {
     }
 }
 
-enum DefaultLocations {
-    static var poc: URL {
-        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("VRE-POC")
+/// Where Vivarium keeps everything it owns.
+///
+/// `~/.vivarium` follows the `~/.tart` precedent: a dot directory the user is
+/// unlikely to browse, holding artefacts that are large, machine-generated, and
+/// safe to delete. `VIVARIUM_HOME` exists so a run can be pointed at an
+/// external volume — a single template plus one run is comfortably over 100 GB
+/// of sparse image — without every command needing a path flag.
+///
+/// The POC's `~/VRE-POC` is deliberately *not* consulted or migrated. Nothing
+/// in Vivarium reads or deletes it, so a POC bundle kept for reference stays
+/// exactly where it was left.
+enum VivariumHome {
+    static let environmentVariable = "VIVARIUM_HOME"
+
+    static var root: URL {
+        if let override = ProcessInfo.processInfo.environment[environmentVariable],
+           !override.isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+                .standardizedFileURL
+        }
+        return URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".vivarium")
+            .standardizedFileURL
     }
 
     static var templates: URL {
-        poc.appendingPathComponent("templates")
+        root.appendingPathComponent("templates")
     }
 
+    /// Runs live one level below `runs/` rather than directly under the home,
+    /// so that `viv gc` has a single subtree it may delete from and can never
+    /// reach `templates/`, which is expensive to rebuild.
+    static var runs: URL {
+        root.appendingPathComponent("runs")
+    }
+
+    static func run(id: String) -> URL {
+        runs.appendingPathComponent(id)
+    }
+}
+
+enum DefaultLocations {
+    static var templates: URL { VivariumHome.templates }
+
     static func runBundle(runID: String) -> URL {
-        poc.appendingPathComponent(runID).appendingPathComponent("VM.bundle")
+        VivariumHome.run(id: runID).appendingPathComponent("VM.bundle")
     }
 
     static func template(ipswBuild: String) -> URL {

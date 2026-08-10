@@ -40,12 +40,12 @@ enum RestoreImageManager {
     /// The gate runs before anything expensive so that pointing the tool at the
     /// macOS 26.6.1 image `VZMacOSRestoreImage.latestSupported` offers fails in
     /// seconds rather than after a ninety-minute install.
-    static func load(ipsw url: URL, stage: POCStage = .restoreImage) async throws -> LoadedRestoreImage {
+    static func load(ipsw url: URL, stage: VivStage = .restoreImage) async throws -> LoadedRestoreImage {
         guard url.isFileURL else {
-            throw POCError(stage, "The IPSW path \(url) is not a file URL.")
+            throw VivError(stage, "The IPSW path \(url) is not a file URL.")
         }
         guard FileManager.default.fileExists(atPath: url.path) else {
-            throw POCError(stage, "No file at \(url.path).")
+            throw VivError(stage, "No file at \(url.path).")
         }
 
         let image = try await withCheckedThrowingContinuation { continuation in
@@ -56,7 +56,7 @@ enum RestoreImageManager {
 
         let version = image.operatingSystemVersion
         guard version.majorVersion >= minimumGuestMajorVersion else {
-            throw POCError(
+            throw VivError(
                 stage,
                 """
                 Restore image at \(url.path) is macOS \
@@ -69,14 +69,14 @@ enum RestoreImageManager {
         }
 
         guard let requirements = image.mostFeaturefulSupportedConfiguration else {
-            throw POCError(
+            throw VivError(
                 stage,
                 "Restore image at \(url.path) offers no configuration supported by this host."
             )
         }
 
         guard requirements.hardwareModel.isSupported else {
-            throw POCError(
+            throw VivError(
                 stage,
                 "The hardware model required by \(url.path) is not supported on this host."
             )

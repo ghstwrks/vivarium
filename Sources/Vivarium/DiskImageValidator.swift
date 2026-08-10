@@ -44,7 +44,7 @@ enum DiskImageValidator {
         )
 
         guard let imageDevice = attachment.imageDeviceIdentifier else {
-            throw POCError(
+            throw VivError(
                 .artifactAttach,
                 "diskutil attached the artifact image but reported no whole-disk device: "
                     + attachment.summary
@@ -63,7 +63,7 @@ enum DiskImageValidator {
         }
 
         guard let volume = attachment.entity(volumeNamed: expectations.artifactVolumeName) else {
-            throw POCError(
+            throw VivError(
                 .artifactValidation,
                 "No volume named \(expectations.artifactVolumeName) on the artifact image. "
                     + "Devices: \(attachment.summary)",
@@ -84,7 +84,7 @@ enum DiskImageValidator {
 
         try await assertReadOnly(mountPoint: mountPoint)
 
-        let markerURL = URL(fileURLWithPath: mountPoint).appendingPathComponent("vre-result.txt")
+        let markerURL = URL(fileURLWithPath: mountPoint).appendingPathComponent("viv-result.txt")
         let contents = try readWithoutFollowingSymlinks(at: markerURL, stage: .artifactValidation)
 
         let digest = Digest.sha256Hex(contents)
@@ -150,7 +150,7 @@ enum DiskImageValidator {
                 among: attachment,
                 stage: .artifactValidation
             ) else {
-                throw POCError(
+                throw VivError(
                     .artifactValidation,
                     "No APFS Data volume found on the system disk. Devices: \(attachment.summary)"
                 )
@@ -165,7 +165,7 @@ enum DiskImageValidator {
             let markerURL = URL(fileURLWithPath: mountPoint)
                 .appendingPathComponent("Users")
                 .appendingPathComponent(username)
-                .appendingPathComponent("vre-result.txt")
+                .appendingPathComponent("viv-result.txt")
             let contents = try readWithoutFollowingSymlinks(at: markerURL, stage: .artifactValidation)
             let matched = contents == expectations.markerFileContents
 
@@ -185,7 +185,7 @@ enum DiskImageValidator {
                 deviceIdentifiers: devices,
                 ejected: ejected,
                 detail: matched
-                    ? "Marker in /Users/\(username)/vre-result.txt matched."
+                    ? "Marker in /Users/\(username)/viv-result.txt matched."
                     : "Marker present but did not match the expected bytes."
             )
         } catch {
@@ -200,7 +200,7 @@ enum DiskImageValidator {
                 mountPoint: nil,
                 deviceIdentifiers: devices,
                 ejected: imageDevice != nil,
-                detail: POCError.describe(error)
+                detail: VivError.describe(error)
             )
         }
     }
@@ -222,7 +222,7 @@ enum DiskImageValidator {
     /// would otherwise be a perfectly plausible match for a marker search.
     private static func findAPFSDataVolume(
         among attachment: DiskAttachment,
-        stage: POCStage
+        stage: VivStage
     ) async throws -> DiskSystemEntity? {
         let result = try await ProcessRunner.runChecked(
             DiskUtil.executable, ["apfs", "list", "-plist"],
@@ -234,7 +234,7 @@ enum DiskImageValidator {
             from: result.stdout, options: [], format: nil
         ) as? [String: Any],
             let containers = plist["Containers"] as? [[String: Any]] else {
-            throw POCError(stage, "Could not parse `diskutil apfs list -plist`.")
+            throw VivError(stage, "Could not parse `diskutil apfs list -plist`.")
         }
 
         let attached = Set(attachment.allDeviceIdentifiers)
@@ -268,7 +268,7 @@ enum DiskImageValidator {
 
         for line in result.stdoutText.split(separator: "\n") where line.contains(" on \(mountPoint) (") {
             guard line.contains("read-only") else {
-                throw POCError(
+                throw VivError(
                     .artifactValidation,
                     "\(mountPoint) is mounted but not read-only: \(line)"
                 )
@@ -284,11 +284,11 @@ enum DiskImageValidator {
     /// could be a link pointing anywhere on the host. `O_NOFOLLOW` keeps a
     /// validation read from becoming a way for guest-controlled data to
     /// redirect a host read.
-    private static func readWithoutFollowingSymlinks(at url: URL, stage: POCStage) throws -> Data {
+    private static func readWithoutFollowingSymlinks(at url: URL, stage: VivStage) throws -> Data {
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
         guard descriptor != -1 else {
             let reason = String(cString: strerror(errno))
-            throw POCError(
+            throw VivError(
                 stage,
                 "Cannot read \(url.path): \(reason)",
                 inspectionHints: ["ls -la \(url.deletingLastPathComponent().path)"]
@@ -300,7 +300,7 @@ enum DiskImageValidator {
         do {
             return try handle.readToEnd() ?? Data()
         } catch {
-            throw POCError(stage, "Failed while reading \(url.path).", underlying: error)
+            throw VivError(stage, "Failed while reading \(url.path).", underlying: error)
         }
     }
 }

@@ -51,12 +51,12 @@ struct RunExpectations: Codable, Sendable {
         let nonce = Self.randomHex(byteCount: 16)
         let contentDigest = Digest.sha256Hex("\(runID):\(nonce)")
         return RunExpectations(
-            stdoutToken: "VRE_STDOUT_OK",
-            stderrToken: "VRE_STDERR_OK",
+            stdoutToken: "VIV_STDOUT_OK",
+            stderrToken: "VIV_STDERR_OK",
             exitCode: 23,
             markerNonce: nonce,
             marker: "\(runID):\(nonce):\(contentDigest)",
-            artifactVolumeName: "VREArtifacts"
+            artifactVolumeName: "VivArtifacts"
         )
     }
 
@@ -188,13 +188,13 @@ enum JSONCoding {
         try data.write(to: url, options: .atomic)
     }
 
-    static func read<T: Decodable>(_ type: T.Type, from url: URL, stage: POCStage) throws -> T {
+    static func read<T: Decodable>(_ type: T.Type, from url: URL, stage: VivStage) throws -> T {
         do {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             return try decoder.decode(type, from: Data(contentsOf: url))
         } catch {
-            throw POCError(stage, "Cannot read \(url.path).", underlying: error)
+            throw VivError(stage, "Cannot read \(url.path).", underlying: error)
         }
     }
 }

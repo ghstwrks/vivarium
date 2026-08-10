@@ -128,7 +128,7 @@ final class VMEventRelay: NSObject, VZVirtualMachineDelegate, @unchecked Sendabl
     }
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: any Error) {
-        let message = POCError.describe(error)
+        let message = VivError.describe(error)
         log.error("Delegate: virtual machine stopped with error: \(message)")
         record(.stoppedWithError(message))
     }
@@ -140,6 +140,6 @@ final class VMEventRelay: NSObject, VZVirtualMachineDelegate, @unchecked Sendabl
     ) {
         // Not terminal: the guest tearing down its network on the way to a
         // clean shutdown looks exactly like this.
-        log.warn("Delegate: network attachment disconnected: \(POCError.describe(error))")
+        log.warn("Delegate: network attachment disconnected: \(VivError.describe(error))")
     }
 }

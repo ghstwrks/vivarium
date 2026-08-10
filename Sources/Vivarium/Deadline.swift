@@ -4,7 +4,7 @@ import Foundation
 ///
 /// Returns `nil` on expiry.
 ///
-/// Polling loops in this POC bound their *total* effort with a deadline
+/// Polling loops here bound their *total* effort with a deadline
 /// evaluated between attempts, which silently assumes each attempt finishes.
 /// One that never returns therefore hangs the loop for as long as the process
 /// lives, and the outer timeout never gets a chance to fire — exactly the
@@ -16,7 +16,7 @@ import Foundation
 ///
 /// The losing child is cancelled, not killed: Swift cancellation is
 /// cooperative, so an operation blocked in a system call keeps its thread until
-/// it returns. Every subprocess this POC spawns is bounded by
+/// it returns. Every subprocess Vivarium spawns is bounded by
 /// `ProcessRunner.defaultTimeout`, so such a thread is temporary rather than
 /// permanent, and the caller resumes either way.
 func withTimeout<T: Sendable>(

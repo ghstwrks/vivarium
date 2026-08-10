@@ -19,7 +19,7 @@ enum ArtifactDiskManager {
     /// with a known name, keeping the remote script's job to "write a file".
     static func create(paths: VMBundlePaths, volumeName: String) async throws {
         guard !FileManager.default.fileExists(atPath: paths.artifactDisk.path) else {
-            throw POCError(
+            throw VivError(
                 .bundlePreparation,
                 "\(paths.artifactDisk.path) already exists; refusing to overwrite it."
             )
@@ -37,7 +37,7 @@ enum ArtifactDiskManager {
         )
 
         guard let device = attachment.imageDeviceIdentifier else {
-            throw POCError(
+            throw VivError(
                 .bundlePreparation,
                 "diskutil attached \(paths.artifactDisk.path) but reported no whole-disk device: "
                     + attachment.summary
@@ -100,7 +100,7 @@ enum ArtifactDiskManager {
                 ofItemAtPath: volume.mountPoint
             )
         } catch {
-            throw POCError(
+            throw VivError(
                 .bundlePreparation,
                 "Could not make \(volume.mountPoint) writable by the guest.",
                 underlying: error,
@@ -117,7 +117,7 @@ enum ArtifactDiskManager {
     private static func createSparseImage(at url: URL) throws {
         let descriptor = open(url.path, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
         guard descriptor != -1 else {
-            throw POCError(
+            throw VivError(
                 .bundlePreparation,
                 "Cannot create \(url.path): \(String(cString: strerror(errno)))"
             )
@@ -125,7 +125,7 @@ enum ArtifactDiskManager {
         defer { close(descriptor) }
 
         guard ftruncate(descriptor, sizeBytes) == 0 else {
-            throw POCError(
+            throw VivError(
                 .bundlePreparation,
                 "ftruncate on \(url.path) failed: \(String(cString: strerror(errno)))"
             )

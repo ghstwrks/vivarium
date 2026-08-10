@@ -337,8 +337,8 @@ struct GuestAddressResolver: Sendable {
     /// Bridge interfaces created by Virtualization's NAT.
     ///
     /// The bridge name is not contractual, so the interfaces are found by
-    /// prefix and the actual name is logged: recording it is one of the open
-    /// questions this POC exists to answer.
+    /// prefix and the actual name is logged, so that a rename shows up in the
+    /// run log rather than as an unexplained address-discovery failure.
     static func natBridgeInterfaces() async -> [BridgeInterface] {
         guard let result = try? await ProcessRunner.run(
             "/sbin/ifconfig", ["-a"],

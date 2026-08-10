@@ -7,7 +7,7 @@ import Virtualization
 /// late delegate callback cannot advance the workflow twice. Every transition
 /// is appended to `logs/state.jsonl`, which makes a failed run's timeline
 /// readable without reconstructing it from log prose.
-enum POCState: String, Codable, Sendable {
+enum VivState: String, Codable, Sendable {
     case idle
     case preflight
     case preparingBundle
@@ -161,8 +161,8 @@ struct OrchestratorOptions: Sendable {
     var validateSystemDisk = false
     var queryLatestSupported = false
     var logsInAutomatically = GuestProvisioner.defaultLogsInAutomatically
-    var username = "vreadmin"
-    var fullName = "VRE Administrator"
+    var username = "vivadmin"
+    var fullName = "Vivarium Administrator"
     /// Negative-test switches. Each makes the run configuration deliberately
     /// wrong in one specific way so the expected stage can be observed failing.
     var shareReadOnly = false
@@ -178,9 +178,9 @@ struct OrchestratorOptions: Sendable {
 /// Process I/O, hashing, and disk inspection are ordinary async work that runs
 /// off it.
 @MainActor
-final class POCOrchestrator {
+final class Orchestrator {
     private let options: OrchestratorOptions
-    private var state: POCState = .idle
+    private var state: VivState = .idle
     private var stateLogURL: URL?
     private let startedAt = ContinuousClock.now
 
@@ -204,7 +204,7 @@ final class POCOrchestrator {
     static func preflight(options: OrchestratorOptions) async -> PreflightReport {
         await PreflightChecker.run(
             ipsw: options.ipsw,
-            targetDirectory: options.bundle ?? DefaultLocations.poc,
+            targetDirectory: options.bundle ?? VivariumHome.root,
             queryLatestSupported: options.queryLatestSupported
         )
     }
@@ -262,12 +262,12 @@ final class POCOrchestrator {
 
         let preflight = await PreflightChecker.run(
             ipsw: options.ipsw,
-            targetDirectory: options.bundle ?? DefaultLocations.poc,
+            targetDirectory: options.bundle ?? VivariumHome.root,
             queryLatestSupported: options.queryLatestSupported
         )
         log.info("Preflight:\n\(preflight.text)")
         guard preflight.passed else {
-            throw POCError(
+            throw VivError(
                 .preflight,
                 "Preflight failed:\n"
                     + preflight.checks.filter { !$0.passed }
@@ -280,7 +280,7 @@ final class POCOrchestrator {
     /// Creates the bundle, generates run metadata, and loads the IPSW.
     private func prepareBundleAndImage() async throws -> LoadedRestoreImage {
         guard let ipsw = options.ipsw else {
-            throw POCError(
+            throw VivError(
                 .bundlePreparation,
                 "--ipsw is required. There is no download fallback: on this host "
                     + "VZMacOSRestoreImage.latestSupported resolves to macOS 26.6.1, which would "
@@ -437,7 +437,7 @@ final class POCOrchestrator {
     /// Adopts an already-installed bundle, reusing its `run.json`.
     private func attachExistingBundle() throws {
         guard let bundleRoot = options.bundle else {
-            throw POCError(.bundlePreparation, "--bundle is required for this subcommand.")
+            throw VivError(.bundlePreparation, "--bundle is required for this subcommand.")
         }
         paths = VMBundlePaths(root: bundleRoot)
         try BundleManager.requireInstalledBundle(paths: paths, stage: .bundlePreparation)
@@ -465,7 +465,7 @@ final class POCOrchestrator {
 
     private func provisionAndValidate() async throws {
         guard !credentials.password.isEmpty else {
-            throw POCError(
+            throw VivError(
                 .provisioning,
                 "This bundle's guest password is not available. Passwords are generated per run "
                     + "and deliberately never persisted, so a bundle can only be provisioned by the "
@@ -548,7 +548,7 @@ final class POCOrchestrator {
         try await GuestProvisioner.start(virtualMachine: machine, options: startOptions)
 
         guard machine.state == .running || machine.state == .starting else {
-            throw POCError(
+            throw VivError(
                 .provisioning,
                 "The virtual machine is \(VMStateDescription.describe(machine.state)) immediately "
                     + "after start."
@@ -635,7 +635,7 @@ final class POCOrchestrator {
         }
 
         await GuestAddressResolver.captureDiagnostics(into: paths.diagnosticsDirectory)
-        throw POCError(
+        throw VivError(
             .addressDiscovery,
             "Could not find an address for MAC \(manifest.macAddress) within "
                 + "\(Timeouts.addressDiscovery). Last gate passed: \(lastReadinessGate ?? "none"). "
@@ -696,7 +696,7 @@ final class POCOrchestrator {
                 let whoami = result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard whoami == credentials.username else {
                     lastReason = "authenticated but `id -un` returned \(whoami), not \(credentials.username)"
-                    throw POCError(
+                    throw VivError(
                         .sshReadiness,
                         "SSH connected to \(ssh.address) but the session belongs to \(whoami), "
                             + "not the provisioned user \(credentials.username). The address may "
@@ -722,7 +722,7 @@ final class POCOrchestrator {
         }
 
         await GuestAddressResolver.captureDiagnostics(into: paths.diagnosticsDirectory)
-        throw POCError(
+        throw VivError(
             .sshReadiness,
             "The guest at \(ssh.address) did not become SSH-ready within \(Timeouts.sshReadiness). "
                 + "Last gate passed: \(lastReadinessGate ?? "none"). Last reason: \(lastReason).",
@@ -762,13 +762,13 @@ final class POCOrchestrator {
 
         switch result.outcome {
         case let .transportFailure(detail):
-            throw POCError(
+            throw VivError(
                 .sshCommand,
                 "The acceptance command did not run: SSH transport or authentication failed. "
                     + "This is distinct from a remote command failure. Detail: \(detail.trimmed(to: 500))"
             )
         case let .localFailure(detail):
-            throw POCError(.sshCommand, "The local ssh process failed: \(detail)")
+            throw VivError(.sshCommand, "The local ssh process failed: \(detail)")
         case let .remoteExit(code):
             report.observedRemoteExitCode = code
             report.remoteExitCodeMatched = code == manifest.expectations.exitCode
@@ -785,7 +785,7 @@ final class POCOrchestrator {
         )
 
         guard report.remoteExitCodeMatched, report.stdoutTokenMatched, report.stderrTokenMatched else {
-            throw POCError(
+            throw VivError(
                 .sshCommand,
                 """
                 The acceptance command did not produce the expected result.
@@ -811,7 +811,7 @@ final class POCOrchestrator {
 
         let markerURL = paths.sharedMarker
         guard let contents = try? Data(contentsOf: markerURL) else {
-            throw POCError(
+            throw VivError(
                 .virtioFSValidation,
                 "The guest reported success, but \(markerURL.path) does not exist on the host. "
                     + "The VirtioFS share did not carry the write.",
@@ -824,7 +824,7 @@ final class POCOrchestrator {
         report.virtioFSMountPath = AcceptanceScript.expectedSharePath
 
         guard report.virtioFSMarkerMatched else {
-            throw POCError(
+            throw VivError(
                 .virtioFSValidation,
                 "The VirtioFS marker at \(markerURL.path) does not match: expected "
                     + "\(expected.count) bytes (sha256 \(manifest.expectations.markerFileSHA256)), "
@@ -839,7 +839,7 @@ final class POCOrchestrator {
     private func shutdown(ssh: SSHCommandRunner) async throws {
         transition(to: .requestingGuestShutdown)
         guard let machine = virtualMachine, let relay = eventRelay else {
-            throw POCError(.guestShutdown, "No running virtual machine to stop.")
+            throw VivError(.guestShutdown, "No running virtual machine to stop.")
         }
 
         var requested = false
@@ -849,7 +849,7 @@ final class POCOrchestrator {
                 requested = true
                 log.info("Requested a graceful guest stop.")
             } catch {
-                log.warn("requestStop() failed: \(POCError.describe(error))")
+                log.warn("requestStop() failed: \(VivError.describe(error))")
             }
         } else {
             log.warn("The guest cannot be asked to stop in its current state.")
@@ -896,7 +896,7 @@ final class POCOrchestrator {
         log.error("The guest did not stop gracefully; forcing a destructive stop.")
         report.destructiveStopRequired = true
         await forceStopForCleanup()
-        throw POCError(
+        throw VivError(
             .guestShutdown,
             "The guest did not stop gracefully — neither within "
                 + "\(Timeouts.stopRequestAcknowledgement) of `requestStop()` nor within "
@@ -931,7 +931,7 @@ final class POCOrchestrator {
             Thread.sleep(forTimeInterval: 0.1)
         }
         guard machine.state == .stopped else {
-            throw POCError(
+            throw VivError(
                 .guestShutdown,
                 "The guest reported a stop but the VM is \(VMStateDescription.describe(machine.state))."
             )
@@ -965,7 +965,7 @@ final class POCOrchestrator {
 
     private func validateDetachedArtifact() async throws {
         guard virtualMachine == nil else {
-            throw POCError(
+            throw VivError(
                 .artifactAttach,
                 "Refusing to attach the artifact image while a virtual machine object still holds it."
             )
@@ -985,7 +985,7 @@ final class POCOrchestrator {
 
         transition(to: .ejectingArtifact)
         guard result.markerMatched else {
-            throw POCError(
+            throw VivError(
                 .artifactValidation,
                 "The artifact disk's marker did not match: expected sha256 "
                     + "\(result.expectedMarkerSHA256), found \(result.markerSHA256).",
@@ -997,7 +997,7 @@ final class POCOrchestrator {
 
     // MARK: - Bookkeeping
 
-    private func transition(to newState: POCState) {
+    private func transition(to newState: VivState) {
         let previous = state
         state = newState
         log.info("State: \(previous.rawValue) -> \(newState.rawValue)")
@@ -1058,7 +1058,7 @@ final class POCOrchestrator {
         log.error("Failure report written to \(paths.failureReport.path).")
     }
 
-    private func stageForCurrentState() -> POCStage {
+    private func stageForCurrentState() -> VivStage {
         switch state {
         case .idle, .preflight: return .preflight
         case .preparingBundle: return .bundlePreparation
@@ -1080,7 +1080,7 @@ final class POCOrchestrator {
 
     /// Collects guest-side state before the VM goes away.
     private func captureFailureDiagnostics(error: any Error) async {
-        log.error("Failure: \(POCError.describe(error))")
+        log.error("Failure: \(VivError.describe(error))")
         await GuestAddressResolver.captureDiagnostics(into: paths.diagnosticsDirectory)
 
         guard report.sshAuthenticationSucceeded,

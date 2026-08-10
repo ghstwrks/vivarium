@@ -63,7 +63,7 @@ enum DiskUtil {
         at url: URL,
         readOnly: Bool,
         mount: Bool,
-        stage: POCStage
+        stage: VivStage
     ) async throws -> DiskAttachment {
         var arguments = ["image", "--plist", "attach"]
         if readOnly { arguments.append("--readOnly") }
@@ -77,7 +77,7 @@ enum DiskUtil {
         )
 
         guard result.succeeded else {
-            throw POCError(
+            throw VivError(
                 stage,
                 "Failed to attach \(url.path): \(result.summary)\n"
                     + "  stderr: \(result.stderrText.trimmed(to: 2000))",
@@ -93,17 +93,17 @@ enum DiskUtil {
         return attachment
     }
 
-    static func parseAttachPlist(_ data: Data, stage: POCStage) throws -> DiskAttachment {
+    static func parseAttachPlist(_ data: Data, stage: VivStage) throws -> DiskAttachment {
         let plist: Any
         do {
             plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
         } catch {
-            throw POCError(stage, "diskutil returned output that is not a property list.", underlying: error)
+            throw VivError(stage, "diskutil returned output that is not a property list.", underlying: error)
         }
 
         guard let root = plist as? [String: Any],
               let rawEntities = root["system-entities"] as? [[String: Any]] else {
-            throw POCError(stage, "diskutil's plist has no system-entities array.")
+            throw VivError(stage, "diskutil's plist has no system-entities array.")
         }
 
         let entities = rawEntities.compactMap { raw -> DiskSystemEntity? in
@@ -118,7 +118,7 @@ enum DiskUtil {
         }
 
         guard !entities.isEmpty else {
-            throw POCError(stage, "diskutil attached the image but reported no devices.")
+            throw VivError(stage, "diskutil attached the image but reported no devices.")
         }
 
         return DiskAttachment(entities: entities)
@@ -128,7 +128,7 @@ enum DiskUtil {
     static func mount(
         deviceIdentifier: String,
         readOnly: Bool,
-        stage: POCStage
+        stage: VivStage
     ) async throws -> String {
         var arguments = ["mount"]
         if readOnly { arguments.append("readOnly") }
@@ -141,13 +141,13 @@ enum DiskUtil {
             inspectionHints: ["diskutil info \(deviceIdentifier)"]
         )
 
-        // "Volume VREArtifacts on <device> mounted"; the authoritative mount
+        // "Volume VivArtifacts on <device> mounted"; the authoritative mount
         // point comes from `diskutil info`, not from parsing this sentence.
         _ = result
         return try await mountPoint(deviceIdentifier: deviceIdentifier, stage: stage)
     }
 
-    static func mountPoint(deviceIdentifier: String, stage: POCStage) async throws -> String {
+    static func mountPoint(deviceIdentifier: String, stage: VivStage) async throws -> String {
         let result = try await ProcessRunner.runChecked(
             executable, ["info", "-plist", deviceIdentifier],
             timeout: .seconds(60),
@@ -158,7 +158,7 @@ enum DiskUtil {
         ) as? [String: Any],
             let path = plist["MountPoint"] as? String,
             !path.isEmpty else {
-            throw POCError(stage, "\(deviceIdentifier) reports no mount point.")
+            throw VivError(stage, "\(deviceIdentifier) reports no mount point.")
         }
         return path
     }
@@ -167,7 +167,7 @@ enum DiskUtil {
     static func partitionAsAPFS(
         deviceIdentifier: String,
         volumeName: String,
-        stage: POCStage
+        stage: VivStage
     ) async throws {
         try await ProcessRunner.runChecked(
             executable,
@@ -189,13 +189,13 @@ enum DiskUtil {
     static func apfsVolume(
         onWholeDisk deviceIdentifier: String,
         named expectedVolumeName: String,
-        stage: POCStage
+        stage: VivStage
     ) async throws -> (deviceIdentifier: String, mountPoint: String) {
         let partition = "\(deviceIdentifier)s1"
         let partitionInfo = try await infoPlist(deviceIdentifier: partition, stage: stage)
         guard let container = partitionInfo["APFSContainerReference"] as? String,
               !container.isEmpty else {
-            throw POCError(
+            throw VivError(
                 stage,
                 "\(partition) reports no APFS container reference.",
                 inspectionHints: ["diskutil info \(partition)"]
@@ -205,7 +205,7 @@ enum DiskUtil {
         let volume = "\(container)s1"
         let volumeInfo = try await infoPlist(deviceIdentifier: volume, stage: stage)
         guard let name = volumeInfo["VolumeName"] as? String, name == expectedVolumeName else {
-            throw POCError(
+            throw VivError(
                 stage,
                 "\(volume) is named \(volumeInfo["VolumeName"] as? String ?? "<none>"), "
                     + "not \(expectedVolumeName).",
@@ -213,7 +213,7 @@ enum DiskUtil {
             )
         }
         guard let mountPoint = volumeInfo["MountPoint"] as? String, !mountPoint.isEmpty else {
-            throw POCError(
+            throw VivError(
                 stage,
                 "\(volume) (\(expectedVolumeName)) is not mounted.",
                 inspectionHints: ["diskutil info \(volume)"]
@@ -224,7 +224,7 @@ enum DiskUtil {
 
     private static func infoPlist(
         deviceIdentifier: String,
-        stage: POCStage
+        stage: VivStage
     ) async throws -> [String: Any] {
         let result = try await ProcessRunner.runChecked(
             executable, ["info", "-plist", deviceIdentifier],
@@ -234,7 +234,7 @@ enum DiskUtil {
         guard let plist = try? PropertyListSerialization.propertyList(
             from: result.stdout, options: [], format: nil
         ) as? [String: Any] else {
-            throw POCError(stage, "Could not parse `diskutil info -plist \(deviceIdentifier)`.")
+            throw VivError(stage, "Could not parse `diskutil info -plist \(deviceIdentifier)`.")
         }
         return plist
     }
@@ -247,7 +247,7 @@ enum DiskUtil {
     @discardableResult
     static func eject(
         deviceIdentifier: String,
-        stage: POCStage,
+        stage: VivStage,
         attempts: Int = 10
     ) async throws -> Bool {
         for attempt in 1...attempts {
@@ -266,7 +266,7 @@ enum DiskUtil {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
-        throw POCError(
+        throw VivError(
             stage,
             "Could not eject \(deviceIdentifier) after \(attempts) attempts.",
             inspectionHints: [

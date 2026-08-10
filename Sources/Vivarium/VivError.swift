@@ -3,7 +3,7 @@ import Foundation
 /// The stage of the workflow a failure belongs to. Every failure the tool
 /// reports is attributed to exactly one stage so that a failed run says *where*
 /// it broke, not just that it broke.
-enum POCStage: String, Codable, Sendable {
+enum VivStage: String, Codable, Sendable {
     case preflight
     case bundlePreparation
     case restoreImage
@@ -28,15 +28,15 @@ enum POCStage: String, Codable, Sendable {
 /// to collect. Every failure here carries the stage, a human-readable message,
 /// the underlying error if there was one, and — where a next step is known — a
 /// concrete command the operator can run to investigate.
-struct POCError: Error, CustomStringConvertible, Sendable {
-    let stage: POCStage
+struct VivError: Error, CustomStringConvertible, Sendable {
+    let stage: VivStage
     let message: String
     let underlying: (any Error)?
     /// Commands or paths worth inspecting by hand after this failure.
     let inspectionHints: [String]
 
     init(
-        _ stage: POCStage,
+        _ stage: VivStage,
         _ message: String,
         underlying: (any Error)? = nil,
         inspectionHints: [String] = []
@@ -62,7 +62,7 @@ struct POCError: Error, CustomStringConvertible, Sendable {
     /// `localizedDescription` alone routinely omits for `NSError`s from
     /// Virtualization.
     static func describe(_ error: any Error) -> String {
-        if let pocError = error as? POCError {
+        if let pocError = error as? VivError {
             return pocError.description
         }
         let nsError = error as NSError
@@ -94,20 +94,20 @@ struct FailureReport: Codable, Sendable {
 
     init(
         error: any Error,
-        stage: POCStage,
+        stage: VivStage,
         vmState: String?,
         elapsedSeconds: Double,
         bundlePath: String,
         cleanupCompleted: Bool,
         lastReadinessGate: String?
     ) {
-        let pocError = error as? POCError
+        let pocError = error as? VivError
         self.stage = pocError?.stage.rawValue ?? stage.rawValue
         self.message = pocError?.message ?? error.localizedDescription
         let underlying = pocError?.underlying ?? (pocError == nil ? error : nil)
         if let underlying {
             let nsError = underlying as NSError
-            self.underlyingDescription = POCError.describe(underlying)
+            self.underlyingDescription = VivError.describe(underlying)
             self.underlyingDomain = nsError.domain
             self.underlyingCode = nsError.code
         } else {

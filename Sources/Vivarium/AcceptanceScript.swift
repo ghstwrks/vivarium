@@ -6,7 +6,8 @@ enum AcceptanceScript {
     ///
     /// Expected, not assumed: the script locates the real mount and fails
     /// loudly if it is somewhere else, because confirming this path on the
-    /// selected guest build is one of the questions the POC exists to answer.
+    /// selected guest build was one of the POC's open questions; POC-RESULTS.md
+    /// records macOS 27 mounting the share exactly here.
     static let expectedSharePath = "/Volumes/My Shared Files"
 
     /// A trivial command that must exit zero.
@@ -73,9 +74,9 @@ enum AcceptanceScript {
         require_writable_directory share "$share"
         require_writable_directory artifact "$artifact"
 
-        printf '%s\\n' "$marker" > "$share/vre-result.txt"
-        printf '%s\\n' "$marker" > "$artifact/vre-result.txt"
-        printf '%s\\n' "$marker" > "$HOME/vre-result.txt"
+        printf '%s\\n' "$marker" > "$share/viv-result.txt"
+        printf '%s\\n' "$marker" > "$artifact/viv-result.txt"
+        printf '%s\\n' "$marker" > "$HOME/viv-result.txt"
 
         # Flush before the host is told the write happened. Combined with the
         # artifact disk's full synchronisation mode, this removes the ambiguity

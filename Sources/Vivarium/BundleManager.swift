@@ -14,7 +14,7 @@ enum BundleManager {
             let contents = (try? manager.contentsOfDirectory(atPath: paths.root.path)) ?? []
             let meaningful = contents.filter { $0 != ".DS_Store" }
             if !meaningful.isEmpty && !reuse {
-                throw POCError(
+                throw VivError(
                     .bundlePreparation,
                     "\(paths.root.path) already exists and is not empty "
                         + "(\(meaningful.count) entries). Pass --reuse to write into it anyway, "
@@ -29,7 +29,7 @@ enum BundleManager {
             do {
                 try manager.createDirectory(at: directory, withIntermediateDirectories: true)
             } catch {
-                throw POCError(
+                throw VivError(
                     .bundlePreparation,
                     "Failed to create \(directory.path).",
                     underlying: error
@@ -39,14 +39,14 @@ enum BundleManager {
     }
 
     /// Confirms a bundle holds a complete, installed VM.
-    static func requireInstalledBundle(paths: VMBundlePaths, stage: POCStage) throws {
+    static func requireInstalledBundle(paths: VMBundlePaths, stage: VivStage) throws {
         let required = [
             paths.auxiliaryStorage, paths.systemDisk,
             paths.hardwareModel, paths.machineIdentifier, paths.macAddress
         ]
         let missing = required.filter { !FileManager.default.fileExists(atPath: $0.path) }
         guard missing.isEmpty else {
-            throw POCError(
+            throw VivError(
                 stage,
                 "\(paths.root.path) is not an installed VM bundle; missing: "
                     + missing.map(\.lastPathComponent).joined(separator: ", "),
