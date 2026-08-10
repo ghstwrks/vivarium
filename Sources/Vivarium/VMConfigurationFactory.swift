@@ -254,11 +254,17 @@ enum VMConfigurationFactory {
     }
 
     /// The run configuration: system disk, then artifact disk, then the share.
+    /// - Parameter includesArtifactDisk: whether to attach the separate block
+    ///   device. `viv selftest` needs it: proving a write survived detachment
+    ///   is one of its criteria. `viv run` does not — it harvests through the
+    ///   share — and attaching it anyway would add a `diskutil` partitioning
+    ///   step, and its failure modes, to every run for nothing.
     static func makeRunConfiguration(
         paths: VMBundlePaths,
         macAddress: VZMACAddress,
         cpuCount: Int,
         memorySize: UInt64,
+        includesArtifactDisk: Bool = true,
         shareReadOnly: Bool = false,
         artifactReadOnly: Bool = false
     ) throws -> VZVirtualMachineConfiguration {
@@ -272,10 +278,12 @@ enum VMConfigurationFactory {
 
         // Order matters: the system disk must remain the first block device so
         // the boot loader finds the same device it installed onto.
-        configuration.storageDevices = [
-            try makeSystemDisk(paths: paths, stage: .runConfiguration),
-            try makeArtifactDisk(paths: paths, readOnly: artifactReadOnly)
-        ]
+        configuration.storageDevices = [try makeSystemDisk(paths: paths, stage: .runConfiguration)]
+        if includesArtifactDisk {
+            configuration.storageDevices.append(
+                try makeArtifactDisk(paths: paths, readOnly: artifactReadOnly)
+            )
+        }
 
         configuration.directorySharingDevices = [
             makeVirtioFileSystemShare(paths: paths, readOnly: shareReadOnly)

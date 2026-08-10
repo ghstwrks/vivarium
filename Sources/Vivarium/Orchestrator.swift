@@ -16,11 +16,15 @@ enum VivState: String, Codable, Sendable {
     case installing
     case releasingInstallVM
     case snapshottingTemplate
+    case stagingCode
     case creatingRunVM
     case startingWithProvisioning
     case resolvingAddress
     case waitingForSSH
+    case preparingGuestWorkdir
     case executingAcceptanceCommand
+    case executingTestCommand
+    case harvestingArtifacts
     case validatingVirtioFS
     case requestingGuestShutdown
     case waitingForGuestStop
@@ -46,6 +50,17 @@ enum Timeouts {
     static let discoveryAttempt = Duration.seconds(5 * 60)
     static let sshReadiness = Duration.seconds(10 * 60)
     static let acceptanceCommand = Duration.seconds(120)
+    /// Copying the staged code out of the share into the guest workdir. Kept
+    /// out of the test command's own budget: `--timeout` is what the user
+    /// thinks their tests deserve, not what a large repository costs to copy.
+    static let guestWorkdirPreparation = Duration.seconds(30 * 60)
+    /// How long after the test command's own budget the attempt is abandoned
+    /// outright. `ProcessRunner` already escalates SIGTERM to SIGKILL, so this
+    /// only matters if the local ssh process cannot be killed at all — in which
+    /// case the run continues with whatever output was streamed, rather than
+    /// waiting forever on a process the kernel will not reap.
+    static let testCommandGrace = Duration.seconds(30)
+    static let harvest = Duration.seconds(10 * 60)
     /// How long `requestStop()` is given before the in-guest fallback.
     ///
     /// Deliberately short. `requestStop()` is a power-button press, and a macOS
@@ -163,6 +178,9 @@ struct OrchestratorOptions: Sendable {
     var logsInAutomatically = GuestProvisioner.defaultLogsInAutomatically
     var username = "vivadmin"
     var fullName = "Vivarium Administrator"
+    /// Only the selftest needs the detached-storage proof; see
+    /// `VMConfigurationFactory.makeRunConfiguration`.
+    var includesArtifactDisk = true
     /// Negative-test switches. Each makes the run configuration deliberately
     /// wrong in one specific way so the expected stage can be observed failing.
     var shareReadOnly = false
@@ -197,6 +215,8 @@ final class Orchestrator {
     private var eventRelay: VMEventRelay?
     private var lastReadinessGate: String?
     private var cleanupCompleted = false
+    /// Phase timings for `viv run`, in pipeline order.
+    private var phases: [PhaseTiming] = []
 
     init(options: OrchestratorOptions) {
         self.options = options
@@ -473,42 +493,16 @@ final class Orchestrator {
     // MARK: - Provisioned boot and proof
 
     private func provisionAndValidate() async throws {
-        guard !credentials.password.isEmpty else {
-            throw VivError(
-                .provisioning,
-                "This bundle's guest password is not available. Passwords are generated per run "
-                    + "and deliberately never persisted, so a bundle can only be provisioned by the "
-                    + "same invocation that created it. Use `all`, or `provision --from-template`."
-            )
-        }
-
-        try await createAndStartRunVM()
+        try await startProvisionedGuest()
 
         do {
-            let address = try await resolveAddress()
-            let ssh = SSHCommandRunner(
-                username: credentials.username,
-                password: credentials.password,
-                address: address,
-                knownHostsFile: paths.knownHosts
-            )
-
-            try await waitForSSHReadiness(ssh: ssh)
+            let ssh = try await connectToGuest()
             let result = try await runAcceptanceCommand(ssh: ssh)
             try validateVirtioFSMarker()
             try await shutdown(ssh: ssh)
             _ = result
         } catch {
-            await captureFailureDiagnostics(error: error)
-            if options.keepGoing {
-                log.warn(
-                    "--keep-going: leaving the VM booted at "
-                        + (report.guestAddress ?? "an undiscovered address")
-                        + " so the guest can be inspected. Stop it with Ctrl-C when finished."
-                )
-            } else {
-                await forceStopForCleanup()
-            }
+            await abandonGuest(after: error)
             throw error
         }
 
@@ -526,10 +520,59 @@ final class Orchestrator {
         finish(outcome: report.allAcceptanceCriteriaPassed ? "succeeded" : "failed")
     }
 
+    /// The half of a provisioned boot that both `selftest` and `run` need:
+    /// everything from the cloned bundle to a VM that is executing.
+    ///
+    /// Deliberately outside the caller's `catch`: nothing has been started that
+    /// could need stopping, and a failure here is about the configuration, not
+    /// about a guest that has to be released.
+    private func startProvisionedGuest() async throws {
+        guard !credentials.password.isEmpty else {
+            throw VivError(
+                .provisioning,
+                "This bundle's guest password is not available. Passwords are generated per run "
+                    + "and deliberately never persisted, so a bundle can only be provisioned by the "
+                    + "same invocation that created it. Use `all`, or `provision --from-template`."
+            )
+        }
+        try await createAndStartRunVM()
+    }
+
+    /// The other half: find the guest, and hold a runner that has authenticated
+    /// to it. Everything after this point differs between the selftest's
+    /// scripted proof and a user's test command.
+    private func connectToGuest() async throws -> SSHCommandRunner {
+        let address = try await resolveAddress()
+        let ssh = SSHCommandRunner(
+            username: credentials.username,
+            password: credentials.password,
+            address: address,
+            knownHostsFile: paths.knownHosts
+        )
+        try await waitForSSHReadiness(ssh: ssh)
+        return ssh
+    }
+
+    /// Collects what can still be collected from a guest whose run has failed,
+    /// then stops it — unless the operator asked to keep it for inspection.
+    private func abandonGuest(after error: any Error) async {
+        await captureFailureDiagnostics(error: error)
+        if options.keepGoing {
+            log.warn(
+                "--keep-going: leaving the VM booted at "
+                    + (report.guestAddress ?? "an undiscovered address")
+                    + " so the guest can be inspected. Stop it with Ctrl-C when finished."
+            )
+        } else {
+            await forceStopForCleanup()
+        }
+    }
+
     private func createAndStartRunVM() async throws {
         transition(to: .creatingRunVM)
 
-        if !FileManager.default.fileExists(atPath: paths.artifactDisk.path) {
+        if options.includesArtifactDisk,
+           !FileManager.default.fileExists(atPath: paths.artifactDisk.path) {
             try await ArtifactDiskManager.create(
                 paths: paths,
                 volumeName: manifest.expectations.artifactVolumeName
@@ -542,6 +585,7 @@ final class Orchestrator {
             macAddress: macAddress,
             cpuCount: manifest.cpuCount ?? VMConfigurationFactory.computeCPUCount(),
             memorySize: manifest.memorySizeBytes ?? VMConfigurationFactory.computeMemorySize(),
+            includesArtifactDisk: options.includesArtifactDisk,
             shareReadOnly: options.shareReadOnly,
             artifactReadOnly: options.artifactReadOnly
         )
@@ -1004,6 +1048,381 @@ final class Orchestrator {
         log.info("Artifact disk marker matched after detachment.")
     }
 
+    // MARK: - Test runs
+
+    /// `run`: the core pipeline.
+    ///
+    /// Returns a report for every outcome the guest is capable of producing —
+    /// a passing test, a failing one, a timed-out one — and throws only when
+    /// Vivarium itself could not do its job. That split is what makes the exit
+    /// codes meaningful: the caller turns the report into 0 or 1, and a thrown
+    /// error into 70.
+    func runTest(plan: TestPlan) async throws -> TestRunReport {
+        try Entitlement.require(stage: .preflight)
+        let startedAt = Date()
+
+        try await measure("materialise") {
+            try await prepareBundleFromTemplate(plan.templateRoot)
+        }
+        guard let layout else {
+            throw VivError(
+                .bundlePreparation,
+                "A test run needs a run directory under \(VivariumHome.runs.path); "
+                    + "--bundle is not supported by `viv run`."
+            )
+        }
+
+        try await measure("stage code") {
+            transition(to: .stagingCode)
+            _ = try await CodeStager.stage(from: plan.codeDirectory, to: layout.sharedCode)
+            // Created before the guest boots, so the share the guest mounts
+            // already has somewhere to put artifacts. A directory created
+            // later on the host does appear in the guest, but relying on that
+            // makes the run depend on VirtioFS invalidation timing for no
+            // reason.
+            try createDirectory(layout.sharedArtifacts, stage: .codeStaging)
+            try createDirectory(layout.results, stage: .codeStaging)
+        }
+
+        try await startProvisionedGuest()
+
+        let execution: TestExecution
+        var artifacts: [ArtifactEntry] = []
+        var warnings: [String] = []
+        var shutdownError: (any Error)?
+        do {
+            let ssh = try await measure("boot to ssh") { try await connectToGuest() }
+
+            try await measure("prepare guest") { try await prepareGuestWorkdir(ssh: ssh) }
+            execution = try await measure("test") { try await executeTest(ssh: ssh, plan: plan) }
+            (artifacts, warnings) = await measure("harvest") {
+                await harvest(ssh: ssh, plan: plan, layout: layout, execution: execution)
+            }
+
+            // A guest that will not shut down is reported, not fatal: the test
+            // has already produced its verdict, and throwing here would throw
+            // the report away with it.
+            do {
+                try await measure("shutdown") { try await shutdown(ssh: ssh) }
+            } catch {
+                shutdownError = error
+                log.error("The guest did not shut down cleanly: \(VivError.describe(error))")
+            }
+        } catch {
+            await abandonGuest(after: error)
+            throw error
+        }
+
+        let status: TestRunStatus = execution.timedOut
+            ? .timedOut
+            : (execution.exitCode == 0 ? .passed : .failed)
+        let deleted = await cleanUp(status: status, plan: plan, layout: layout)
+
+        let report = TestRunReport(
+            runID: manifest.runID,
+            vivariumVersion: Viv.releaseVersion,
+            status: status,
+            startedAt: startedAt,
+            finishedAt: Date(),
+            codeDirectory: plan.codeDirectory.path,
+            manifestPath: plan.manifestPath?.path,
+            projectName: plan.projectName,
+            command: plan.command,
+            commandSource: plan.commandSource,
+            templatePath: plan.templateRoot.path,
+            templateBuild: manifest.restoreImageBuild,
+            guestUsername: credentials.username,
+            guestAddress: self.report.guestAddress,
+            guestWorkdir: GuestTestScript.workdirDisplayPath,
+            timeoutSeconds: plan.timeout.elapsedSeconds,
+            timedOut: execution.timedOut,
+            testExitCode: execution.exitCode,
+            phases: phases,
+            totalSeconds: startedAt.distance(to: Date()),
+            artifacts: artifacts,
+            artifactByteCount: artifacts.reduce(0) { $0 + $1.byteCount },
+            harvestWarnings: warnings
+                + (shutdownError.map { ["the guest did not shut down cleanly: " + VivError.describe($0)] } ?? []),
+            resultsPath: layout.results.path,
+            deletedPaths: deleted,
+            keptForInspection: deleted.isEmpty
+        )
+
+        try JSONCoding.write(report, to: layout.reportJSON)
+        try Data(report.markdownText.utf8).write(to: layout.reportMarkdown, options: .atomic)
+
+        transition(to: status == .passed ? .succeeded : .failed)
+        finish(outcome: status.rawValue)
+        return report
+    }
+
+    /// What the test command did, whether or not it got to decide.
+    private struct TestExecution {
+        /// `nil` when the command never reached an exit: a timeout, or a
+        /// connection that went away underneath it.
+        let exitCode: Int32?
+        let timedOut: Bool
+        let stdout: Data
+        let stderr: Data
+    }
+
+    /// Copies the staged code out of the share and into a guest-local workdir.
+    private func prepareGuestWorkdir(ssh: SSHCommandRunner) async throws {
+        transition(to: .preparingGuestWorkdir)
+
+        let script = GuestTestScript.prepareScript
+        let result = try await ssh.run(
+            remoteCommand: ShellEscaping.base64RemoteCommand(script: script),
+            timeout: Timeouts.guestWorkdirPreparation,
+            redactedCommand: "<base64-encoded workdir preparation script>"
+        )
+
+        guard case let .remoteExit(code) = result.outcome, code == 0 else {
+            throw VivError(
+                .sshCommand,
+                "The guest could not prepare its workdir from the share: \(describe(result.outcome)).\n"
+                    + "  stdout: \(result.stdoutText.trimmed(to: 1000))\n"
+                    + "  stderr: \(result.stderrText.trimmed(to: 1000))",
+                inspectionHints: ["cat \(paths.runLog.path)"]
+            )
+        }
+        log.info("Guest workdir \(GuestTestScript.workdirDisplayPath) is ready.")
+    }
+
+    /// Runs the user's command, streaming both of its streams to the terminal
+    /// as they arrive and capturing them in full.
+    private func executeTest(ssh: SSHCommandRunner, plan: TestPlan) async throws -> TestExecution {
+        transition(to: .executingTestCommand)
+        log.info("Running in the guest: \(plan.command)")
+
+        let script = GuestTestScript.testScript(
+            command: plan.command,
+            environment: plan.environment,
+            runID: manifest.runID
+        )
+        let remoteCommand = ShellEscaping.base64RemoteCommand(script: script)
+        let redacted = "<base64-encoded test script, \(script.count) characters>"
+
+        let echo = GuestEcho()
+        let stdout = LineStream { echo.stdout($0) }
+        let stderr = LineStream { echo.stderr($0) }
+
+        // Two bounds on one attempt, per the rule the POC paid for: the ssh
+        // process gets the user's budget and is killed at it, and the attempt
+        // as a whole gets a short grace period on top so that a child the
+        // kernel will not reap cannot hang the run. The streams are held here
+        // rather than inside the attempt, so an abandoned attempt still leaves
+        // its partial output where it can be reported.
+        let attempted = await withTimeout(plan.timeout + Timeouts.testCommandGrace) {
+            () -> Result<SSHResult, any Error> in
+            do {
+                return .success(try await ssh.runStreaming(
+                    remoteCommand: remoteCommand,
+                    timeout: plan.timeout,
+                    redactedCommand: redacted,
+                    onStdout: { stdout.append($0) },
+                    onStderr: { stderr.append($0) }
+                ))
+            } catch {
+                return .failure(error)
+            }
+        }
+        stdout.finish()
+        stderr.finish()
+
+        guard let attempted else {
+            log.error(
+                "The test command did not return within \(plan.timeout) plus a "
+                    + "\(Timeouts.testCommandGrace) grace period; abandoning it."
+            )
+            return TestExecution(exitCode: nil, timedOut: true, stdout: stdout.data, stderr: stderr.data)
+        }
+        let result = try attempted.get()
+
+        switch result.outcome {
+        case let .remoteExit(code):
+            log.info("The test command exited \(code).")
+            return TestExecution(exitCode: code, timedOut: false, stdout: stdout.data, stderr: stderr.data)
+
+        case let .localFailure(detail):
+            guard result.command.timedOut else {
+                throw VivError(
+                    .testExecution,
+                    "The ssh process running the test command failed: \(detail)"
+                )
+            }
+            log.error("The test command exceeded its \(plan.timeout) budget and was terminated.")
+            return TestExecution(exitCode: nil, timedOut: true, stdout: stdout.data, stderr: stderr.data)
+
+        case let .transportFailure(detail):
+            // ssh reserves 255 for its own errors, so a test command that
+            // exits 255 is indistinguishable from a connection that broke.
+            // Saying both is more honest than picking one.
+            throw VivError(
+                .testExecution,
+                "The connection to the guest failed while the test command was running: "
+                    + detail.trimmed(to: 500)
+                    + "\nA test command that exits 255 is reported the same way, because OpenSSH "
+                    + "uses that status for its own failures; choose another status if the "
+                    + "distinction matters.",
+                inspectionHints: ["cat \(paths.runLog.path)"]
+            )
+        }
+    }
+
+    /// Gets everything the test produced back onto the host.
+    ///
+    /// Two halves. The manifest's globs are resolved *in the guest*, because
+    /// that is where the files are, and their matches are copied into
+    /// `$VIV_ARTIFACTS` — which is on the share, so the host already has them.
+    /// The host then lifts the whole of `Shared/artifacts` into
+    /// `results/artifacts`, which is what survives the bundle's deletion.
+    ///
+    /// Never throws. A pattern that matched nothing, or a copy that failed, is
+    /// a warning on a report that still says what the test did; losing the
+    /// verdict over a missing log file would be a poor trade.
+    private func harvest(
+        ssh: SSHCommandRunner,
+        plan: TestPlan,
+        layout: RunLayout,
+        execution: TestExecution
+    ) async -> ([ArtifactEntry], [String]) {
+        transition(to: .harvestingArtifacts)
+        var warnings: [String] = []
+
+        do {
+            try Data(execution.stdout).write(to: layout.testStdout, options: .atomic)
+            try Data(execution.stderr).write(to: layout.testStderr, options: .atomic)
+        } catch {
+            warnings.append("could not write the captured streams: " + VivError.describe(error))
+        }
+
+        if !plan.artifactPatterns.isEmpty {
+            let script = GuestTestScript.harvestScript(patterns: plan.artifactPatterns)
+            let result = try? await ssh.run(
+                remoteCommand: ShellEscaping.base64RemoteCommand(script: script),
+                timeout: Timeouts.harvest,
+                redactedCommand: "<base64-encoded artifact harvest script>"
+            )
+            if let result {
+                // The guest's own complaints — an unmatched pattern, a failed
+                // copy — arrive on stderr, one per line, already phrased for a
+                // person.
+                for line in result.stderrText.split(separator: "\n") where line.hasPrefix("viv: ") {
+                    warnings.append(String(line.dropFirst("viv: ".count)))
+                }
+                if result.remoteExitCode != 0 {
+                    warnings.append(
+                        "the guest-side harvest reported \(describe(result.outcome))"
+                    )
+                }
+            } else {
+                warnings.append("the guest-side harvest could not be run")
+            }
+        }
+
+        do {
+            try createDirectory(layout.resultsArtifacts, stage: .harvest)
+            let copy = try await ProcessRunner.run(
+                "/bin/cp", ["-c", "-R", layout.sharedArtifacts.path + "/.", layout.resultsArtifacts.path],
+                timeout: Timeouts.harvest,
+                stage: .harvest
+            )
+            if !copy.succeeded {
+                warnings.append(
+                    "copying the share's artifacts into results/ failed: "
+                        + copy.stderrText.trimmed(to: 300)
+                )
+            }
+        } catch {
+            warnings.append("could not collect artifacts: " + VivError.describe(error))
+        }
+
+        let artifacts = inventory(of: layout.resultsArtifacts)
+        log.info(
+            "Harvested \(artifacts.count) file(s), "
+                + artifacts.reduce(0) { $0 + $1.byteCount }.formattedByteCount
+                + ", into \(layout.resultsArtifacts.path)."
+        )
+        return (artifacts, warnings)
+    }
+
+    /// Every regular file under `root`, by path relative to it.
+    private func inventory(of root: URL) -> [ArtifactEntry] {
+        let manager = FileManager.default
+        guard let enumerator = manager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: []
+        ) else {
+            return []
+        }
+
+        let prefix = root.standardizedFileURL.path + "/"
+        var entries: [ArtifactEntry] = []
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard values?.isRegularFile == true else { continue }
+            let path = url.standardizedFileURL.path
+            entries.append(
+                ArtifactEntry(
+                    path: path.hasPrefix(prefix) ? String(path.dropFirst(prefix.count)) : path,
+                    byteCount: Int64(values?.fileSize ?? 0)
+                )
+            )
+        }
+        return entries.sorted { $0.path < $1.path }
+    }
+
+    /// Deletes what a successful run no longer needs, and returns what went.
+    ///
+    /// Only a passing test earns the deletion. A failed or timed-out one leaves
+    /// the bundle and the share exactly as the guest left them, because the
+    /// next question is always "what did it actually do in there?".
+    private func cleanUp(status: TestRunStatus, plan: TestPlan, layout: RunLayout) async -> [String] {
+        guard status == .passed else {
+            log.info("Keeping \(layout.root.path): the test did not pass.")
+            return []
+        }
+        guard !plan.keepVM else {
+            log.info("--keep-vm: keeping \(layout.bundleRoot.path).")
+            return []
+        }
+
+        var deleted: [String] = []
+        for url in [layout.bundleRoot, layout.shared] {
+            do {
+                if try RunStorage.remove(url) {
+                    deleted.append(url.lastPathComponent)
+                }
+            } catch {
+                // Not fatal, and not silent. The run passed; `viv gc` exists
+                // for exactly the directory this leaves behind.
+                log.warn(VivError.describe(error))
+                return []
+            }
+        }
+        return deleted
+    }
+
+    private func createDirectory(_ url: URL, stage: VivStage) throws {
+        do {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        } catch {
+            throw VivError(stage, "Cannot create \(url.path).", underlying: error)
+        }
+    }
+
+    /// Times one phase, whether or not it succeeds.
+    ///
+    /// A failed run's timings are the more interesting ones: they say how far
+    /// it got and where it spent the time getting there.
+    private func measure<T>(_ name: String, _ body: () async throws -> T) async rethrows -> T {
+        let start = ContinuousClock.now
+        defer { phases.append(PhaseTiming(name: name, seconds: start.duration(to: .now).elapsedSeconds)) }
+        return try await body()
+    }
+
     // MARK: - Bookkeeping
 
     private func transition(to newState: VivState) {
@@ -1065,6 +1484,13 @@ final class Orchestrator {
         try? JSONCoding.write(failure, to: paths.failureReport)
         finish(outcome: "failed")
         log.error("Failure report written to \(paths.failureReport.path).")
+
+        // `results/` is the one directory a run promises to keep, so a failure
+        // report that only lives inside the bundle is a failure report the
+        // operator has to go looking for.
+        if let layout, FileManager.default.fileExists(atPath: layout.results.path) {
+            try? JSONCoding.write(failure, to: layout.failureReport)
+        }
     }
 
     private func stageForCurrentState() -> VivStage {
@@ -1080,6 +1506,10 @@ final class Orchestrator {
         case .waitingForSSH: return .sshReadiness
         case .executingAcceptanceCommand: return .sshCommand
         case .validatingVirtioFS: return .virtioFSValidation
+        case .stagingCode: return .codeStaging
+        case .preparingGuestWorkdir: return .sshCommand
+        case .executingTestCommand: return .testExecution
+        case .harvestingArtifacts: return .harvest
         case .requestingGuestShutdown, .waitingForGuestStop, .releasingRunVM: return .guestShutdown
         case .attachingArtifactReadOnly: return .artifactAttach
         case .validatingArtifact, .ejectingArtifact: return .artifactValidation
