@@ -9,8 +9,14 @@ struct CommandResult: Sendable {
     let executable: String
     /// Arguments with secrets already removed. Nothing else is ever logged.
     let redactedArguments: [String]
+    /// The process's standard output — all of it, unless the caller passed an
+    /// `outputLimit`, in which case only its last bytes.
     let stdout: Data
     let stderr: Data
+    /// How many bytes the process actually produced, which is what `stdout`
+    /// holds only when nothing was dropped.
+    let stdoutByteCount: Int
+    let stderrByteCount: Int
     let exitCode: Int32
     let terminationReason: Process.TerminationReason
     let timedOut: Bool
@@ -19,14 +25,21 @@ struct CommandResult: Sendable {
 
     var stdoutText: String { String(decoding: stdout, as: UTF8.self) }
     var stderrText: String { String(decoding: stderr, as: UTF8.self) }
+    var stdoutTruncated: Bool { stdoutByteCount > stdout.count }
+    var stderrTruncated: Bool { stderrByteCount > stderr.count }
     var succeeded: Bool { exitCode == 0 && terminationReason == .exit && !timedOut }
     var duration: TimeInterval { endedAt.timeIntervalSince(startedAt) }
 
     /// A one-line summary safe to log.
     var summary: String {
         let reason = terminationReason == .exit ? "exit" : "uncaughtSignal"
+        func describe(_ name: String, _ total: Int, _ kept: Int) -> String {
+            total > kept ? "\(name) \(total)B (last \(kept)B kept)" : "\(name) \(total)B"
+        }
         return "\(executable) \(redactedArguments.joined(separator: " ")) -> "
-            + "\(reason) \(exitCode), stdout \(stdout.count)B, stderr \(stderr.count)B"
+            + "\(reason) \(exitCode), "
+            + describe("stdout", stdoutByteCount, stdout.count) + ", "
+            + describe("stderr", stderrByteCount, stderr.count)
             + (timedOut ? ", TIMED OUT" : "")
     }
 }
@@ -35,7 +48,8 @@ struct CommandResult: Sendable {
 ///
 /// `Process.TerminationReason` is not `Codable` and raw `Data` in JSON is
 /// base64 noise, so the report carries a decoded text view alongside byte
-/// counts and a digest of each stream.
+/// counts and a digest of each stream. Only for a result captured in full: a
+/// digest of a tail would claim to identify the whole stream.
 struct CommandResultReport: Codable, Sendable {
     let executable: String
     let redactedArguments: [String]
@@ -57,8 +71,8 @@ struct CommandResultReport: Codable, Sendable {
         redactedArguments = result.redactedArguments
         stdoutText = result.stdoutText
         stderrText = result.stderrText
-        stdoutByteCount = result.stdout.count
-        stderrByteCount = result.stderr.count
+        stdoutByteCount = result.stdoutByteCount
+        stderrByteCount = result.stderrByteCount
         stdoutSHA256 = Digest.sha256Hex(result.stdout)
         stderrSHA256 = Digest.sha256Hex(result.stderr)
         exitCode = result.exitCode
@@ -78,10 +92,16 @@ enum ProcessRunner {
     /// fills its 64 KiB buffer, which is easy to hit with a verbose `ssh -v`.
     ///
     /// - Parameters:
+    ///   - outputLimit: the most of each stream to keep in the result, in
+    ///     bytes; the last such bytes are kept and the rest are dropped as they
+    ///     go past. Given by a caller that is already writing the stream
+    ///     somewhere durable and only wants a tail to reason about — without
+    ///     it, a chatty child is held in this process's memory in its entirety,
+    ///     next to a running virtual machine.
     ///   - onStdout: called with each chunk of standard output as it arrives,
     ///     on a background queue. Given for a command whose output is echoed
-    ///     live; the chunk is still accumulated into the result either way, so
-    ///     a handler never has to reassemble the stream itself.
+    ///     live; every chunk is handed over whole, whatever `outputLimit` says,
+    ///     so a handler never has to reassemble the stream itself.
     ///   - onStderr: the same, for standard error.
     static func run(
         _ executable: String,
@@ -91,6 +111,7 @@ enum ProcessRunner {
         timeout: Duration? = nil,
         redactedArguments: [String]? = nil,
         stage: VivStage,
+        outputLimit: Int? = nil,
         onStdout: (@Sendable (Data) -> Void)? = nil,
         onStderr: (@Sendable (Data) -> Void)? = nil
     ) async throws -> CommandResult {
@@ -147,8 +168,12 @@ enum ProcessRunner {
             }
         }
 
-        async let stdoutData = readToEnd(stdoutPipe.fileHandleForReading, onChunk: onStdout)
-        async let stderrData = readToEnd(stderrPipe.fileHandleForReading, onChunk: onStderr)
+        async let stdoutData = readToEnd(
+            stdoutPipe.fileHandleForReading, limit: outputLimit, onChunk: onStdout
+        )
+        async let stderrData = readToEnd(
+            stderrPipe.fileHandleForReading, limit: outputLimit, onChunk: onStderr
+        )
 
         let timedOut = await waitForExit(process, exited: exited, timeout: timeout)
 
@@ -158,8 +183,10 @@ enum ProcessRunner {
         let result = CommandResult(
             executable: executable,
             redactedArguments: redactedArguments ?? arguments,
-            stdout: out,
-            stderr: err,
+            stdout: out.kept,
+            stderr: err.kept,
+            stdoutByteCount: out.totalByteCount,
+            stderrByteCount: err.totalByteCount,
             exitCode: process.terminationStatus,
             terminationReason: process.terminationReason,
             timedOut: timedOut,
@@ -198,6 +225,12 @@ enum ProcessRunner {
         return result
     }
 
+    /// What a drained pipe produced, and how much of it was kept.
+    private struct DrainedStream: Sendable {
+        let kept: Data
+        let totalByteCount: Int
+    }
+
     /// Drains a pipe to EOF, handing every chunk onwards as it arrives.
     ///
     /// Read incrementally rather than with `readToEnd()` so that a caller
@@ -205,19 +238,32 @@ enum ProcessRunner {
     /// it. `read(upToCount:)` returns nil at EOF and, unlike `availableData`,
     /// reports a failed read as a Swift error instead of an Objective-C
     /// exception.
+    ///
+    /// With a `limit`, the oldest bytes are dropped as newer ones arrive rather
+    /// than the newest being refused: what a caller wants from a stream it did
+    /// not keep is the end of it — the error, the last thing that happened —
+    /// and the beginning is the part it can most easily do without.
     private static func readToEnd(
         _ handle: FileHandle,
+        limit: Int?,
         onChunk: (@Sendable (Data) -> Void)? = nil
-    ) async -> Data {
+    ) async -> DrainedStream {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 var collected = Data()
+                var total = 0
                 while let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
+                    total += chunk.count
                     collected.append(chunk)
+                    if let limit, collected.count > limit {
+                        collected.removeFirst(collected.count - limit)
+                    }
                     onChunk?(chunk)
                 }
                 try? handle.close()
-                continuation.resume(returning: collected)
+                continuation.resume(
+                    returning: DrainedStream(kept: collected, totalByteCount: total)
+                )
             }
         }
     }

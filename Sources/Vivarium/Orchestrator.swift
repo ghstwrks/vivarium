@@ -206,6 +206,12 @@ struct OrchestratorOptions: Sendable {
 /// off it.
 @MainActor
 final class Orchestrator {
+    /// How much of the test command's output is kept in memory once it is
+    /// safely on disk. Enough to explain an ssh failure or quote the end of a
+    /// stream, small enough that a test which prints without stopping cannot
+    /// grow this process at all.
+    static let streamTailLimit = 256 * 1024
+
     private let options: OrchestratorOptions
     private var state: VivState = .idle
     private var stateLogURL: URL?
@@ -1220,7 +1226,9 @@ final class Orchestrator {
             let ssh = try await measure("boot to ssh") { try await connectToGuest() }
 
             try await measure("prepare guest") { try await prepareGuestWorkdir(ssh: ssh) }
-            execution = try await measure("test") { try await executeTest(ssh: ssh, plan: plan) }
+            execution = try await measure("test") {
+                try await executeTest(ssh: ssh, plan: plan, layout: layout)
+            }
             (artifacts, warnings) = await measure("harvest") {
                 await harvest(ssh: ssh, plan: plan, layout: layout, execution: execution)
             }
@@ -1315,13 +1323,15 @@ final class Orchestrator {
     }
 
     /// What the test command did, whether or not it got to decide.
+    ///
+    /// Its output is not here: both streams went straight to `results/` as they
+    /// arrived. All that comes back is whatever went wrong while writing them.
     private struct TestExecution {
         /// `nil` when the command never reached an exit: a timeout, or a
         /// connection that went away underneath it.
         let exitCode: Int32?
         let timedOut: Bool
-        let stdout: Data
-        let stderr: Data
+        let captureWarnings: [String]
     }
 
     /// Copies the staged code out of the share and into a guest-local workdir.
@@ -1348,8 +1358,10 @@ final class Orchestrator {
     }
 
     /// Runs the user's command, streaming both of its streams to the terminal
-    /// as they arrive and capturing them in full.
-    private func executeTest(ssh: SSHCommandRunner, plan: TestPlan) async throws -> TestExecution {
+    /// and to `results/` as they arrive.
+    private func executeTest(
+        ssh: SSHCommandRunner, plan: TestPlan, layout: RunLayout
+    ) async throws -> TestExecution {
         transition(to: .executingTestCommand)
         log.info("Running in the guest: \(plan.command)")
 
@@ -1362,15 +1374,19 @@ final class Orchestrator {
         let redacted = "<base64-encoded test script, \(script.count) characters>"
 
         let echo = GuestEcho()
-        let stdout = LineStream { echo.stdout($0) }
-        let stderr = LineStream { echo.stderr($0) }
+        // Opened before the command runs, so the files grow with the test
+        // rather than appearing at the end of it: `tail -f` works on a run in
+        // progress, and a run killed mid-test leaves everything it had printed.
+        let stdout = try CapturedStream(file: layout.testStdout) { echo.stdout($0) }
+        let stderr = try CapturedStream(file: layout.testStderr) { echo.stderr($0) }
+        func captureWarnings() -> [String] { [stdout.warning, stderr.warning].compactMap { $0 } }
 
         // Two bounds on one attempt, per the rule the POC paid for: the ssh
         // process gets the user's budget and is killed at it, and the attempt
         // as a whole gets a short grace period on top so that a child the
         // kernel will not reap cannot hang the run. The streams are held here
-        // rather than inside the attempt, so an abandoned attempt still leaves
-        // its partial output where it can be reported.
+        // rather than inside the attempt, so an abandoned attempt still closes
+        // the files it was writing.
         let attempted = await withTimeout(plan.timeout + Timeouts.testCommandGrace) {
             () -> Result<SSHResult, any Error> in
             do {
@@ -1378,6 +1394,10 @@ final class Orchestrator {
                     remoteCommand: remoteCommand,
                     timeout: plan.timeout,
                     redactedCommand: redacted,
+                    // The captured streams are already on disk in full; what
+                    // ssh's own result needs to hold is enough of stderr to
+                    // explain an exit 255, and no more.
+                    outputLimit: Self.streamTailLimit,
                     onStdout: { stdout.append($0) },
                     onStderr: { stderr.append($0) }
                 ))
@@ -1393,14 +1413,14 @@ final class Orchestrator {
                 "The test command did not return within \(plan.timeout) plus a "
                     + "\(Timeouts.testCommandGrace) grace period; abandoning it."
             )
-            return TestExecution(exitCode: nil, timedOut: true, stdout: stdout.data, stderr: stderr.data)
+            return TestExecution(exitCode: nil, timedOut: true, captureWarnings: captureWarnings())
         }
         let result = try attempted.get()
 
         switch result.outcome {
         case let .remoteExit(code):
             log.info("The test command exited \(code).")
-            return TestExecution(exitCode: code, timedOut: false, stdout: stdout.data, stderr: stderr.data)
+            return TestExecution(exitCode: code, timedOut: false, captureWarnings: captureWarnings())
 
         case let .localFailure(detail):
             guard result.command.timedOut else {
@@ -1410,7 +1430,7 @@ final class Orchestrator {
                 )
             }
             log.error("The test command exceeded its \(plan.timeout) budget and was terminated.")
-            return TestExecution(exitCode: nil, timedOut: true, stdout: stdout.data, stderr: stderr.data)
+            return TestExecution(exitCode: nil, timedOut: true, captureWarnings: captureWarnings())
 
         case let .transportFailure(detail):
             // ssh reserves 255 for its own errors, so a test command that
@@ -1446,14 +1466,9 @@ final class Orchestrator {
         execution: TestExecution
     ) async -> ([ArtifactEntry], [String]) {
         transition(to: .harvestingArtifacts)
-        var warnings: [String] = []
-
-        do {
-            try Data(execution.stdout).write(to: layout.testStdout, options: .atomic)
-            try Data(execution.stderr).write(to: layout.testStderr, options: .atomic)
-        } catch {
-            warnings.append("could not write the captured streams: " + VivError.describe(error))
-        }
+        // The test's own streams were written as they arrived, so there is
+        // nothing left to save here — only whatever went wrong while saving.
+        var warnings: [String] = execution.captureWarnings
 
         if !plan.artifactPatterns.isEmpty {
             let script = GuestTestScript.harvestScript(patterns: plan.artifactPatterns)

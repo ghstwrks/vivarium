@@ -92,10 +92,14 @@ struct SSHCommandRunner: Sendable {
     /// a guest program which block-buffers when its output is not a terminal
     /// arrives in bursts rather than lines; that is the program's own choice
     /// and is preferable to losing the distinction between them.
+    ///
+    /// `outputLimit` caps what the result carries, for a caller that is keeping
+    /// the streams itself; the handlers still see every byte.
     func runStreaming(
         remoteCommand: String,
         timeout: Duration,
         redactedCommand: String? = nil,
+        outputLimit: Int? = nil,
         onStdout: @escaping @Sendable (Data) -> Void,
         onStderr: @escaping @Sendable (Data) -> Void
     ) async throws -> SSHResult {
@@ -103,6 +107,7 @@ struct SSHCommandRunner: Sendable {
             remoteCommand: remoteCommand,
             timeout: timeout,
             redactedCommand: redactedCommand,
+            outputLimit: outputLimit,
             onStdout: onStdout,
             onStderr: onStderr
         )
@@ -113,6 +118,7 @@ struct SSHCommandRunner: Sendable {
         stdinData: Data? = nil,
         timeout: Duration,
         redactedCommand: String?,
+        outputLimit: Int? = nil,
         onStdout: (@Sendable (Data) -> Void)? = nil,
         onStderr: (@Sendable (Data) -> Void)? = nil
     ) async throws -> SSHResult {
@@ -134,6 +140,7 @@ struct SSHCommandRunner: Sendable {
             timeout: timeout,
             redactedArguments: redacted,
             stage: .sshCommand,
+            outputLimit: outputLimit,
             onStdout: onStdout,
             onStderr: onStderr
         )
