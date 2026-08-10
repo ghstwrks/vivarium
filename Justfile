@@ -5,8 +5,8 @@
 # unsigned binary. Separating the two invites running a stale unsigned binary
 # and reading the resulting failure as a framework problem.
 
-binary_name := "vre-poc"
-entitlements := "VREPOC.entitlements"
+binary_name := "viv"
+entitlements := "Vivarium.entitlements"
 release_binary := ".build/release/" + binary_name
 debug_binary := ".build/debug/" + binary_name
 
