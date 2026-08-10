@@ -18,7 +18,31 @@ enum VivStage: String, Codable, Sendable {
     case virtioFSValidation
     case artifactAttach
     case artifactValidation
+    /// The proof ran to completion and one or more of its criteria did not
+    /// hold. Distinct from the stage-specific failures above, which stop the
+    /// run where they happen.
+    case acceptance
     case cleanup
+
+    /// Whether a failure at this stage says something about the guest rather
+    /// than about Vivarium's ability to produce one.
+    ///
+    /// This is what separates exit 1 from exit 70: a guest that would not boot,
+    /// answer SSH, or persist what it wrote is a test result, and reporting it
+    /// as an infrastructure fault would make a real finding look like a tooling
+    /// bug. Everything before the guest starts — preflight, restore, install,
+    /// template handling — is Vivarium's own responsibility and exits 70.
+    var describesGuestBehaviour: Bool {
+        switch self {
+        case .preflight, .bundlePreparation, .restoreImage, .installation,
+             .templateSnapshot, .runConfiguration, .cleanup:
+            return false
+        case .provisioning, .addressDiscovery, .sshReadiness, .sshCommand,
+             .guestShutdown, .virtioFSValidation, .artifactAttach,
+             .artifactValidation, .acceptance:
+            return true
+        }
+    }
 }
 
 /// The tool's single error type.

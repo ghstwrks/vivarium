@@ -1,234 +1,631 @@
+import ArgumentParser
 import Foundation
 
-/// The command-line entry point.
+// MARK: - Entry point
+
+/// The process entry point.
 ///
-/// Argument parsing is hand-rolled rather than pulled from swift-argument-parser
-/// so the package has no external dependencies: the point of this POC is to
-/// establish what Virtualization.framework does, and a resolved dependency graph
-/// is one more thing that could explain an unexpected result.
+/// ArgumentParser can own `main()` itself, but its default mapping exits 64
+/// (`EX_USAGE`) on a usage error, and Vivarium's contract says 2. Parsing is
+/// therefore driven by hand so that every exit — usage, guest behaviour,
+/// infrastructure — leaves through one place that also flushes the run log. A
+/// truncated failure report is far more expensive to diagnose than the
+/// microsecond the flush costs.
 @main
-struct CLI {
+enum VivariumMain {
     static func main() async {
-        let arguments = Array(CommandLine.arguments.dropFirst())
-
-        guard let subcommand = arguments.first, !subcommand.hasPrefix("-") else {
-            print(usage)
-            exit(arguments.isEmpty ? 2 : 2)
-        }
-
-        if subcommand == "help" || subcommand == "--help" || subcommand == "-h" {
-            print(usage)
-            exit(0)
-        }
-
-        let options: OrchestratorOptions
         do {
-            options = try parseOptions(Array(arguments.dropFirst()))
+            var command = try Viv.parseAsRoot()
+            if var asyncCommand = command as? AsyncParsableCommand {
+                try await asyncCommand.run()
+            } else {
+                try command.run()
+            }
+            leave(0)
+        } catch let exitCode as ExitCode {
+            leave(exitCode.rawValue)
         } catch {
-            FileHandle.standardError.write(Data(("error: \(VivError.describe(error))\n\n").utf8))
-            print(usage)
-            exit(2)
-        }
-
-        let exitCode = await dispatch(subcommand: subcommand, options: options)
-        // Flush the log file before the process ends; a run whose failure report
-        // is truncated is much harder to diagnose than one that took an extra
-        // millisecond to exit.
-        log.detachFile()
-        exit(exitCode)
-    }
-
-    private static func dispatch(subcommand: String, options: OrchestratorOptions) async -> Int32 {
-        switch subcommand {
-        case "preflight":
-            let report = await Orchestrator.preflight(options: options)
-            print(report.text)
-            return report.passed ? 0 : 1
-
-        case "install":
-            return await run(options: options) { orchestrator in
-                try await orchestrator.runInstall()
-                print("Installation complete.")
-            }
-
-        case "provision":
-            return await run(options: options) { orchestrator in
-                let report = try await orchestrator.runProvision()
-                print(report.summaryText)
-                guard report.allAcceptanceCriteriaPassed else {
-                    throw VivError(.cleanup, "One or more acceptance criteria failed.")
-                }
-            }
-
-        case "run", "all":
-            return await run(options: options) { orchestrator in
-                let report = try await orchestrator.runAll()
-                print(report.summaryText)
-                guard report.allAcceptanceCriteriaPassed else {
-                    throw VivError(.cleanup, "One or more acceptance criteria failed.")
-                }
-            }
-
-        case "validate":
-            return await run(options: options) { orchestrator in
-                let result = try await orchestrator.runValidate()
-                print(result.markerMatched
-                    ? "pass  artifact-disk marker matched (\(result.markerByteCount) bytes)"
-                    : "FAIL  artifact-disk marker did not match")
-                guard result.markerMatched else {
-                    throw VivError(.artifactValidation, "The artifact marker did not match.")
-                }
-            }
-
-        default:
-            FileHandle.standardError.write(Data("error: unknown subcommand \(subcommand)\n\n".utf8))
-            print(usage)
-            return 2
-        }
-    }
-
-    /// Runs a body against a fresh orchestrator, converting a throw into a
-    /// non-zero status and a written failure report.
-    private static func run(
-        options: OrchestratorOptions,
-        body: @escaping @Sendable (Orchestrator) async throws -> Void
-    ) async -> Int32 {
-        let orchestrator = await Orchestrator(options: options)
-        do {
-            try await body(orchestrator)
-            return 0
-        } catch {
-            log.error(VivError.describe(error))
-            await orchestrator.recordFailure(error)
-            return 1
-        }
-    }
-
-    // MARK: - Options
-
-    private static func parseOptions(_ arguments: [String]) throws -> OrchestratorOptions {
-        var options = OrchestratorOptions()
-        var index = 0
-
-        func nextValue(for flag: String) throws -> String {
-            index += 1
-            guard index < arguments.count else {
-                throw VivError(.preflight, "\(flag) requires a value.")
-            }
-            return arguments[index]
-        }
-
-        func url(_ path: String) -> URL {
-            URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
-        }
-
-        while index < arguments.count {
-            let argument = arguments[index]
-            switch argument {
-            case "--ipsw":
-                options.ipsw = url(try nextValue(for: argument))
-            case "--bundle":
-                options.bundle = url(try nextValue(for: argument))
-            case "--template":
-                options.template = url(try nextValue(for: argument))
-            case "--from-template":
-                options.fromTemplate = url(try nextValue(for: argument))
-            case "--guest-address":
-                options.guestAddress = try nextValue(for: argument)
-            case "--username":
-                options.username = try nextValue(for: argument)
-            case "--full-name":
-                options.fullName = try nextValue(for: argument)
-            case "--artifact-volume-name":
-                options.artifactVolumeName = try nextValue(for: argument)
-            case "--keep-going":
-                options.keepGoing = true
-            case "--reuse":
-                options.reuse = true
-            case "--skip-ipsw-digest":
-                options.skipIPSWDigest = true
-            case "--validate-system-disk":
-                options.validateSystemDisk = true
-            case "--query-latest":
-                options.queryLatestSupported = true
-            case "--no-auto-login":
-                options.logsInAutomatically = false
-            case "--auto-login":
-                options.logsInAutomatically = true
-            case "--share-read-only":
-                options.shareReadOnly = true
-            case "--artifact-read-only":
-                options.artifactReadOnly = true
-            case "--disable-remote-login":
-                options.disableRemoteLogin = true
+            // A help or version request reaches here as an error whose exit
+            // code is success; the library knows how to print it, and it goes
+            // to stdout because it is what was asked for.
+            switch Viv.exitCode(for: error) {
+            case .success:
+                log.detachFile()
+                Viv.exit(withError: error)
+            case .validationFailure:
+                write(Viv.fullMessage(for: error), to: FileHandle.standardError)
+                leave(ExitStatus.usage)
             default:
-                throw VivError(.preflight, "unknown option \(argument)")
+                write("error: " + VivError.describe(error), to: FileHandle.standardError)
+                leave(ExitStatus.of(error))
             }
-            index += 1
         }
-
-        return options
     }
 
-    private static let usage = """
-    vre-poc — a proof of concept for macOS 27 guest provisioning under
-    Virtualization.framework.
+    private static func leave(_ code: Int32) -> Never {
+        log.detachFile()
+        exit(code)
+    }
 
-    USAGE
-      vre-poc <subcommand> [options]
+    private static func write(_ text: String, to handle: FileHandle) {
+        handle.write(Data((text + "\n").utf8))
+    }
+}
 
-    SUBCOMMANDS
-      preflight   Check the host, the entitlement, free space, and (with --ipsw)
-                  the restore image. Creates nothing.
-      install     Restore macOS into a new bundle and snapshot a template.
-      provision   Boot an installed bundle with provisioning options and run the
-                  acceptance proof. Requires --from-template, because a guest
-                  password is generated per run and never persisted.
-      all         install followed by provision, in one process.
-      validate    Attach an existing bundle's artifact disk read-only and check
-                  its marker. Does not start a virtual machine.
+/// The exit codes Vivarium promises.
+enum ExitStatus {
+    /// The user's test failed, or the guest did not behave as asserted. Not a
+    /// Vivarium failure.
+    static let testFailure: Int32 = 1
+    static let usage: Int32 = 2
+    /// `EX_SOFTWARE`: Vivarium could not do its job.
+    static let infrastructure: Int32 = 70
 
-    OPTIONS
-      --ipsw <path>            Local macOS 27 restore image. Required for
-                               install and all: there is no download fallback,
-                               because the latest downloadable image on this
-                               host is macOS 26.6.1, which ignores provisioning
-                               options entirely.
-      --bundle <path>          Bundle directory. Defaults to
-                               ~/VRE-POC/<run-id>/VM.bundle.
-      --template <path>        Where to write the post-restore template.
-                               Defaults to ~/VRE-POC/templates/<build>.bundle.
-      --from-template <path>   Clone this template instead of restoring.
-      --guest-address <ip>     Skip address discovery and use this address.
-      --username <name>        Provisioned account short name (default vivadmin).
-      --full-name <name>       Provisioned account full name.
-      --artifact-volume-name   Volume name for the artifact disk (default
-                               VivArtifacts).
-      --reuse                  Allow a non-empty existing bundle directory.
-      --keep-going             On failure, leave the guest running for manual
-                               inspection instead of stopping it.
-      --skip-ipsw-digest       Skip hashing the restore image.
-      --validate-system-disk   Also attach the system disk read-only and look
-                               for the marker in the guest's home directory.
-                               Optional: this path is more fragile than the
-                               artifact disk and a failure is reported, not
-                               fatal.
-      --query-latest           Report what latestSupported currently offers.
-      --no-auto-login          Provision without automatic login. The artifact
-                               volume may then not automount; the acceptance
-                               script mounts it by name as a fallback.
-      --share-read-only        Negative test: attach the VirtioFS share
-                               read-only, so the guest's write must fail.
-      --artifact-read-only     Negative test: attach the artifact disk
-                               read-only.
-      --disable-remote-login   Negative test: provision without Remote Login,
-                               so the run must fail at the SSH readiness gate.
+    static func of(_ error: any Error) -> Int32 {
+        guard let vivError = error as? VivError else { return infrastructure }
+        return vivError.stage.describesGuestBehaviour ? testFailure : infrastructure
+    }
+}
 
-    ENVIRONMENT
-      VIV_DEBUG=1              Emit debug-level logging.
+// MARK: - Root command
 
-    NOTES
-      The generated guest password is held in memory only. It is never written
-      to run.json, never logged, and never placed on a command line.
-    """
+struct Viv: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "viv",
+        abstract: "Run tests autonomously inside a macOS virtual machine.",
+        discussion: """
+            Vivarium prepares a macOS 27 guest, runs a command in it, harvests \
+            what the command produced, and shuts the guest down. No human \
+            touches the guest at any point.
+
+            The usual sequence is to build a template once from a local restore \
+            image, then run against clones of it:
+
+              viv template create --ipsw ~/Downloads/UniversalMac_27.0_…_Restore.ipsw
+              cd ~/my-project && viv run -- swift test
+
+            Vivarium keeps everything it owns under ~/.vivarium, or under \
+            $VIVARIUM_HOME if that is set.
+            """,
+        version: "0.1.0-dev",
+        subcommands: [
+            PreflightCommand.self,
+            TemplateCommand.self,
+            RunCommand.self,
+            SelftestCommand.self,
+            ValidateCommand.self,
+            GCCommand.self
+        ]
+    )
+}
+
+// MARK: - Shared argument types
+
+/// A filesystem path.
+///
+/// Tildes are expanded here as well as by the shell, because a path that
+/// arrives quoted — or, later, out of a manifest — would otherwise be read as a
+/// relative directory literally named `~`.
+struct PathArgument: ExpressibleByArgument, Sendable {
+    let url: URL
+
+    init?(argument: String) {
+        guard !argument.isEmpty else { return nil }
+        url = URL(fileURLWithPath: (argument as NSString).expandingTildeInPath)
+            .standardizedFileURL
+    }
+
+    var path: String { url.path }
+}
+
+/// The guest account and address options shared by the commands that boot a
+/// guest.
+struct GuestOptions: ParsableArguments {
+    @Option(
+        name: .customLong("guest-address"),
+        help: ArgumentHelp(
+            "Use this address instead of discovering one.",
+            discussion: """
+                Skips ARP and Bonjour discovery entirely. Useful when discovery \
+                is the thing that is broken.
+                """,
+            valueName: "ip"
+        )
+    )
+    var guestAddress: String?
+
+    @Option(
+        name: .customLong("username"),
+        help: ArgumentHelp("Short name of the provisioned account.", valueName: "name")
+    )
+    var username: String = "vivadmin"
+
+    @Option(
+        name: .customLong("full-name"),
+        help: ArgumentHelp("Full name of the provisioned account.", valueName: "name")
+    )
+    var fullName: String = "Vivarium Administrator"
+
+    @Flag(
+        inversion: .prefixedNo,
+        help: ArgumentHelp(
+            "Log the guest in automatically at startup.",
+            discussion: """
+                On by default. macOS automounts volumes through a console user \
+                session, so with nobody logged in the artifact volume may never \
+                appear in the guest. The guest script mounts it by name as a \
+                fallback, so --no-auto-login is expected to work; it is a \
+                weaker path, not a broken one.
+                """
+        )
+    )
+    var autoLogin: Bool = GuestProvisioner.defaultLogsInAutomatically
+}
+
+// MARK: - preflight
+
+struct PreflightCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "preflight",
+        abstract: "Check the host, the entitlement, free space, and a restore image.",
+        discussion: """
+            Creates nothing and starts no virtual machine. Its whole value is \
+            turning a ninety-minute failure into a two-second one, so it is \
+            cheap enough to run before anything else.
+
+            Without --ipsw it checks only what does not depend on an image: \
+            architecture, host version, the virtualization entitlement on this \
+            binary, and free space in the Vivarium home.
+            """
+    )
+
+    @Option(
+        name: .customLong("ipsw"),
+        help: ArgumentHelp(
+            "Local macOS 27 restore image to inspect.",
+            valueName: "path"
+        )
+    )
+    var ipsw: PathArgument?
+
+    @Flag(
+        name: .customLong("query-latest"),
+        help: """
+            Also report what VZMacOSRestoreImage.latestSupported currently \
+            offers. Informational: the downloadable image is not usable here.
+            """
+    )
+    var queryLatest: Bool = false
+
+    func run() async throws {
+        var options = OrchestratorOptions()
+        options.ipsw = ipsw?.url
+        options.queryLatestSupported = queryLatest
+
+        let report = await Orchestrator.preflight(options: options)
+        print(report.text)
+        guard report.passed else { throw ExitCode(ExitStatus.infrastructure) }
+    }
+}
+
+// MARK: - template
+
+struct TemplateCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "template",
+        abstract: "Create and inspect the guest templates runs are cloned from.",
+        discussion: """
+            macOS evaluates first-boot provisioning options exactly once, on the \
+            first boot after a restore, so every guest must come from a freshly \
+            restored disk. A template is that restored disk, snapshotted before \
+            it is ever booted; runs clone it with APFS clonefile in a fraction \
+            of a second instead of spending ninety minutes on another restore.
+            """,
+        subcommands: [TemplateCreateCommand.self, TemplateListCommand.self],
+        defaultSubcommand: TemplateListCommand.self
+    )
+}
+
+struct TemplateCreateCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "create",
+        abstract: "Restore macOS into a bundle and snapshot it as a template.",
+        discussion: """
+            Expect this to take around ninety minutes and to need roughly 80 GiB \
+            of free space. The template is snapshotted before the guest's first \
+            boot, because booting it would consume the one provisionable boot \
+            the template exists to preserve.
+
+            A local restore image is mandatory and there is no download \
+            fallback: on this host VZMacOSRestoreImage.latestSupported resolves \
+            to macOS 26.6.1, which silently ignores guest provisioning options \
+            and would produce a template that can never be provisioned.
+            """
+    )
+
+    @Option(
+        name: .customLong("ipsw"),
+        help: ArgumentHelp("Local macOS 27 restore image to restore from.", valueName: "path")
+    )
+    var ipsw: PathArgument
+
+    @Option(
+        name: .customLong("template"),
+        help: ArgumentHelp(
+            "Where to write the template. Defaults to <home>/templates/<build>.bundle.",
+            valueName: "path"
+        )
+    )
+    var template: PathArgument?
+
+    @Flag(
+        name: .customLong("skip-ipsw-digest"),
+        help: """
+            Skip hashing the restore image. Hashing 22 GB is noise against a \
+            ninety-minute restore, so it is on by default; skip it when \
+            iterating.
+            """
+    )
+    var skipIPSWDigest: Bool = false
+
+    @Flag(
+        name: .customLong("reuse"),
+        help: "Allow the working bundle directory to already exist and be non-empty."
+    )
+    var reuse: Bool = false
+
+    func run() async throws {
+        var options = OrchestratorOptions()
+        options.ipsw = ipsw.url
+        options.template = template?.url
+        options.skipIPSWDigest = skipIPSWDigest
+        options.reuse = reuse
+
+        try await withOrchestrator(options) { orchestrator in
+            try await orchestrator.runInstall()
+            print("Template created.")
+        }
+    }
+}
+
+struct TemplateListCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "list",
+        abstract: "List the templates in the Vivarium home."
+    )
+
+    func run() async throws {
+        let directory = VivariumHome.templates
+        let summaries = await TemplateInventory.summaries(in: directory)
+
+        guard !summaries.isEmpty else {
+            print("""
+                No templates in \(directory.path).
+
+                Create one from a local macOS 27 restore image:
+                  viv template create --ipsw ~/Downloads/UniversalMac_27.0_<build>_Restore.ipsw
+                """)
+            return
+        }
+
+        let rows: [[String]] = summaries.map { summary in
+            let version: String
+            if let manifest = summary.manifest {
+                version = "macOS " + manifest.ipswVersion
+            } else {
+                version = "unreadable template.json"
+            }
+            let size: String = summary.onDiskByteCount?.formattedByteCount ?? "unknown"
+            let created: String = summary.createdAt.map { Self.dateStyle.format($0) } ?? "unknown"
+            return [summary.name, version, size, created, summary.paths.root.path]
+        }
+        let headers = ["BUILD", "VERSION", "ON DISK", "CREATED", "PATH"]
+        print(Self.table(headers: headers, rows: rows))
+    }
+
+    /// Local time without seconds: a template's age matters to the day, and a
+    /// full ISO timestamp would push the path off the terminal.
+    private static let dateStyle = Date.FormatStyle(date: .numeric, time: .shortened)
+
+    private static func table(headers: [String], rows: [[String]]) -> String {
+        let widths = headers.indices.map { column in
+            ([headers[column]] + rows.map { $0[column] }).map(\.count).max() ?? 0
+        }
+        func render(_ fields: [String]) -> String {
+            fields.indices
+                .map { $0 == fields.count - 1
+                    ? fields[$0]
+                    : fields[$0].padding(toLength: widths[$0], withPad: " ", startingAt: 0) }
+                .joined(separator: "  ")
+        }
+        return ([render(headers)] + rows.map(render)).joined(separator: "\n")
+    }
+}
+
+// MARK: - run
+
+struct RunCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "run",
+        abstract: "Run a test command inside a fresh guest. (Not yet implemented.)",
+        discussion: """
+            The core pipeline: clone a template, provision and boot a guest, \
+            stage the code directory into it, run the test command, harvest \
+            artifacts, write a report, and delete the expensive bundle on \
+            success. It is not implemented in this phase.
+            """
+    )
+
+    func run() async throws {
+        FileHandle.standardError.write(Data("""
+            viv run is not implemented in this phase.
+
+            Until it lands, `viv selftest` exercises the same provisioning, \
+            SSH, and artifact-harvesting machinery against Vivarium's own \
+            acceptance criteria.
+
+            """.utf8))
+        throw ExitCode(ExitStatus.infrastructure)
+    }
+}
+
+// MARK: - selftest
+
+struct SelftestCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "selftest",
+        abstract: "Prove, end to end, that a guest can be provisioned and observed.",
+        discussion: """
+            Boots a guest with first-boot provisioning, authenticates over SSH \
+            as the provisioned account, runs a scripted command, and checks \
+            thirteen criteria covering stdout, stderr, the remote exit code, the \
+            VirtioFS share, a graceful shutdown, and an artifact disk read back \
+            on the host after the machine is released. This is Vivarium's own \
+            integration test, inherited from the proof of concept.
+
+            With no path options it clones the newest template in the Vivarium \
+            home. With --from-template it clones the one named. With --ipsw and \
+            no template it takes the cold path: restore, snapshot a template, \
+            then run the proof, which takes around ninety minutes.
+
+            The guest password is generated per run, kept in memory, and never \
+            written to run.json, logged, or placed on a command line. That is \
+            why a bundle from an earlier invocation cannot be provisioned by a \
+            later one.
+
+            Exits 1 when the guest failed to behave as asserted, and 70 when \
+            Vivarium could not get far enough to ask.
+            """
+    )
+
+    @OptionGroup var guest: GuestOptions
+
+    @Option(
+        name: .customLong("from-template"),
+        help: ArgumentHelp("Clone this template instead of restoring.", valueName: "path")
+    )
+    var fromTemplate: PathArgument?
+
+    @Option(
+        name: .customLong("ipsw"),
+        help: ArgumentHelp(
+            """
+            Local macOS 27 restore image. Given alone it selects the cold path: \
+            restore, snapshot, then prove. Given with a template it only \
+            asserts that the template was built from this image.
+            """,
+            valueName: "path"
+        )
+    )
+    var ipsw: PathArgument?
+
+    @Option(
+        name: .customLong("artifact-volume-name"),
+        help: ArgumentHelp("Volume name for the artifact disk.", valueName: "name")
+    )
+    var artifactVolumeName: String?
+
+    @Flag(
+        name: .customLong("validate-system-disk"),
+        help: """
+            Also attach the guest's system disk read-only afterwards and look \
+            for the marker in the account's home directory. Reported, never \
+            fatal: this path is more fragile than the artifact disk.
+            """
+    )
+    var validateSystemDisk: Bool = false
+
+    @Flag(
+        name: .customLong("keep-going"),
+        help: """
+            On failure, leave the guest running for inspection instead of \
+            stopping it. Stop it with Ctrl-C when finished.
+            """
+    )
+    var keepGoing: Bool = false
+
+    @Flag(
+        name: .customLong("reuse"),
+        help: "Allow the working bundle directory to already exist and be non-empty."
+    )
+    var reuse: Bool = false
+
+    @Flag(
+        name: .customLong("skip-ipsw-digest"),
+        help: "Skip hashing the restore image on the cold path."
+    )
+    var skipIPSWDigest: Bool = false
+
+    @Flag(
+        name: .customLong("share-read-only"),
+        help: """
+            Negative test: attach the VirtioFS share read-only, so the guest's \
+            write to it must fail.
+            """
+    )
+    var shareReadOnly: Bool = false
+
+    @Flag(
+        name: .customLong("artifact-read-only"),
+        help: "Negative test: attach the artifact disk read-only."
+    )
+    var artifactReadOnly: Bool = false
+
+    @Flag(
+        name: .customLong("disable-remote-login"),
+        help: """
+            Negative test: provision without Remote Login, so the run must fail \
+            at the SSH readiness gate rather than at boot.
+            """
+    )
+    var disableRemoteLogin: Bool = false
+
+    func run() async throws {
+        var options = OrchestratorOptions()
+        options.ipsw = ipsw?.url
+        options.fromTemplate = fromTemplate?.url
+        options.guestAddress = guest.guestAddress
+        options.username = guest.username
+        options.fullName = guest.fullName
+        options.logsInAutomatically = guest.autoLogin
+        options.artifactVolumeName = artifactVolumeName
+        options.validateSystemDisk = validateSystemDisk
+        options.keepGoing = keepGoing
+        options.reuse = reuse
+        options.skipIPSWDigest = skipIPSWDigest
+        options.shareReadOnly = shareReadOnly
+        options.artifactReadOnly = artifactReadOnly
+        options.disableRemoteLogin = disableRemoteLogin
+
+        // A named template wins over --ipsw, which then only pins the build the
+        // template must have been made from. Restoring is the expensive path
+        // and is never chosen on the operator's behalf.
+        let warmPath: Bool
+        if options.fromTemplate != nil {
+            warmPath = true
+        } else if options.ipsw != nil {
+            warmPath = false
+        } else {
+            guard let newest = await TemplateInventory.newest() else {
+                throw VivError(
+                    .bundlePreparation,
+                    """
+                    No template in \(VivariumHome.templates.path), and neither \
+                    --from-template nor --ipsw was given.
+
+                    Create one:
+                      viv template create --ipsw <path to a macOS 27 restore image>
+                    """
+                )
+            }
+            log.info("Using the newest template: \(newest.paths.root.path).")
+            options.fromTemplate = newest.paths.root
+            warmPath = true
+        }
+
+        try await withOrchestrator(options) { orchestrator in
+            let report = warmPath
+                ? try await orchestrator.runProvision()
+                : try await orchestrator.runAll()
+            print(report.summaryText)
+            guard report.allAcceptanceCriteriaPassed else {
+                throw VivError(.acceptance, "One or more acceptance criteria failed.")
+            }
+        }
+    }
+}
+
+// MARK: - validate
+
+struct ValidateCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "validate",
+        abstract: "Re-check an existing bundle's artifact disk on the host.",
+        discussion: """
+            Attaches the bundle's artifact image read-only and compares its \
+            marker against the expectations recorded in the bundle's run.json. \
+            Starts no virtual machine, so it is safe to run against a bundle \
+            kept from a failed run.
+            """
+    )
+
+    @Option(
+        name: .customLong("bundle"),
+        help: ArgumentHelp("The VM bundle directory to validate.", valueName: "path")
+    )
+    var bundle: PathArgument
+
+    func run() async throws {
+        var options = OrchestratorOptions()
+        options.bundle = bundle.url
+
+        try await withOrchestrator(options) { orchestrator in
+            let result = try await orchestrator.runValidate()
+            print(result.markerMatched
+                ? "pass  artifact-disk marker matched (\(result.markerByteCount) bytes)"
+                : "FAIL  artifact-disk marker did not match")
+            guard result.markerMatched else {
+                throw VivError(.artifactValidation, "The artifact marker did not match.")
+            }
+        }
+    }
+}
+
+// MARK: - gc
+
+struct GCCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "gc",
+        abstract: "Delete run directories from the Vivarium home. (Not yet implemented.)",
+        discussion: """
+            Deletes only under <home>/runs, never templates and never anything \
+            the proof of concept left in ~/VRE-POC. It is not implemented in \
+            this phase.
+            """
+    )
+
+    @Flag(name: .customLong("dry-run"), help: "List what would be deleted and delete nothing.")
+    var dryRun: Bool = false
+
+    @Flag(name: .customLong("all"), help: "Delete every run directory.")
+    var all: Bool = false
+
+    @Option(
+        name: .customLong("older-than"),
+        help: ArgumentHelp("Delete run directories older than this many days.", valueName: "days")
+    )
+    var olderThan: Int?
+
+    func run() async throws {
+        FileHandle.standardError.write(Data("""
+            viv gc is not implemented in this phase.
+
+            Run directories are under \(VivariumHome.runs.path) and can be \
+            removed with rm -rf until it lands.
+
+            """.utf8))
+        throw ExitCode(ExitStatus.infrastructure)
+    }
+}
+
+// MARK: - Orchestrator plumbing
+
+/// Runs `body` against a fresh orchestrator, recording a failure report before
+/// the error escapes.
+///
+/// The report has to be written from here rather than from the throwing code,
+/// because only the orchestrator knows the state it reached and only the caller
+/// knows the run is over.
+private func withOrchestrator(
+    _ options: OrchestratorOptions,
+    _ body: @escaping @Sendable (Orchestrator) async throws -> Void
+) async throws {
+    let orchestrator = await Orchestrator(options: options)
+    do {
+        try await body(orchestrator)
+    } catch {
+        log.error(VivError.describe(error))
+        await orchestrator.recordFailure(error)
+        throw error
+    }
 }
