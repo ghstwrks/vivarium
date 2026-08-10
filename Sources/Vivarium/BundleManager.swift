@@ -24,8 +24,8 @@ enum BundleManager {
             }
         }
 
-        for directory in [paths.root, paths.sharedDirectory, paths.sharedInput,
-                          paths.sharedOutput, paths.logsDirectory, paths.diagnosticsDirectory] {
+        for directory in [paths.root, paths.sharedDirectory,
+                          paths.logsDirectory, paths.diagnosticsDirectory] {
             do {
                 try manager.createDirectory(at: directory, withIntermediateDirectories: true)
             } catch {

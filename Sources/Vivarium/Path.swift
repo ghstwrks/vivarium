@@ -8,15 +8,22 @@ import Foundation
 struct VMBundlePaths: Sendable {
     let root: URL
 
+    /// The host directory exported to the guest over VirtioFS.
+    ///
+    /// It lives outside the bundle whenever a `RunLayout` supplies it, because
+    /// the bundle is the expensive thing a successful run deletes and the share
+    /// carries the harvest back. Keeping the two separate means cleanup is a
+    /// directory removal rather than a selective one. A bundle named directly
+    /// with `--bundle` has no run directory around it, so it keeps its share
+    /// inside itself and stays self-contained.
+    let sharedDirectory: URL
+
     var auxiliaryStorage: URL { root.appendingPathComponent("AuxiliaryStorage") }
     var systemDisk: URL { root.appendingPathComponent("Disk.img") }
     var hardwareModel: URL { root.appendingPathComponent("HardwareModel") }
     var machineIdentifier: URL { root.appendingPathComponent("MachineIdentifier") }
     var macAddress: URL { root.appendingPathComponent("MACAddress") }
     var artifactDisk: URL { root.appendingPathComponent("Artifact.raw") }
-    var sharedDirectory: URL { root.appendingPathComponent("Shared") }
-    var sharedInput: URL { sharedDirectory.appendingPathComponent("input") }
-    var sharedOutput: URL { sharedDirectory.appendingPathComponent("output") }
     var knownHosts: URL { root.appendingPathComponent("ssh_known_hosts") }
     var runManifest: URL { root.appendingPathComponent("run.json") }
     var sshResult: URL { root.appendingPathComponent("ssh-result.json") }
@@ -32,8 +39,11 @@ struct VMBundlePaths: Sendable {
     /// guest, read by the host: this is the whole point of the share.
     var sharedMarker: URL { sharedDirectory.appendingPathComponent("viv-result.txt") }
 
-    init(root: URL) {
-        self.root = root.standardizedFileURL
+    init(root: URL, sharedDirectory: URL? = nil) {
+        let root = root.standardizedFileURL
+        self.root = root
+        self.sharedDirectory = (sharedDirectory ?? root.appendingPathComponent("Shared"))
+            .standardizedFileURL
     }
 
     /// The files that together constitute the VM's platform identity. They are
@@ -96,12 +106,49 @@ enum VivariumHome {
     }
 }
 
+/// The directory tree one run owns: `<home>/runs/<run-id>/`.
+///
+/// Three siblings rather than one nest, because they have three different
+/// lifetimes. `VM.bundle` is tens of gigabytes and is deleted the moment a run
+/// succeeds; `Shared/` is the channel the guest reads code from and writes
+/// artifacts to, and is deleted with it; `results/` is small, is the only thing
+/// anyone reads afterwards, and is always kept.
+struct RunLayout: Sendable {
+    let runID: String
+    let root: URL
+
+    init(runID: String, root: URL? = nil) {
+        self.runID = runID
+        self.root = (root ?? VivariumHome.run(id: runID)).standardizedFileURL
+    }
+
+    var bundleRoot: URL { root.appendingPathComponent("VM.bundle") }
+
+    /// The VirtioFS share, which the guest sees at
+    /// `AcceptanceScript.expectedSharePath`.
+    var shared: URL { root.appendingPathComponent("Shared") }
+    /// The staged copy of the user's code. The original directory is never
+    /// mounted into a guest and never written to.
+    var sharedCode: URL { shared.appendingPathComponent("code") }
+    /// The guest's `$VIV_ARTIFACTS`. Everything the guest leaves here, plus
+    /// everything matched by the manifest's `artifacts` globs, is harvested.
+    var sharedArtifacts: URL { shared.appendingPathComponent("artifacts") }
+
+    var results: URL { root.appendingPathComponent("results") }
+    var resultsArtifacts: URL { results.appendingPathComponent("artifacts") }
+    var reportJSON: URL { results.appendingPathComponent("report.json") }
+    var reportMarkdown: URL { results.appendingPathComponent("report.md") }
+    var testStdout: URL { results.appendingPathComponent("test-stdout.txt") }
+    var testStderr: URL { results.appendingPathComponent("test-stderr.txt") }
+    var failureReport: URL { results.appendingPathComponent("failure.json") }
+
+    var paths: VMBundlePaths {
+        VMBundlePaths(root: bundleRoot, sharedDirectory: shared)
+    }
+}
+
 enum DefaultLocations {
     static var templates: URL { VivariumHome.templates }
-
-    static func runBundle(runID: String) -> URL {
-        VivariumHome.run(id: runID).appendingPathComponent("VM.bundle")
-    }
 
     static func template(ipswBuild: String) -> URL {
         templates.appendingPathComponent("\(ipswBuild).bundle")

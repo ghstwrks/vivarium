@@ -185,6 +185,10 @@ final class Orchestrator {
     private let startedAt = ContinuousClock.now
 
     private var paths: VMBundlePaths!
+    /// Set for every run Vivarium sites itself, and `nil` only when the
+    /// operator named a bundle directly with `--bundle`, which has no run
+    /// directory around it.
+    private var layout: RunLayout?
     private var manifest: RunManifest!
     private var credentials: GuestCredentials!
     private var report: RunReport!
@@ -322,8 +326,13 @@ final class Orchestrator {
 
     private func prepareRunMetadata() throws {
         let runID = UUID().uuidString.lowercased()
-        let bundleRoot = options.bundle ?? DefaultLocations.runBundle(runID: runID)
-        paths = VMBundlePaths(root: bundleRoot)
+        if let bundleRoot = options.bundle {
+            paths = VMBundlePaths(root: bundleRoot)
+        } else {
+            let layout = RunLayout(runID: runID)
+            self.layout = layout
+            paths = layout.paths
+        }
 
         try BundleManager.createBundle(paths: paths, reuse: options.reuse)
         log.attachFile(at: paths.runLog)
