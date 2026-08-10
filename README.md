@@ -22,7 +22,7 @@ plan this implements is `VZMacGuestProvisioning-POC-Plan.md`.
 ## Build
 
 ```sh
-make build
+just build
 ```
 
 Building and ad-hoc signing are one target on purpose. `swift build` produces
@@ -35,7 +35,7 @@ silently use an unsigned build.
 
 ```sh
 # Check the host, entitlement, free space, and the restore image. Creates nothing.
-make preflight IPSW=~/Downloads/UniversalMac_27.0_26A5388g_Restore.ipsw
+just preflight ~/Downloads/UniversalMac_27.0_26A5388g_Restore.ipsw
 
 # The full acceptance path: restore, snapshot a template, provision, prove, validate.
 .build/release/vre-poc all --ipsw ~/Downloads/UniversalMac_27.0_26A5388g_Restore.ipsw
