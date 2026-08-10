@@ -58,26 +58,11 @@ struct SSHCommandRunner: Sendable {
         timeout: Duration,
         redactedCommand: String? = nil
     ) async throws -> SSHResult {
-        let helper = try AskpassHelper()
-        defer { helper.remove() }
-
-        var arguments = Self.baseArguments(knownHostsFile: knownHostsFile)
-        arguments.append("\(username)@\(address)")
-        arguments.append(remoteCommand)
-
-        var redacted = Self.baseArguments(knownHostsFile: knownHostsFile)
-        redacted.append("\(username)@\(address)")
-        redacted.append(redactedCommand ?? remoteCommand)
-
-        let result = try await ProcessRunner.run(
-            "/usr/bin/ssh", arguments,
-            environment: helper.environment(password: password),
+        try await invoke(
+            remoteCommand: remoteCommand,
             timeout: timeout,
-            redactedArguments: redacted,
-            stage: .sshCommand
+            redactedCommand: redactedCommand
         )
-
-        return SSHResult(outcome: Self.classify(result), command: result)
     }
 
     /// Runs a command with data on its standard input.
@@ -89,6 +74,47 @@ struct SSHCommandRunner: Sendable {
         stdinData: Data,
         timeout: Duration,
         redactedCommand: String? = nil
+    ) async throws -> SSHResult {
+        try await invoke(
+            remoteCommand: remoteCommand,
+            stdinData: stdinData,
+            timeout: timeout,
+            redactedCommand: redactedCommand
+        )
+    }
+
+    /// Runs a command, handing its output onwards as it arrives.
+    ///
+    /// Used for the user's test command, whose output has to reach the host
+    /// terminal while the test is still running. No pseudo-terminal is
+    /// requested (`ssh -t`), because a tty would merge the two streams into
+    /// one and Vivarium promises to capture them separately. The cost is that
+    /// a guest program which block-buffers when its output is not a terminal
+    /// arrives in bursts rather than lines; that is the program's own choice
+    /// and is preferable to losing the distinction between them.
+    func runStreaming(
+        remoteCommand: String,
+        timeout: Duration,
+        redactedCommand: String? = nil,
+        onStdout: @escaping @Sendable (Data) -> Void,
+        onStderr: @escaping @Sendable (Data) -> Void
+    ) async throws -> SSHResult {
+        try await invoke(
+            remoteCommand: remoteCommand,
+            timeout: timeout,
+            redactedCommand: redactedCommand,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    private func invoke(
+        remoteCommand: String,
+        stdinData: Data? = nil,
+        timeout: Duration,
+        redactedCommand: String?,
+        onStdout: (@Sendable (Data) -> Void)? = nil,
+        onStderr: (@Sendable (Data) -> Void)? = nil
     ) async throws -> SSHResult {
         let helper = try AskpassHelper()
         defer { helper.remove() }
@@ -107,7 +133,9 @@ struct SSHCommandRunner: Sendable {
             stdinData: stdinData,
             timeout: timeout,
             redactedArguments: redacted,
-            stage: .sshCommand
+            stage: .sshCommand,
+            onStdout: onStdout,
+            onStderr: onStderr
         )
 
         return SSHResult(outcome: Self.classify(result), command: result)

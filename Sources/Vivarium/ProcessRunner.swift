@@ -76,6 +76,13 @@ enum ProcessRunner {
     /// Both pipes are drained concurrently for the lifetime of the process.
     /// Reading one only after the process exits deadlocks as soon as the other
     /// fills its 64 KiB buffer, which is easy to hit with a verbose `ssh -v`.
+    ///
+    /// - Parameters:
+    ///   - onStdout: called with each chunk of standard output as it arrives,
+    ///     on a background queue. Given for a command whose output is echoed
+    ///     live; the chunk is still accumulated into the result either way, so
+    ///     a handler never has to reassemble the stream itself.
+    ///   - onStderr: the same, for standard error.
     static func run(
         _ executable: String,
         _ arguments: [String],
@@ -83,7 +90,9 @@ enum ProcessRunner {
         stdinData: Data? = nil,
         timeout: Duration? = nil,
         redactedArguments: [String]? = nil,
-        stage: VivStage
+        stage: VivStage,
+        onStdout: (@Sendable (Data) -> Void)? = nil,
+        onStderr: (@Sendable (Data) -> Void)? = nil
     ) async throws -> CommandResult {
         let startedAt = Date()
         let process = Process()
@@ -138,8 +147,8 @@ enum ProcessRunner {
             }
         }
 
-        async let stdoutData = readToEnd(stdoutPipe.fileHandleForReading)
-        async let stderrData = readToEnd(stderrPipe.fileHandleForReading)
+        async let stdoutData = readToEnd(stdoutPipe.fileHandleForReading, onChunk: onStdout)
+        async let stderrData = readToEnd(stderrPipe.fileHandleForReading, onChunk: onStderr)
 
         let timedOut = await waitForExit(process, exited: exited, timeout: timeout)
 
@@ -189,12 +198,26 @@ enum ProcessRunner {
         return result
     }
 
-    private static func readToEnd(_ handle: FileHandle) async -> Data {
+    /// Drains a pipe to EOF, handing every chunk onwards as it arrives.
+    ///
+    /// Read incrementally rather than with `readToEnd()` so that a caller
+    /// echoing the guest's output sees it during the command rather than after
+    /// it. `read(upToCount:)` returns nil at EOF and, unlike `availableData`,
+    /// reports a failed read as a Swift error instead of an Objective-C
+    /// exception.
+    private static func readToEnd(
+        _ handle: FileHandle,
+        onChunk: (@Sendable (Data) -> Void)? = nil
+    ) async -> Data {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let data = (try? handle.readToEnd()) ?? Data()
+                var collected = Data()
+                while let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
+                    collected.append(chunk)
+                    onChunk?(chunk)
+                }
                 try? handle.close()
-                continuation.resume(returning: data)
+                continuation.resume(returning: collected)
             }
         }
     }
