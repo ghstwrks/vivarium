@@ -37,7 +37,24 @@ struct GuestAddressResolver: Sendable {
         }
 
         if found.isEmpty {
-            for address in await bonjourSSHAddresses() where !found.contains(where: { $0.address == address }) {
+            // Bonjour names every `_ssh._tcp` advertiser reachable from the
+            // host, including the host itself and any other Mac on the LAN with
+            // Remote Login enabled. A guest behind Virtualization's NAT can only
+            // hold an address inside a bridge subnet, so anything outside one is
+            // definitively not this VM and is discarded rather than handed to
+            // the SSH gate, which would otherwise spend its whole timeout
+            // failing to authenticate against an unrelated machine.
+            let subnets = await Self.natBridgeInterfaces()
+            for address in await bonjourSSHAddresses() {
+                guard let subnet = subnets.first(where: { $0.contains(address: address) }) else {
+                    log.debug("Discarding Bonjour candidate \(address): outside every NAT bridge subnet.")
+                    continue
+                }
+                guard address != subnet.address else {
+                    log.debug("Discarding Bonjour candidate \(address): it is the host's own bridge address.")
+                    continue
+                }
+                guard !found.contains(where: { $0.address == address }) else { continue }
                 found.append(AddressCandidate(address: address, strategy: "bonjour"))
             }
         }
@@ -164,6 +181,13 @@ struct GuestAddressResolver: Sendable {
         let name: String
         let address: String
         let netmask: UInt32
+
+        /// Whether an address falls inside this interface's subnet.
+        func contains(address candidate: String) -> Bool {
+            guard let base = GuestAddressResolver.ipv4ToUInt32(address),
+                  let value = GuestAddressResolver.ipv4ToUInt32(candidate) else { return false }
+            return (base & netmask) == (value & netmask)
+        }
 
         /// Every host address in this interface's subnet, excluding the network
         /// address, the broadcast address, and the host's own address.

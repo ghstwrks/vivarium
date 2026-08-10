@@ -591,10 +591,13 @@ final class POCOrchestrator {
             }
 
             // The guest leaves no ARP entry until it has talked to the host, so
-            // after a few quiet rounds the cache is primed with bounded traffic
-            // confined to the NAT bridge subnet.
-            if attempt == 5 {
-                log.info("No ARP entry for \(manifest.macAddress) yet; priming the ARP cache.")
+            // the cache is primed with bounded traffic confined to the NAT
+            // bridge subnet. Priming starts on the second attempt rather than
+            // later: ARP is the only strategy that matches the persisted MAC,
+            // so the sooner it can answer, the less weight falls on Bonjour,
+            // which can only ever produce candidates.
+            if attempt >= 2 {
+                log.debug("No ARP entry for \(manifest.macAddress) yet; priming the ARP cache.")
                 await resolver.primeARPCache()
             }
 
