@@ -324,26 +324,28 @@ struct TemplateListCommand: AsyncParsableCommand {
             return [summary.name, version, size, created, summary.paths.root.path]
         }
         let headers = ["BUILD", "VERSION", "ON DISK", "CREATED", "PATH"]
-        print(Self.table(headers: headers, rows: rows))
+        print(renderTable(headers: headers, rows: rows))
     }
 
     /// Local time without seconds: a template's age matters to the day, and a
     /// full ISO timestamp would push the path off the terminal.
     private static let dateStyle = Date.FormatStyle(date: .numeric, time: .shortened)
+}
 
-    private static func table(headers: [String], rows: [[String]]) -> String {
-        let widths = headers.indices.map { column in
-            ([headers[column]] + rows.map { $0[column] }).map(\.count).max() ?? 0
-        }
-        func render(_ fields: [String]) -> String {
-            fields.indices
-                .map { $0 == fields.count - 1
-                    ? fields[$0]
-                    : fields[$0].padding(toLength: widths[$0], withPad: " ", startingAt: 0) }
-                .joined(separator: "  ")
-        }
-        return ([render(headers)] + rows.map(render)).joined(separator: "\n")
+/// A simple, left-aligned, two-space-gutter table, shared by every command
+/// that lists something rather than acting on one thing.
+private func renderTable(headers: [String], rows: [[String]]) -> String {
+    let widths = headers.indices.map { column in
+        ([headers[column]] + rows.map { $0[column] }).map(\.count).max() ?? 0
     }
+    func render(_ fields: [String]) -> String {
+        fields.indices
+            .map { $0 == fields.count - 1
+                ? fields[$0]
+                : fields[$0].padding(toLength: widths[$0], withPad: " ", startingAt: 0) }
+            .joined(separator: "  ")
+    }
+    return ([render(headers)] + rows.map(render)).joined(separator: "\n")
 }
 
 // MARK: - run
@@ -787,11 +789,22 @@ struct ValidateCommand: AsyncParsableCommand {
 struct GCCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "gc",
-        abstract: "Delete run directories from the Vivarium home. (Not yet implemented.)",
+        abstract: "Delete run directories from the Vivarium home.",
         discussion: """
-            Deletes only under <home>/runs, never templates and never anything \
-            the proof of concept left in ~/VRE-POC. It is not implemented in \
-            this phase.
+            Deletes only under <home>/runs — never templates, and never \
+            anything the proof of concept left in ~/VRE-POC.
+
+            With neither --all nor --older-than, a run counts as finished once \
+            it has a results/report.json or a results/failure.json, and only \
+            its heavy remains — VM.bundle and Shared/ — are deleted; results/ \
+            is always kept. A run directory with a VM.bundle and no report at \
+            all might still be running, so it is left alone with a note.
+
+            --older-than widens that to delete whole run directories, results \
+            included, once they are old enough by the report's finishedAt (or \
+            the directory's own modification date, when there is no report). \
+            --all deletes every run directory outright, kept-for-inspection \
+            and reportless ones included.
             """
     )
 
@@ -808,14 +821,39 @@ struct GCCommand: AsyncParsableCommand {
     var olderThan: Int?
 
     func run() async throws {
-        FileHandle.standardError.write(Data("""
-            viv gc is not implemented in this phase.
+        if all, olderThan != nil {
+            throw ValidationError("--all and --older-than are mutually exclusive.")
+        }
+        if let olderThan, olderThan <= 0 {
+            throw ValidationError("--older-than must be a positive number of days.")
+        }
 
-            Run directories are under \(VivariumHome.runs.path) and can be \
-            removed with rm -rf until it lands.
+        let selection: RunGC.Selection = all
+            ? .all
+            : olderThan.map { .olderThan(days: $0) } ?? .heavyRemainsOfFinishedRuns
 
-            """.utf8))
-        throw ExitCode(ExitStatus.infrastructure)
+        let plan = try await RunGC.plan(selection: selection)
+        guard !plan.actions.isEmpty else {
+            print("Nothing to clean: no run directories in \(VivariumHome.runs.path).")
+            return
+        }
+
+        let headers = ["RUN", "AGE", "ACTION", "SIZE", "STATUS"]
+        let rows: [[String]] = plan.actions.map { action in
+            let actionWord = action.isSkip ? "skip" : (dryRun ? "would delete" : "delete")
+            let size = action.byteCount > 0 ? action.byteCount.formattedByteCount : "-"
+            return [action.runID, action.ageDescription, actionWord, size, action.label]
+        }
+        print(renderTable(headers: headers, rows: rows))
+        print("")
+
+        guard !dryRun else {
+            print("Would reclaim \(plan.reclaimableBytes.formattedByteCount).")
+            return
+        }
+
+        try RunGC.execute(plan)
+        print("Reclaimed \(plan.reclaimableBytes.formattedByteCount).")
     }
 }
 
