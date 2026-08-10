@@ -40,13 +40,20 @@ enum RunStorage {
     }
 
     /// Bytes actually occupied, for saying how much a deletion returned.
+    ///
+    /// `du`'s exit status is ignored deliberately: a guest mounts `.Trashes`
+    /// into the share with mode `d-wx--x--t` (see `clearRemovalObstacles`
+    /// below), which `du` cannot descend into and reports with a nonzero
+    /// exit — while still printing a correct total for everything it could
+    /// read. Trusting the exit code here would silently report a multi-
+    /// gigabyte run as reclaiming 0 bytes.
     static func onDiskByteCount(of url: URL) async -> Int64? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         guard let result = try? await ProcessRunner.run(
             "/usr/bin/du", ["-s", "-k", url.path],
             timeout: .seconds(300),
             stage: .cleanup
-        ), result.succeeded else {
+        ) else {
             return nil
         }
         guard let field = result.stdoutText.split(separator: "\n").first?
