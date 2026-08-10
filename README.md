@@ -207,11 +207,18 @@ later."* Nothing is deleted on your behalf without asking, because the
 guest that just failed is usually the most useful thing on the host for
 working out why.
 
-`viv gc` is that cleanup, run later and on your terms: `viv gc --dry-run`
-to see what qualifies, `viv gc --older-than 7` to sweep anything older than
-a week, `viv gc --all` for everything. It removes the same two directories
-a successful run removes itself — `VM.bundle` and `Shared/` — and always
-keeps `results/`.
+`viv gc` is that cleanup, run later and on your terms. By default it
+removes the same two directories a successful run removes itself —
+`VM.bundle` and `Shared/` — from every *finished* run (one that wrote a
+`results/report.json` or `results/failure.json`), keeping each run's
+`results/`. A run directory with a bundle but no report yet may still be
+running, so it is skipped with a note. The two widening flags go further
+and delete **whole run directories, results included**: `viv gc
+--older-than 7` sweeps runs that finished more than a week ago, and `viv gc
+--all` removes every run outright, kept-for-inspection and reportless ones
+included. `viv gc --dry-run` shows exactly what any invocation would do,
+computed by the same code that would do it. Templates, and anything outside
+`~/.vivarium/runs/`, are never touched.
 
 ## Exit codes
 
