@@ -46,6 +46,13 @@ enum Timeouts {
     static let discoveryAttempt = Duration.seconds(5 * 60)
     static let sshReadiness = Duration.seconds(10 * 60)
     static let acceptanceCommand = Duration.seconds(120)
+    /// How long `requestStop()` is given before the in-guest fallback.
+    ///
+    /// Deliberately short. `requestStop()` is a power-button press, and a macOS
+    /// guest with a logged-in session answers it with a confirmation dialog
+    /// nobody is there to click, so waiting the full shutdown budget on it just
+    /// burns five minutes before trying the thing that works.
+    static let stopRequestAcknowledgement = Duration.seconds(90)
     static let gracefulShutdown = Duration.seconds(5 * 60)
     static let diskAttach = Duration.seconds(120)
 }
@@ -844,7 +851,7 @@ final class POCOrchestrator {
         }
 
         transition(to: .waitingForGuestStop)
-        if requested, await awaitGuestStop(relay: relay, timeout: Timeouts.gracefulShutdown) {
+        if requested, await awaitGuestStop(relay: relay, timeout: Timeouts.stopRequestAcknowledgement) {
             try confirmStopped(machine)
             report.gracefulGuestStopObserved = true
             releaseRunVM()
@@ -862,6 +869,11 @@ final class POCOrchestrator {
             redactedCommand: "sudo -S /sbin/shutdown -h now <password on stdin>"
         )
         if let result {
+            // A transport failure here is the *expected* result, not a problem:
+            // sshd goes down with the machine, so the connection is closed from
+            // under the command that asked for the shutdown. Whether it worked
+            // is decided by the guest actually stopping, below — never by this
+            // exit status.
             log.info("In-guest shutdown returned \(describe(result.outcome)).")
         }
 
@@ -881,7 +893,9 @@ final class POCOrchestrator {
         await forceStopForCleanup()
         throw POCError(
             .guestShutdown,
-            "The guest did not stop gracefully within \(Timeouts.gracefulShutdown), so a "
+            "The guest did not stop gracefully — neither within "
+                + "\(Timeouts.stopRequestAcknowledgement) of `requestStop()` nor within "
+                + "\(Timeouts.gracefulShutdown) of an in-guest `shutdown -h now` — so a "
                 + "destructive stop was used. Disk-persistence validation after a destructive "
                 + "stop cannot distinguish a guest that never wrote from one that never flushed, "
                 + "so this run is failed rather than validated.",
@@ -890,27 +904,18 @@ final class POCOrchestrator {
     }
 
     private func awaitGuestStop(relay: VMEventRelay, timeout: Duration) async -> Bool {
-        await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                for await event in relay.events {
-                    switch event {
-                    case .guestDidStop:
-                        return true
-                    case .stoppedWithError:
-                        return false
-                    case .networkAttachmentDisconnected:
-                        continue
-                    }
-                }
-                return false
-            }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                return false
-            }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            return first
+        let outcome = await withTimeout(timeout, operation: { await relay.awaitStop() })
+        switch outcome {
+        case .some(.some(.guestDidStop)):
+            return true
+        case let .some(.some(.stoppedWithError(message))):
+            log.warn("The guest stopped reporting an error: \(message)")
+            return false
+        case .some(.none):
+            return false
+        case .none:
+            log.warn("The guest had not stopped after \(timeout).")
+            return false
         }
     }
 
