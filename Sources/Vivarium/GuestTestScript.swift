@@ -88,24 +88,42 @@ enum GuestTestScript {
     /// command's own status and the run reports what the test decided. `set -e`
     /// covers the preamble: a failure to reach the workdir must not be reported
     /// as the test's result.
+    ///
+    /// It is then turned off again for the command itself, because the command
+    /// is the user's shell script and not Vivarium's. Under `-e` a multi-line
+    /// `test:` stops at its first non-zero line — including the ones that are
+    /// meant to fail, like a grep that finds nothing — and under `-u` a
+    /// reference to an unset variable kills the run outright. Neither is what
+    /// the same lines would do in the shell the user tried them in, and a test
+    /// harness that quietly changes the semantics of what it runs is worse than
+    /// one that runs it plainly.
+    ///
+    /// Vivarium's own variables are exported last so that they hold whatever
+    /// the caller passed: the manifest parser rejects an `env` that names one
+    /// of them, but this script is the only place that can guarantee it, and
+    /// `$VIV_ARTIFACTS` pointing somewhere other than the share would silently
+    /// harvest nothing.
     static func testScript(
         command: String,
         environment: [String: String],
         runID: String
     ) -> String {
-        var exports = [
-            "export VIV_RUN_ID=\(ShellEscaping.singleQuoted(runID))",
-            "export VIV_ARTIFACTS=\(ShellEscaping.singleQuoted(artifactsGuestPath))"
-        ]
-        for name in environment.keys.sorted() {
+        var exports: [String] = []
+        for name in environment.keys.sorted() where !reservedEnvironmentNames.contains(name) {
             exports.append("export \(name)=\(ShellEscaping.singleQuoted(environment[name]!))")
         }
+        exports.append("export VIV_RUN_ID=\(ShellEscaping.singleQuoted(runID))")
+        exports.append("export VIV_ARTIFACTS=\(ShellEscaping.singleQuoted(artifactsGuestPath))")
 
         return """
         set -eu
 
         cd "\(workdirShellExpression)"
         \(exports.joined(separator: "\n"))
+
+        # From here on the script is the user's, and behaves as it would in
+        # their own shell.
+        set +eu
 
         \(command)
         """
@@ -136,6 +154,11 @@ enum GuestTestScript {
         return """
         set -u
         setopt NULL_GLOB
+        # zsh's bare glob qualifiers make `*(e:'command':)` a pattern that runs
+        # a command while matching. The manifest validator presents `artifacts`
+        # as a list of inert path patterns, so they are matched as inert path
+        # patterns; the parenthesis is a literal here, as it is everywhere else.
+        setopt NO_BARE_GLOB_QUAL
 
         artifacts=\(artifacts)
         failures=0
@@ -152,12 +175,15 @@ enum GuestTestScript {
                 [ -f "$match" ] || continue
                 matched=1
                 destination="$artifacts/$match"
-                if ! /bin/mkdir -p "$(/usr/bin/dirname "$destination")"; then
+                # `--` throughout: a matched file named `-n` is a filename, not
+                # an option, and without it the harvest of an otherwise fine run
+                # fails on someone's test fixture.
+                if ! /bin/mkdir -p "$(/usr/bin/dirname -- "$destination")"; then
                     printf 'viv: could not make a place for %s on the share\\n' "$match" >&2
                     failures=1
                     continue
                 fi
-                if ! /bin/cp "$match" "$destination"; then
+                if ! /bin/cp -- "$match" "$destination"; then
                     printf 'viv: could not copy %s onto the share\\n' "$match" >&2
                     failures=1
                 fi

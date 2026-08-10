@@ -163,6 +163,12 @@ supply one.
   `$VIV_RUN_ID` is this run's identifier. `$VIV_ARTIFACTS` is a guest path on
   the share; anything the test command writes there is harvested
   automatically, whether or not it matches an `artifacts` glob.
+- **The test command is your script, run as written.** It is executed by the
+  guest's `zsh` with `-e` and `-u` off, so a multi-line `test` runs every
+  line — a step that exits non-zero does not stop the ones after it — and an
+  unset variable expands empty. The run's verdict is the exit status of the
+  last line, exactly as it would be in a shell. Put `set -e` at the top of
+  your own command if you want it.
 - **Artifact globs are resolved by the guest's zsh**, relative to the guest's
   copy of the code directory. `logs/**` behaves like `logs/*` — zsh's
   recursive-glob qualifier is a property of `**/`, not `**`, so a bare `**`
@@ -183,8 +189,8 @@ Every run's results live at `~/.vivarium/runs/<run-id>/results/`:
 results/
   report.json       machine-readable: status, timings, exit code, artifacts
   report.md         the same, formatted for reading
-  test-stdout.txt   the test command's stdout, captured in full
-  test-stderr.txt   the test command's stderr, captured in full
+  test-stdout.txt   the test command's stdout, written as it arrives
+  test-stderr.txt   the test command's stderr, written as it arrives
   run.log           Vivarium's own log for this run
   artifacts/        harvested files, mirroring the guest's working directory
 ```
@@ -267,8 +273,8 @@ the volume allows it; **provision** and boot the guest with a per-run
 password and `VZMacGuestProvisioningOptions`, so no human sees Setup
 Assistant; connect over **SSH** once the guest answers, then copy the staged
 code from the share into a guest-local working directory; **stream** the
-test command's stdout and stderr to the terminal live while capturing both
-in full, and record its exit status; **harvest** the manifest's artifact
+test command's stdout and stderr to the terminal and to `results/` at once,
+as they arrive, and record its exit status; **harvest** the manifest's artifact
 globs plus everything under `$VIV_ARTIFACTS`, both resolved and copied by
 the guest's own shell, back through the share; write the **report**
 (`report.json` and `report.md`); shut the guest down; and **delete** the
