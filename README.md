@@ -129,6 +129,33 @@ and maps the bundle's persisted MAC straight to an address. ARP remains as a
 second strategy for hosts where the permission has been granted, and Bonjour
 last, confined to the NAT bridge subnet.
 
+### `requestStop()` never stops the guest; the in-guest shutdown always does
+
+The plan gives graceful shutdown a single five-minute budget and treats the
+in-guest `sudo shutdown -h now` as the fallback. Measured over several runs,
+`requestStop()` is not the primary path at all — it has never once stopped the
+guest. It delivers a power-button press, and a macOS guest with a logged-in
+session answers that with a confirmation dialog nobody is there to click; the
+`logsInAutomatically` deviation above guarantees such a session exists.
+
+The fallback works every time, and the guest stops about six seconds later.
+`requestStop()` therefore gets 90 seconds rather than five minutes, and the
+in-guest shutdown keeps the full five. That fallback returns SSH exit 255,
+"Connection closed by remote host", because sshd goes down with the machine:
+that is the expected result, and whether the shutdown worked is decided only by
+the guest actually stopping.
+
+### The system disk's Data volume is found via `diskutil apfs list`
+
+Not `diskutil info`. The optional system-disk check identifies the Data volume
+by APFS role, because names are localised and the Signed System Volume must not
+be the one opened. `diskutil info -plist <volume>` does not report roles at all
+— no `APFSVolumeRoles` key, on any volume — so a role search built on it finds
+nothing while the volume sits in plain sight. `diskutil apfs list -plist`
+reports a `Roles` array per volume, for every container, in one call. Matches
+are intersected with the devices the attach produced, since `apfs list` also
+enumerates the host's own disks.
+
 ### The template digest covers four files, not the bundle
 
 `template.json` records a SHA-256 over `AuxiliaryStorage`, `HardwareModel`,
