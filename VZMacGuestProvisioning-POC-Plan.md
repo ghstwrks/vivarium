@@ -22,6 +22,29 @@ Extend Apple's Swift `InstallationTool` sample into a command-line proof of conc
 
 The separate artifact disk is deliberate. A VirtioFS path is backed by a host directory, not by the VM's disk image, so it can be validated directly but cannot satisfy a detached-disk-image validation by itself.
 
+## Environment verification
+
+The following was measured on this host on 2026-08-10. Facts recorded here are verified, not assumed; do not re-derive them, but do re-check them if the host is upgraded.
+
+| Item | Verified state |
+|---|---|
+| Host OS | macOS 27.0, build `26A5388g` |
+| Architecture | `arm64` |
+| Free space | ~1.0 TiB on `/System/Volumes/Data` |
+| Toolchain | Apple Swift 6.4 (`swiftlang-6.4.0.27.1`), default target `arm64-apple-macosx27.0` |
+| SDKs | `MacOSX27.0.sdk` and `MacOSX27.sdk` present under Command Line Tools; Xcode 27.0 also installed |
+| `xcode-select` | Points at `/Library/Developer/CommandLineTools`, so `xcodebuild` is unavailable without `sudo xcode-select --switch` |
+| Codesigning identities | **Zero** valid identities (`security find-identity -v -p codesigning`) |
+| Provisioning API | `VZMacGuestProvisioningOptions` present in the macOS 27 SDK with `fullName`, `username`, `password`, `logsInAutomatically`, `enablesRemoteLogin` |
+| Restore image | `~/Downloads/UniversalMac_27.0_26A5388g_Restore.ipsw` loads as version `27.0.0`, build `26A5388g`, `hardwareModel.isSupported == true`, minimum 2 CPUs / 4 GiB |
+| `VZMacOSRestoreImage.latestSupported` | Returns **26.6.1** (`25G76`) — too old for provisioning. The local IPSW must be used |
+
+Two consequences follow, and both are load-bearing for the rest of this document.
+
+**The framework cannot supply a usable guest image.** `fetchLatestSupported` returns macOS 26.6.1, and the provisioning header states that guests earlier than macOS 27 ignore these settings entirely. A run that silently falls back to the downloadable image would restore for roughly ninety minutes and then land in Setup Assistant. The download path is therefore removed from the acceptance workflow, and a version gate (Phase 3) is mandatory.
+
+**Ad-hoc code signing is sufficient.** A `swiftc`-built binary signed with `codesign -s - --entitlements` was confirmed to pass the `com.apple.security.virtualization` entitlement check: `VZVirtualMachine(configuration:)` rejected the test configuration on validity grounds (`"auxiliaryStorage" is nil`), which it only reaches after the entitlement check. No Apple Developer account, provisioning profile, or `xcode-select` change is required.
+
 ## Source baseline
 
 Use the Apple sample at:
@@ -47,28 +70,42 @@ The inspected checkout is commit:
 32fd50d874b6bab37b146eef14153fa8ccf6d111
 ```
 
-Do not begin by editing the only downloaded copy. Duplicate the sample into a development directory or create a branch/clean commit first.
+Do not begin by editing the only downloaded copy. That checkout stays pristine as the upstream reference.
+
+### Repository layout
+
+The POC lives in a new git repository at `/Users/rubynerd/Developer/vre`, already initialised on branch `main`. Vendor the needed sample sources into it rather than working in `~/Downloads`, preserving Apple's `LICENSE.txt` alongside the copied files and recording the upstream commit (`32fd50d`) in the commit message that introduces them.
 
 ## Platform requirements
 
-The SDK installed on this machine declares `VZMacGuestProvisioningOptions` as macOS 27 API, and its header says the guest must also run macOS 27 or later. Earlier guests ignore the configuration.
-
-Required baseline:
+Every requirement below is satisfied on this host; see [Environment verification](#environment-verification) for the measured values.
 
 - Apple silicon host;
 - macOS 27 or later host;
-- macOS 27 SDK/Xcode or equivalent toolchain;
-- macOS 27-or-later restore image;
-- `com.apple.security.virtualization` entitlement;
+- macOS 27 SDK (Command Line Tools is sufficient — Xcode is not required);
+- a macOS 27-or-later restore image, supplied locally;
+- `com.apple.security.virtualization` entitlement, applied by ad-hoc signature;
 - network access sufficient for guest DHCP and host-to-guest SSH;
 - enough free host storage for the restored system disk and test disks.
 
-The existing InstallationTool target currently has a macOS 14 deployment target. Either:
+## Build and code signing
 
-- raise that target to macOS 27 for the POC; or
-- retain the older target and wrap every provisioning use in `if #available(macOS 27.0, *)`.
+The Apple sample ships an Xcode project whose `InstallationTool-Swift` target sets `MACOSX_DEPLOYMENT_TARGET = 14.0`, `SWIFT_VERSION = 5.0`, `CODE_SIGN_STYLE = Automatic`, and `CODE_SIGN_IDENTITY = "Mac Developer"`. On this host that project cannot build: `xcodebuild` is not reachable through the current `xcode-select` setting, and there are no signing identities for automatic signing to select.
 
-Raising the target is simpler for an intentionally macOS-27-only experiment.
+Build the POC as a Swift package instead.
+
+- Deployment target `.macOS("27.0")`, so no `#available(macOS 27.0, *)` wrapping is needed anywhere. This is deliberately a macOS-27-only experiment.
+- Swift 6 language mode, consistent with the concurrency assumptions elsewhere in this plan (`@MainActor` orchestrator, `Sendable` value types).
+- One executable target. Add `swift-nio-ssh` only if and when the future SSH implementation is adopted; the initial proof shells out to `/usr/bin/ssh` and needs no dependencies.
+
+Signing is a required post-build step, not an optional one — an unsigned binary cannot instantiate `VZVirtualMachine`:
+
+```sh
+swift build -c release
+codesign -s - --entitlements InstallationTool.entitlements -f .build/release/vre-poc
+```
+
+The entitlements file is the sample's `InstallationTool.entitlements` verbatim: a single `com.apple.security.virtualization` boolean. Wire this into a `Makefile` or shell script so that no run can accidentally use an unsigned binary, and have the tool verify its own entitlement at startup rather than crashing with an uncaught `NSInvalidArgumentException` deep inside VM construction.
 
 ## Acceptance criteria
 
@@ -76,9 +113,11 @@ One invocation of the final `all` workflow succeeds only if every assertion belo
 
 ### Installation
 
+- The restore image reports `operatingSystemVersion.majorVersion >= 27` **before** installation begins.
 - A fresh VM bundle is created.
 - `VZMacOSInstaller` completes successfully.
 - The system disk, auxiliary storage, hardware model, and machine identifier exist.
+- A pristine template copy of the bundle is taken after restore and before first boot.
 - No human interacts with Setup Assistant.
 
 ### Provisioning and boot
@@ -113,19 +152,27 @@ One invocation of the final `all` workflow succeeds only if every assertion belo
 Refactor the sample from a single implicit behavior into explicit subcommands:
 
 ```text
-InstallationTool-Swift install [--ipsw PATH] [--bundle PATH]
-InstallationTool-Swift provision --bundle PATH
-InstallationTool-Swift run --bundle PATH [--guest-address ADDRESS]
-InstallationTool-Swift validate --bundle PATH
-InstallationTool-Swift all [--ipsw PATH] [--bundle PATH]
+vre-poc preflight [--ipsw PATH]
+vre-poc install --ipsw PATH [--bundle PATH] [--template PATH]
+vre-poc provision --bundle PATH [--from-template PATH] [--keep-going]
+vre-poc run --bundle PATH [--guest-address ADDRESS]
+vre-poc validate --bundle PATH
+vre-poc all --ipsw PATH [--bundle PATH] [--template PATH]
 ```
+
+`--ipsw` is required wherever an image is needed. There is no download fallback: on this host `VZMacOSRestoreImage.latestSupported` resolves to macOS 26.6.1, which would produce a guest that silently ignores provisioning. `preflight` may *query* and report what `latestSupported` currently offers, so the restriction can be lifted once Apple publishes a 27 image, but it never downloads and never substitutes an image for the one given.
+
+`preflight` performs every cheap check before anything expensive happens: entitlement present on the running binary, host version, free space, IPSW loads, IPSW major version >= 27, `hardwareModel.isSupported`, and CPU/memory minimums. It exits nonzero on any failure and never creates a bundle. Run it first; it turns a ninety-minute failure into a two-second one.
+
+`--keep-going` leaves a failed run's VM booted so the guest can be inspected over SSH before shutdown, rather than tearing down the only evidence.
 
 For the first implementation, `all` is the primary acceptance path. Separate commands are valuable for debugging expensive phases without reinstalling macOS.
 
 Suggested defaults:
 
 ```text
-~/VRE-POC/<run-UUID>/VM.bundle/
+~/VRE-POC/<run-UUID>/VM.bundle/          # working bundle for this run
+~/VRE-POC/templates/<ipsw-build>.bundle/ # pristine post-restore template
 ```
 
 Suggested bundle contents:
@@ -138,7 +185,6 @@ VM.bundle/
   MachineIdentifier
   MACAddress
   Artifact.raw
-  RestoreImage.ipsw          # optional; may be outside bundle
   Shared/
     input/
     output/
@@ -149,6 +195,20 @@ VM.bundle/
   logs/
 ```
 
+The IPSW deliberately lives outside the bundle. It is 22.6 GB, it is shared across runs, and copying it per run would dominate both time and disk. Reference it by path and record its digest in `run.json`.
+
+Template bundles hold only the platform identity and restored system disk, plus a `template.json` recording the source IPSW build and digest:
+
+```text
+<ipsw-build>.bundle/
+  AuxiliaryStorage
+  Disk.img
+  HardwareModel
+  MachineIdentifier
+  MACAddress
+  template.json
+```
+
 Do not reuse `~/VM.bundle` implicitly. A unique run directory prevents collisions and makes failed runs independently inspectable.
 
 ## High-level architecture
@@ -156,11 +216,17 @@ Do not reuse `~/VM.bundle` implicitly. A unique run directory prevents collision
 ```text
 POCOrchestrator (@MainActor)
     |
+    +-- PreflightChecker
+    |     entitlement, host version, space, IPSW version gate
+    |
     +-- BundleManager
     |     creates paths, run manifest, credentials, marker
     |
+    +-- TemplateManager
+    |     clones post-restore bundle; restores from template
+    |
     +-- RestoreImageManager
-    |     loads/downloads macOS 27 IPSW
+    |     loads local macOS 27 IPSW; asserts major version >= 27
     |
     +-- VMConfigurationFactory
     |     install configuration: system disk only
@@ -273,6 +339,8 @@ Add:
 
 ```text
 POCOrchestrator.swift
+PreflightChecker.swift
+TemplateManager.swift
 GuestProvisioner.swift
 GuestAddressResolver.swift
 SSHCommandRunner.swift
@@ -306,25 +374,27 @@ Store non-secret metadata in `run.json`. Keep the password in memory. If persist
 
 ### System disk
 
-Retain Apple's current behavior:
+Retain Apple's current behavior, but note what that actually resolves to here. The sample's `createDiskImage()` branches on `#available(macOS 16.0, *)`, so on this macOS 27 host it **always** takes the ASIF path and shells out to `diskutil image create blank --fs none --format ASIF --size 128GiB`. The RAW branch is dead code on this machine.
 
-- use ASIF on hosts where the sample enables it;
-- otherwise use a sparse RAW image;
-- keep a 128 GiB logical size unless a smaller value is proven sufficient for the selected restore image.
+- Keep ASIF for the system disk.
+- Keep a 128 GiB logical size unless a smaller value is proven sufficient for the selected restore image.
+- Because the system disk is ASIF, optional Phase 12 depends on `diskutil image attach` accepting ASIF read-only. That is an open question; the artifact disk deliberately does not share this dependency.
 
 ### Artifact disk
 
 Use a small RAW disk image for the proof because it is simple to attach with both Virtualization and host disk-image tooling.
 
-Suggested preparation sequence:
+This sequence was executed end-to-end on this host and works as written:
 
 1. Create a sparse 1 GiB RAW file with `open` and `ftruncate`.
-2. Attach it on the host without mounting filesystems.
-3. Partition it GPT and format one APFS volume named `VREArtifacts`.
-4. Eject it.
+2. `diskutil image attach --noMount <path>` — attaches without mounting; on a blank image this prints the device node (`/dev/disk16` in the trial run).
+3. `diskutil partitionDisk <device> GPT APFS VREArtifacts 100%` — creates the GPT map and a single APFS volume, and mounts it.
+4. `diskutil eject <device>`.
 5. Attach it to the VM with `VZDiskImageStorageDeviceAttachment` and `VZVirtioBlockDeviceConfiguration`.
 
-Prefer structured plist output from `diskutil image attach` where available. Never identify the new device by assuming it is the highest `/dev/diskN`; parse the attach command's result.
+Take structured output from `diskutil image --plist attach ...`. Note the flag position: `--plist` is an option of the `image` verb, so `diskutil --plist image attach` is rejected. The plist is a `system-entities` array whose elements carry `dev-entry`, `content-hint`, and — for mounted volumes — `volume-name`, `filesystem-type`, and `mount-point`. Locate the artifact by matching `volume-name == "VREArtifacts"` on an entry whose `content-hint` is `Apple_APFS_Volume`.
+
+Never identify the new device by assuming it is the highest `/dev/diskN`; parse the attach command's result.
 
 When constructing the Virtualization attachment, choose full synchronization for the acceptance test:
 
@@ -344,19 +414,24 @@ Full synchronization plus a graceful guest shutdown reduces ambiguity when valid
 
 ## Phase 3: install macOS
 
-Keep the Apple sample's restore-image and requirements checks:
+Keep the Apple sample's restore-image and requirements checks, and add a version gate ahead of them:
 
 1. load the local IPSW with `VZMacOSRestoreImage.load(from:)`;
-2. select `mostFeaturefulSupportedConfiguration`;
-3. verify the hardware model is supported;
-4. create auxiliary storage using that hardware model;
-5. generate and persist a machine identifier;
-6. create the system disk;
-7. configure CPU and memory at or above minimum requirements;
-8. configure the system disk as the only storage device;
-9. validate the VM configuration;
-10. invoke `VZMacOSInstaller` and observe progress;
-11. await success.
+2. **assert `restoreImage.operatingSystemVersion.majorVersion >= 27`, failing immediately if not**;
+3. select `mostFeaturefulSupportedConfiguration`;
+4. verify the hardware model is supported;
+5. create auxiliary storage using that hardware model;
+6. generate and persist a machine identifier;
+7. create the system disk;
+8. configure CPU and memory at or above minimum requirements;
+9. configure the system disk as the only storage device;
+10. validate the VM configuration;
+11. invoke `VZMacOSInstaller` and observe progress;
+12. await success.
+
+Step 2 is the single highest-value check in the plan. The IPSW available here reports `27.0.0` / `26A5388g`, but nothing prevents a future run from being pointed at the 26.6.1 image that `latestSupported` offers, and the failure mode is a ninety-minute install followed by a Setup Assistant prompt that no acceptance criterion can satisfy. Record the version and build in `run.json`.
+
+Do not carry the sample's `validateSaveRestoreSupport()` call into the run configuration. Save/restore imposes restrictions the run VM deliberately violates by attaching a directory-sharing device and a second block device. Keeping it during installation is harmless because the install configuration has neither; asserting it against the run configuration would fail for reasons unrelated to this POC.
 
 Persist an installation log containing every progress update with a monotonic timestamp.
 
@@ -367,7 +442,27 @@ After installation, nil out or otherwise release:
 - install-time storage attachment objects;
 - KVO observations.
 
-Do not delete the IPSW until the run is fully successful if it would be expensive to reacquire.
+Do not delete the IPSW until the run is fully successful if it would be expensive to reacquire. The current image is 22.6 GB.
+
+## Phase 3.5: snapshot the restored bundle before first boot
+
+macOS evaluates `VZMacGuestProvisioningOptions` only on the first boot after restore, and the framework cannot use them to reconfigure a guest it has already provisioned. Every failed experiment in Phases 5 through 9 therefore consumes one restore. Without mitigation, each debugging cycle costs roughly ninety minutes, which is the difference between a POC that can be iterated on in an afternoon and one that cannot.
+
+Immediately after installation succeeds and all install-time objects are released, and strictly **before** the first provisioned start, copy the whole bundle to a template:
+
+```text
+~/VRE-POC/templates/<ipsw-build>.bundle/
+```
+
+Requirements:
+
+- copy with `clonefile`-backed APFS cloning (`FileManager.copyItem` on APFS, or `cp -c`) so a 128 GiB sparse system disk costs seconds and near-zero space rather than a full duplication;
+- copy `AuxiliaryStorage`, `Disk.img`, `HardwareModel`, `MachineIdentifier`, and `MACAddress` together — the platform identity must stay internally consistent;
+- do **not** copy `Artifact.raw`, `Shared/`, or any result file; those are per-run and are recreated by `provision`;
+- record the IPSW build and a digest of the template contents in a `template.json`, and refuse to use a template whose IPSW build does not match the requested image;
+- treat the template as immutable. `--from-template` clones it into a fresh run bundle; it never boots the template in place, because doing so would consume the template's one provisionable first boot.
+
+`provision --from-template` then costs about the time of one clone plus one boot, and can be repeated as often as needed. `all` still performs a full install so that the acceptance run remains a genuine end-to-end proof.
 
 ## Phase 4: construct the first-boot VM
 
@@ -417,28 +512,33 @@ configuration.networkDevices = [network]
 
 ## Phase 5: configure first-boot provisioning
 
-Create provisioning options immediately before the first post-restore start:
+Create provisioning options immediately before the first post-restore start. The spelling below is taken from the macOS 27 SDK headers on this host, not inferred:
 
 ```swift
-@available(macOS 27.0, *)
 func makeStartOptions(credentials: GuestCredentials) throws
     -> VZMacOSVirtualMachineStartOptions {
     let provisioning = VZMacGuestProvisioningOptions()
     provisioning.fullName = credentials.fullName
     provisioning.username = credentials.username
     provisioning.password = credentials.password
-    provisioning.logsInAutomatically = false
+    provisioning.logsInAutomatically = true
     provisioning.enablesRemoteLogin = true
 
-    try provisioning.validate()
-
     let options = VZMacOSVirtualMachineStartOptions()
-    try options.setGuestProvisioning(provisioning)
+    try options.setGuestProvisioningOptions(provisioning)
     return options
 }
 ```
 
-Confirm the exact Swift import spelling against the final macOS 27 SDK. The current Objective-C headers expose validation and a throwing Swift-refined provisioning setter, but prerelease SDK spellings can change.
+Three details, all confirmed against `VZMacGuestProvisioningOptions.h`, `VZGuestProvisioningOptions.h`, and `VZMacOSVirtualMachineStartOptions.h`:
+
+- The setter is `setGuestProvisioningOptions:error:`, which Swift refines to `setGuestProvisioningOptions(_:) throws`. An earlier draft of this plan called it `setGuestProvisioning`, which does not exist.
+- `setGuestProvisioningOptions` validates internally and leaves the current options unchanged if validation fails, so a separate `try provisioning.validate()` call is redundant. `validateWithError:` is still available on the base class if a distinct pre-flight error is wanted; if so, expect a `VZError` carrying a guest-provisioning error code.
+- `VZGuestProvisioningOptions` marks `init` and `new` as unavailable, but `VZMacGuestProvisioningOptions` redeclares `init`, so `VZMacGuestProvisioningOptions()` is correct.
+
+No `@available(macOS 27.0, *)` guard is needed because the package's deployment target is macOS 27.
+
+**Assumption — `logsInAutomatically` is set to `true`.** The plan originally specified `false`. It is raised here because macOS automounts external volumes through `diskarbitrationd` in the context of a console user session, and with no user logged in the preformatted APFS artifact volume may never appear in the guest — which would fail the acceptance run for a reason unrelated to what is being proved. Auto-login does not weaken any acceptance criterion: the criterion is that no human interacts with Setup Assistant, and that still holds. Revert to `false` once the guest-side mount fallback in Phase 8 is confirmed to work, and record which setting was used in `run.json`.
 
 Rules:
 
@@ -613,6 +713,12 @@ share='/Volumes/My Shared Files'
 artifact='/Volumes/VREArtifacts'
 marker='<run-id>:<nonce>:<sha256>'
 
+# The artifact volume may not automount if no console session exists.
+# Mount it explicitly by volume name before asserting on it.
+if [ ! -d "$artifact" ]; then
+    /usr/sbin/diskutil mount VREArtifacts
+fi
+
 test -d "$share"
 test -w "$share"
 test -d "$artifact"
@@ -676,14 +782,30 @@ Do not host-attach any image that remains writable by a live VM.
 
 ## Phase 11: validate the detached artifact disk
 
-Attach `Artifact.raw` read-only using `diskutil image attach` with structured output where possible.
+Attach `Artifact.raw` read-only with:
+
+```sh
+diskutil image --plist attach --readOnly <path>
+```
+
+This was exercised on this host. The attach mounts the APFS volume automatically at `/Volumes/VREArtifacts`, read-only is genuinely enforced by the filesystem (`touch` fails with `Read-only file system`, and `mount` reports the `read-only` flag), a marker written before ejection reads back intact, and the plist reports:
+
+```text
+system-entities:
+  disk16   GUID_partition_scheme
+  disk16s1 Apple_APFS
+  disk17   Apple_APFS_Container
+  disk17s1 Apple_APFS_Volume  volume-name=VREArtifacts  mount-point=/Volumes/VREArtifacts
+```
+
+Note that the container and volume appear on a *different* device number than the image's own disk, so both must be tracked for cleanup, and `diskutil eject` must target the top-level image device.
 
 Validation algorithm:
 
 1. Attach read-only.
-2. Parse returned device identifiers.
-3. Locate the APFS volume named exactly `VREArtifacts`.
-4. Mount it read-only if it is not automatically mounted.
+2. Parse returned device identifiers from every `system-entities` element.
+3. Locate the entry whose `volume-name` is exactly `VREArtifacts`.
+4. Mount it read-only if `mount-point` is absent from the plist.
 5. Open `vre-result.txt` without following unexpected symlinks.
 6. Compare exact bytes to the expected marker.
 7. Record file metadata and SHA-256.
@@ -729,11 +851,13 @@ Represent orchestration as explicit states so callbacks cannot accidentally adva
 
 ```text
 idle
+  -> preflight
   -> preparingBundle
   -> preparingRestoreImage
   -> creatingInstallVM
   -> installing(progress)
   -> releasingInstallVM
+  -> snapshottingTemplate
   -> creatingRunVM
   -> startingWithProvisioning
   -> resolvingAddress
@@ -770,9 +894,11 @@ Define stage-specific errors instead of calling `fatalError`:
 
 ```swift
 enum POCStage: String, Codable {
+    case preflight
     case bundlePreparation
     case restoreImage
     case installation
+    case templateSnapshot
     case runConfiguration
     case provisioning
     case addressDiscovery
@@ -805,8 +931,9 @@ Suggested initial limits:
 
 | Operation | Timeout |
 |---|---:|
+| Preflight, excluding image load | 30 seconds |
 | Restore-image metadata load | 2 minutes |
-| Restore-image download | configurable; no short fixed limit |
+| Template clone | 5 minutes |
 | macOS installation | 90 minutes |
 | First boot and provisioning | 15 minutes |
 | Address discovery | 10 minutes |
@@ -869,10 +996,21 @@ Never log:
 10. Artifact image still busy when validation starts.
 11. Marker contents differ by one byte.
 12. Attempt to reuse provisioning options after the first boot.
+13. Install pointed at a macOS 26 IPSW, which must be rejected by the Phase 3 version gate in seconds, before any bundle or disk is created.
+14. `--from-template` pointed at a template whose recorded IPSW build does not match the requested image.
+15. Unsigned binary, which must fail with a clear entitlement message rather than an uncaught exception inside `VZVirtualMachine`.
 
 Each negative test must fail in the expected stage with useful diagnostics.
 
 ## Implementation milestones
+
+### Milestone 0: build, sign, preflight
+
+- Swift package builds against the macOS 27 SDK with a macOS 27 deployment target.
+- Ad-hoc signing applies the virtualization entitlement, and the binary self-checks it at startup.
+- `preflight --ipsw ~/Downloads/UniversalMac_27.0_26A5388g_Restore.ipsw` reports version 27.0.0, a supported hardware model, and sufficient space, and exits zero.
+
+This milestone costs minutes and gates every expensive one after it.
 
 ### Milestone 1: refactor without provisioning
 
@@ -880,18 +1018,22 @@ Each negative test must fail in the expected stage with useful diagnostics.
 - Async installer completion.
 - No `fatalError` in modified orchestration paths.
 - Existing install behavior still succeeds.
+- Template snapshot taken after restore and before first boot.
 
 ### Milestone 2: reconstruct and boot
 
 - Load saved platform identity.
-- Build run VM separately.
+- Build run VM separately, without `validateSaveRestoreSupport()`.
 - Start and gracefully stop an already manually provisioned VM.
+- `--from-template` produces a bootable run bundle in seconds rather than a reinstall.
 
 ### Milestone 3: provisioning options
 
 - Start a freshly restored macOS 27 VM with `VZMacGuestProvisioningOptions`.
 - Confirm Setup Assistant is bypassed.
 - Confirm account and Remote Login exist.
+
+Iterate this milestone from the template, not from fresh installs.
 
 ### Milestone 4: SSH command capture
 
@@ -917,16 +1059,27 @@ Each negative test must fail in the expected stage with useful diagnostics.
 - Generates `run.json`, `ssh-result.json`, and `validation.json`.
 - Exits zero only when all acceptance criteria pass.
 
+## Resolved before implementation
+
+These were open questions in the original draft and have been settled by direct measurement on this host.
+
+1. **Swift spelling of the provisioning setter.** It is `setGuestProvisioningOptions(_:) throws`, and it validates internally. See Phase 5.
+2. **Guest image availability.** `latestSupported` yields macOS 26.6.1, which is unusable. A local `UniversalMac_27.0_26A5388g_Restore.ipsw` is present and loads with a supported hardware model. The download path is removed from the acceptance workflow and a version gate added.
+3. **Entitlement and signing.** Ad-hoc `codesign -s - --entitlements` grants `com.apple.security.virtualization`. No developer account, provisioning profile, or Xcode is required.
+4. **Artifact disk lifecycle.** Create/attach/partition/format/eject/re-attach-read-only was run end-to-end successfully, including read-only enforcement and structured plist parsing. See Phases 2 and 11.
+5. **ASIF on this host.** The sample always takes the ASIF branch on macOS 27; the RAW branch is unreachable.
+
 ## Known uncertainties to resolve during implementation
 
-1. Confirm final Swift spelling for `setGuestProvisioning` and validation in the exact Xcode 27 build used to compile.
-2. Confirm whether the provisioned account is an administrator; do not depend on this for the primary `requestStop` path.
-3. Confirm the actual VirtioFS automount path on the selected guest build.
-4. Confirm whether the preformatted Virtio block APFS volume automounts during first boot; add a guest-side mount fallback if necessary.
+1. Confirm whether the provisioned account is an administrator; do not depend on this for the primary `requestStop` path.
+2. Confirm the actual VirtioFS automount path on the selected guest build.
+3. Confirm whether the preformatted Virtio block APFS volume automounts during first boot, and whether the `logsInAutomatically = true` assumption in Phase 5 is what makes it work. The Phase 8 script now mounts by volume name as a fallback; determine whether that fallback is load-bearing.
+4. Confirm that Remote Login as enabled by provisioning permits password authentication for the provisioned user, and whether that user is placed in the SSH access group or access is left open to all users.
 5. Confirm NAT ARP discovery reliability on macOS 27 and record the actual bridge name.
 6. Confirm OpenSSH returns the remote status unchanged for the chosen command and that stderr remains distinct from local SSH diagnostics.
-7. Confirm the sample's ASIF system disk can be attached read-only by current `diskutil image` commands for optional system-disk inspection.
+7. Confirm the sample's ASIF system disk can be attached read-only by current `diskutil image` commands for optional system-disk inspection. This affects only optional Phase 12.
 8. Confirm all disk-image objects are released before host attachment; add bounded retry for transient busy errors.
+9. Confirm that `clonefile`-based bundle cloning produces a template whose restored system disk boots identically to the original. If cloning proves unreliable, fall back to a full copy and accept the cost.
 
 These are test questions, not reasons to weaken the acceptance criteria.
 
@@ -946,6 +1099,7 @@ These are test questions, not reasons to weaken the acceptance criteria.
 The POC is complete when a clean run produces a machine-readable report proving all of the following:
 
 ```text
+restore image verified as macOS 27 or later before install
 install succeeded
 first-boot provisioning succeeded without Setup Assistant
 SSH authentication succeeded
