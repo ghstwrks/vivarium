@@ -364,6 +364,12 @@ final class Orchestrator {
         }
 
         try BundleManager.createBundle(paths: paths, reuse: options.reuse)
+        // Created with the bundle, not with the first thing written into it, so
+        // that a run which fails before it reaches its own results still has
+        // somewhere to leave failure.json — the copy that survives the bundle.
+        if let layout {
+            try createDirectory(layout.results, stage: .bundlePreparation)
+        }
         log.attachFile(at: paths.runLog)
         stateLogURL = paths.stateLog
 
@@ -530,6 +536,21 @@ final class Orchestrator {
 
         transition(to: report.allAcceptanceCriteriaPassed ? .succeeded : .failed)
         finish(outcome: report.allAcceptanceCriteriaPassed ? "succeeded" : "failed")
+        mirrorReportIntoResults()
+    }
+
+    /// Copies the acceptance report into `results/`, beside the run rather than
+    /// inside the bundle it describes.
+    ///
+    /// `viv gc` decides a run is finished by what it finds in `results/`, and a
+    /// selftest that only ever wrote its report inside the bundle looked to gc
+    /// like a run that might still be executing — so its tens of gigabytes were
+    /// skipped, every time, forever. The bundle keeps its own copy; this is the
+    /// one that outlives it.
+    private func mirrorReportIntoResults() {
+        guard let layout, let report else { return }
+        try? createDirectory(layout.results, stage: .cleanup)
+        try? JSONCoding.write(report, to: layout.reportJSON)
     }
 
     /// The half of a provisioned boot that both `selftest` and `run` need:
@@ -1549,9 +1570,11 @@ final class Orchestrator {
                 }
             } catch {
                 // Not fatal, and not silent. The run passed; `viv gc` exists
-                // for exactly the directory this leaves behind.
+                // for exactly the directory this leaves behind. What did go is
+                // still reported: discarding it would have the report tell the
+                // operator to inspect a bundle that is no longer there.
                 log.warn(VivError.describe(error))
-                return []
+                break
             }
         }
         return deleted

@@ -94,6 +94,42 @@ enum VivariumHome {
         root.appendingPathComponent("templates")
     }
 
+    /// Refuses a `VIVARIUM_HOME` that cannot be the root of a tree Vivarium
+    /// creates, fills, and deletes from.
+    ///
+    /// Three values are refused outright, because each turns an ordinary
+    /// `viv gc` into something else entirely: a relative path makes the home
+    /// depend on the working directory, so the same command means a different
+    /// tree from a different shell; `/` makes `runs/` a top-level directory and
+    /// puts the whole filesystem one typo away; and `$HOME` itself makes the
+    /// home the user's own, where `runs/` is plausible enough to already exist
+    /// as something else. The default `~/.vivarium` is none of these, so this
+    /// only ever fires for an override.
+    static func requireUsable(stage: VivStage) throws {
+        guard let override = ProcessInfo.processInfo.environment[environmentVariable],
+              !override.isEmpty else { return }
+
+        func refuse(_ reason: String) -> VivError {
+            VivError(
+                stage,
+                "\(environmentVariable) is set to \"\(override)\", which \(reason). "
+                    + "Point it at a directory Vivarium can own, or unset it to use "
+                    + "~/.vivarium.",
+                inspectionHints: ["echo $\(environmentVariable)"]
+            )
+        }
+
+        let expanded = (override as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else {
+            throw refuse("is a relative path — the home would follow the working directory")
+        }
+        let path = URL(fileURLWithPath: expanded).standardizedFileURL.path
+        guard path != "/" else { throw refuse("is the filesystem root") }
+        guard path != URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path else {
+            throw refuse("is your home directory itself")
+        }
+    }
+
     /// Runs live one level below `runs/` rather than directly under the home,
     /// so that `viv gc` has a single subtree it may delete from and can never
     /// reach `templates/`, which is expensive to rebuild.

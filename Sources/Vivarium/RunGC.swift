@@ -54,6 +54,7 @@ enum RunGC {
     /// Builds the plan without deleting anything, so `--dry-run` and the real
     /// run share one code path and can never disagree about what qualifies.
     static func plan(selection: Selection, in runsRoot: URL = VivariumHome.runs, now: Date = Date()) async throws -> Plan {
+        try VivariumHome.requireUsable(stage: .cleanup)
         try requireContained(runsRoot)
         guard FileManager.default.fileExists(atPath: runsRoot.path) else {
             return Plan(actions: [])
@@ -99,11 +100,22 @@ enum RunGC {
 
         let layout = RunLayout(runID: runID, root: entry)
         let hasBundle = FileManager.default.fileExists(atPath: layout.bundleRoot.path)
-        let report = try? JSONCoding.read(TestRunReport.self, from: layout.reportJSON, stage: .cleanup)
+        // A run is finished if it left a report, whatever shape that report is:
+        // `viv run` writes a TestRunReport and `viv selftest` writes its own
+        // acceptance report, and only the first of the two decodes here. Asking
+        // the decoder whether a run finished would leave every selftest — tens
+        // of gigabytes of it — classified forever as possibly still running.
+        let hasReport = FileManager.default.fileExists(atPath: layout.reportJSON.path)
+        let report = hasReport
+            ? try? JSONCoding.read(TestRunReport.self, from: layout.reportJSON, stage: .cleanup)
+            : nil
         let hasFailureReport = FileManager.default.fileExists(atPath: layout.failureReport.path)
         let referenceDate = report?.finishedAt ?? modificationDate(of: entry) ?? now
         let ageDescription = age(from: referenceDate, to: now)
-        let label = label(report: report, hasFailureReport: hasFailureReport, hasBundle: hasBundle)
+        let label = label(
+            report: report, hasReport: hasReport,
+            hasFailureReport: hasFailureReport, hasBundle: hasBundle
+        )
 
         switch selection {
         case .all:
@@ -118,7 +130,7 @@ enum RunGC {
                 return await defaultAction(
                     runID: runID, entry: entry, layout: layout, label: label,
                     hasFailureReport: hasFailureReport, hasBundle: hasBundle,
-                    finished: report != nil || hasFailureReport, ageDescription: ageDescription
+                    finished: hasReport || hasFailureReport, ageDescription: ageDescription
                 )
             }
             let bytes = await RunStorage.onDiskByteCount(of: entry) ?? 0
@@ -131,7 +143,7 @@ enum RunGC {
             return await defaultAction(
                 runID: runID, entry: entry, layout: layout, label: label,
                 hasFailureReport: hasFailureReport, hasBundle: hasBundle,
-                finished: report != nil || hasFailureReport, ageDescription: ageDescription
+                finished: hasReport || hasFailureReport, ageDescription: ageDescription
             )
         }
     }
@@ -148,7 +160,14 @@ enum RunGC {
                 ageDescription: ageDescription, byteCount: 0, isSkip: true
             )
         }
-        guard hasBundle else {
+        // The two heavy directories are targeted independently. A run whose
+        // bundle went but whose share did not — a cleanup that got half way, or
+        // a bundle deleted by hand — still has a Shared/ full of staged code,
+        // and gating on the bundle left it there forever as "nothing to
+        // reclaim".
+        let targets = [layout.bundleRoot, layout.shared]
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !targets.isEmpty else {
             return Action(
                 runID: runID, root: entry, targets: [],
                 label: "\(label), results only — nothing to reclaim",
@@ -156,10 +175,6 @@ enum RunGC {
             )
         }
 
-        var targets = [layout.bundleRoot]
-        if FileManager.default.fileExists(atPath: layout.shared.path) {
-            targets.append(layout.shared)
-        }
         var bytes: Int64 = 0
         for target in targets {
             bytes += await RunStorage.onDiskByteCount(of: target) ?? 0
@@ -207,7 +222,9 @@ enum RunGC {
         }
     }
 
-    private static func label(report: TestRunReport?, hasFailureReport: Bool, hasBundle: Bool) -> String {
+    private static func label(
+        report: TestRunReport?, hasReport: Bool, hasFailureReport: Bool, hasBundle: Bool
+    ) -> String {
         if let report {
             switch report.status {
             case .passed: return report.keptForInspection ? "passed, kept (--keep-vm)" : "passed"
@@ -216,15 +233,23 @@ enum RunGC {
             }
         }
         if hasFailureReport { return "infrastructure failure" }
+        // A report that is there but is not a `viv run` report: a selftest's,
+        // which says nothing about a test command's verdict.
+        if hasReport { return "finished" }
         return hasBundle ? "no report" : "empty"
     }
 
     // MARK: - Safety
 
-    /// Refuses to proceed if `runsRoot` resolves outside the Vivarium home —
-    /// paranoia against a hostile or mistaken `VIVARIUM_HOME` pointing `runs/`
-    /// (via a symlink somewhere in the chain) at something Vivarium does not
-    /// own, such as `~/VRE-POC` or the filesystem root.
+    /// Refuses to proceed if `runsRoot` resolves outside the Vivarium home.
+    ///
+    /// What this defends is the symlink swap: `runs/`, or any component on the
+    /// way to it, replaced with a link to a directory Vivarium does not own, so
+    /// that a routine `viv gc` deletes someone else's tree. It says nothing
+    /// about where the home *itself* points, because the home is the yardstick
+    /// — an unfortunate `VIVARIUM_HOME` moves both sides of the comparison at
+    /// once. `VivariumHome.requireUsable`, called first, is what rules out the
+    /// values that make that a disaster.
     private static func requireContained(_ runsRoot: URL) throws {
         guard FileManager.default.fileExists(atPath: runsRoot.path) else { return }
 
