@@ -70,6 +70,10 @@ enum ExitStatus {
 // MARK: - Root command
 
 struct Viv: AsyncParsableCommand {
+    /// One version string, quoted by `--version` and stamped into every
+    /// `report.json`, so that a report can always be traced to a build.
+    static let releaseVersion = "0.1.0-dev"
+
     static let configuration = CommandConfiguration(
         commandName: "viv",
         abstract: "Run tests autonomously inside a macOS virtual machine.",
@@ -87,7 +91,7 @@ struct Viv: AsyncParsableCommand {
             Vivarium keeps everything it owns under ~/.vivarium, or under \
             $VIVARIUM_HOME if that is set.
             """,
-        version: "0.1.0-dev",
+        version: releaseVersion,
         subcommands: [
             PreflightCommand.self,
             TemplateCommand.self,
@@ -347,25 +351,232 @@ struct TemplateListCommand: AsyncParsableCommand {
 struct RunCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "run",
-        abstract: "Run a test command inside a fresh guest. (Not yet implemented.)",
+        abstract: "Run a test command inside a fresh guest.",
         discussion: """
             The core pipeline: clone a template, provision and boot a guest, \
-            stage the code directory into it, run the test command, harvest \
-            artifacts, write a report, and delete the expensive bundle on \
-            success. It is not implemented in this phase.
+            stage a copy of the code directory into it, run the test command \
+            with its output streamed here as it arrives, harvest artifacts, \
+            write a report, and delete the expensive bundle if the test passed.
+
+            The code directory is copied, not mounted: nothing the guest does \
+            can reach the original. The copy is an APFS clone where the volume \
+            allows one, so staging a large repository costs very little.
+
+            The command comes from the manifest's "test" field, or after a \
+            bare -- on the command line, which wins:
+
+              viv run
+              viv run --code ~/src/thing -- swift test --parallel
+
+            Exits 0 when the test command exits 0, 1 when it does not or when \
+            it exceeded --timeout, and 70 when Vivarium could not get far \
+            enough to ask.
             """
     )
 
+    @OptionGroup var guest: GuestOptions
+
+    @Option(
+        name: .customLong("code"),
+        help: ArgumentHelp(
+            "The directory to copy into the guest. Defaults to the working directory.",
+            valueName: "path"
+        )
+    )
+    var code: PathArgument?
+
+    @Option(
+        name: .customLong("manifest"),
+        help: ArgumentHelp(
+            "The project manifest. Defaults to <code>/viv.json when it exists.",
+            valueName: "path"
+        )
+    )
+    var manifest: PathArgument?
+
+    @Option(
+        name: .customLong("template"),
+        help: ArgumentHelp(
+            "Clone this template. Defaults to the newest in the Vivarium home.",
+            valueName: "path"
+        )
+    )
+    var template: PathArgument?
+
+    @Option(
+        name: .customLong("timeout"),
+        help: ArgumentHelp(
+            """
+            Seconds the test command may take before it is abandoned. Bounds \
+            the command alone, not the boot, the staging, or the harvest.
+            """,
+            valueName: "seconds"
+        )
+    )
+    var timeout: Int?
+
+    @Flag(
+        name: .customLong("keep-vm"),
+        help: """
+            Keep VM.bundle even when the test passes. A failed run always keeps \
+            everything.
+            """
+    )
+    var keepVM: Bool = false
+
+    @Flag(
+        name: .customLong("keep-going"),
+        help: """
+            On infrastructure failure, leave the guest running for inspection \
+            instead of stopping it. Stop it with Ctrl-C when finished.
+            """
+    )
+    var keepGoing: Bool = false
+
+    /// The test command, after a bare `--`.
+    ///
+    /// `.postTerminator` so that the guest's command keeps its own flags: `viv
+    /// run -- swift test --parallel` must not have `--parallel` read as
+    /// Vivarium's.
+    @Argument(
+        parsing: .postTerminator,
+        help: ArgumentHelp(
+            "The command to run in the guest, after --. Overrides the manifest.",
+            valueName: "command"
+        )
+    )
+    var testCommand: [String] = []
+
+    /// Vivarium's default budget for a test command.
+    static let defaultTimeoutSeconds = 600
+
     func run() async throws {
-        FileHandle.standardError.write(Data("""
-            viv run is not implemented in this phase.
+        let plan = try await makePlan()
 
-            Until it lands, `viv selftest` exercises the same provisioning, \
-            SSH, and artifact-harvesting machinery against Vivarium's own \
-            acceptance criteria.
+        var options = OrchestratorOptions()
+        options.fromTemplate = plan.templateRoot
+        options.guestAddress = guest.guestAddress
+        options.username = guest.username
+        options.fullName = guest.fullName
+        options.logsInAutomatically = guest.autoLogin
+        options.keepGoing = keepGoing
+        // The share carries the artifacts, so a run needs no artifact disk and
+        // none of the guest-side partitioning that goes with one. Selftest,
+        // which exists to prove the disk path works, still asks for it.
+        options.includesArtifactDisk = false
 
-            """.utf8))
-        throw ExitCode(ExitStatus.infrastructure)
+        let report = try await withOrchestrator(options) { orchestrator in
+            try await orchestrator.runTest(plan: plan)
+        }
+
+        print("")
+        print(report.summaryText)
+
+        // A test that failed is not a Vivarium failure, so it leaves through
+        // ExitCode rather than an error: no failure report, no "error:" prefix,
+        // just the status the caller asked about.
+        guard report.passed else { throw ExitCode(ExitStatus.testFailure) }
+    }
+
+    /// Reconciles the command line and the manifest before anything is created.
+    ///
+    /// Everything that can be wrong with the request — no command, no template,
+    /// a missing code directory, a manifest with a typo in it — is found here,
+    /// where the cost of being told is a message rather than a two-minute boot.
+    private func makePlan() async throws -> TestPlan {
+        let codeDirectory = (code?.url ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+            .standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: codeDirectory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw ValidationError("\(codeDirectory.path) is not a directory.")
+        }
+
+        // An explicitly named manifest that is not there is a mistake worth
+        // reporting; a missing default one just means the project has no
+        // manifest.
+        let manifestURL: URL?
+        if let manifest {
+            guard FileManager.default.fileExists(atPath: manifest.path) else {
+                throw ValidationError("No manifest at \(manifest.path).")
+            }
+            manifestURL = manifest.url
+        } else {
+            let candidate = codeDirectory.appendingPathComponent(VivManifest.filename)
+            manifestURL = FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+        }
+        let project = try manifestURL.map { try VivManifest.read(from: $0) }
+
+        let command: String
+        let commandSource: String
+        if !testCommand.isEmpty {
+            command = Self.joined(testCommand)
+            commandSource = "command line"
+        } else if let test = project?.test, !test.trimmingCharacters(in: .whitespaces).isEmpty {
+            command = test
+            commandSource = VivManifest.filename
+        } else {
+            throw ValidationError("""
+                No test command. Give one either way:
+
+                  viv run -- swift test
+
+                or in \(codeDirectory.appendingPathComponent(VivManifest.filename).path):
+
+                  { "test": "swift test" }
+                """)
+        }
+
+        if let timeout, timeout <= 0 {
+            throw ValidationError("--timeout must be a positive number of seconds.")
+        }
+        let seconds = timeout ?? project?.timeout ?? Self.defaultTimeoutSeconds
+
+        let templateRoot: URL
+        if let template {
+            templateRoot = template.url
+        } else if let newest = await TemplateInventory.newest() {
+            log.info("Using the newest template: \(newest.paths.root.path).")
+            templateRoot = newest.paths.root
+        } else {
+            throw VivError(
+                .bundlePreparation,
+                """
+                No template in \(VivariumHome.templates.path), and --template was not given.
+
+                Create one:
+                  viv template create --ipsw <path to a macOS 27 restore image>
+                """
+            )
+        }
+
+        return TestPlan(
+            codeDirectory: codeDirectory,
+            command: command,
+            commandSource: commandSource,
+            manifestPath: manifestURL,
+            projectName: project?.name,
+            artifactPatterns: project?.artifacts ?? [],
+            environment: project?.environment ?? [:],
+            timeout: .seconds(seconds),
+            templateRoot: templateRoot,
+            keepVM: keepVM
+        )
+    }
+
+    /// Rebuilds a shell command line from the words after `--`.
+    ///
+    /// The shell has already removed one layer of quoting, so a word containing
+    /// anything the guest's shell would act on gets that layer put back. Words
+    /// that need nothing are left alone, so the command in the report reads the
+    /// way it was typed.
+    private static func joined(_ words: [String]) -> String {
+        let safe = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-./=:@+,")
+        return words.map { word in
+            word.isEmpty || word.unicodeScalars.contains(where: { !safe.contains($0) })
+                ? ShellEscaping.singleQuoted(word)
+                : word
+        }.joined(separator: " ")
     }
 }
 
@@ -616,13 +827,14 @@ struct GCCommand: AsyncParsableCommand {
 /// The report has to be written from here rather than from the throwing code,
 /// because only the orchestrator knows the state it reached and only the caller
 /// knows the run is over.
-private func withOrchestrator(
+@discardableResult
+private func withOrchestrator<T: Sendable>(
     _ options: OrchestratorOptions,
-    _ body: @escaping @Sendable (Orchestrator) async throws -> Void
-) async throws {
+    _ body: @escaping @Sendable (Orchestrator) async throws -> T
+) async throws -> T {
     let orchestrator = await Orchestrator(options: options)
     do {
-        try await body(orchestrator)
+        return try await body(orchestrator)
     } catch {
         log.error(VivError.describe(error))
         await orchestrator.recordFailure(error)
