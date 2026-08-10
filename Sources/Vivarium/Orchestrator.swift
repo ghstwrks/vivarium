@@ -69,6 +69,15 @@ enum Timeouts {
     /// burns five minutes before trying the thing that works.
     static let stopRequestAcknowledgement = Duration.seconds(90)
     static let gracefulShutdown = Duration.seconds(5 * 60)
+    /// How long `requestStop()` is given when it is the *fallback*, not the
+    /// first attempt (`viv run`'s shutdown order — see `ShutdownOrder`).
+    ///
+    /// Short for the same reason `stopRequestAcknowledgement` is short: with
+    /// auto-login on, POC-RESULTS.md never once observed `requestStop()` stop
+    /// a provisioned guest, so this budget only has to cover the case where
+    /// the in-guest shutdown could not even be attempted (SSH already gone),
+    /// not the case where it is expected to work.
+    static let stopRequestFallback = Duration.seconds(30)
     static let diskAttach = Duration.seconds(120)
 }
 
@@ -499,7 +508,10 @@ final class Orchestrator {
             let ssh = try await connectToGuest()
             let result = try await runAcceptanceCommand(ssh: ssh)
             try validateVirtioFSMarker()
-            try await shutdown(ssh: ssh)
+            // selftest keeps requestStop() first deliberately — see
+            // ShutdownOrder. Its "graceful guest stop observed" criterion
+            // documents this exact, measured order, fallback included.
+            try await shutdown(ssh: ssh, order: .requestStopFirst)
             _ = result
         } catch {
             await abandonGuest(after: error)
@@ -889,53 +901,63 @@ final class Orchestrator {
 
     // MARK: - Shutdown
 
-    private func shutdown(ssh: SSHCommandRunner) async throws {
+    /// Which shutdown mechanism gets the first attempt.
+    ///
+    /// `selftest` keeps `requestStop()` first: its "graceful guest stop
+    /// observed" criterion documents that exact, measured behaviour, and
+    /// changing the order would change what the criterion proves. `viv run`
+    /// instead leads with the in-guest shutdown, because POC-RESULTS.md is
+    /// unequivocal that with auto-login on, `requestStop()` has never once
+    /// stopped a provisioned guest — it is a power-button press answered by a
+    /// confirmation dialog nobody is there to click — while the in-guest
+    /// `shutdown -h now` works every time in around six seconds.
+    enum ShutdownOrder: Sendable {
+        case requestStopFirst
+        case inGuestFirst
+    }
+
+    private func shutdown(ssh: SSHCommandRunner, order: ShutdownOrder = .requestStopFirst) async throws {
         transition(to: .requestingGuestShutdown)
         guard let machine = virtualMachine, let relay = eventRelay else {
             throw VivError(.guestShutdown, "No running virtual machine to stop.")
         }
+        transition(to: .waitingForGuestStop)
 
-        var requested = false
-        if machine.canRequestStop {
-            do {
-                try machine.requestStop()
-                requested = true
-                log.info("Requested a graceful guest stop.")
-            } catch {
-                log.warn("requestStop() failed: \(VivError.describe(error))")
-            }
-        } else {
-            log.warn("The guest cannot be asked to stop in its current state.")
+        let primaryDescription: String
+        let fallbackDescription: String
+        let primarySucceeded: Bool
+        switch order {
+        case .requestStopFirst:
+            primaryDescription = "\(Timeouts.stopRequestAcknowledgement) of `requestStop()`"
+            fallbackDescription = "\(Timeouts.gracefulShutdown) of an in-guest `shutdown -h now`"
+            primarySucceeded = await tryRequestStop(
+                machine: machine, relay: relay, timeout: Timeouts.stopRequestAcknowledgement
+            )
+        case .inGuestFirst:
+            primaryDescription = "\(Timeouts.gracefulShutdown) of an in-guest `shutdown -h now`"
+            fallbackDescription = "\(Timeouts.stopRequestFallback) of the `requestStop()` fallback"
+            primarySucceeded = await tryInGuestShutdown(ssh: ssh, relay: relay, timeout: Timeouts.gracefulShutdown)
         }
 
-        transition(to: .waitingForGuestStop)
-        if requested, await awaitGuestStop(relay: relay, timeout: Timeouts.stopRequestAcknowledgement) {
+        if primarySucceeded {
             try confirmStopped(machine)
             report.gracefulGuestStopObserved = true
             releaseRunVM()
             return
         }
 
-        // Fall back to shutting down from inside the guest. The password goes
-        // to sudo's stdin, never into the command line, so it never appears in
-        // the guest's process list.
-        log.warn("Falling back to an in-guest `sudo shutdown -h now`.")
-        let result = try? await ssh.run(
-            remoteCommand: AcceptanceScript.shutdownCommand,
-            stdinData: Data((credentials.password + "\n").utf8),
-            timeout: .seconds(60),
-            redactedCommand: "sudo -S /sbin/shutdown -h now <password on stdin>"
-        )
-        if let result {
-            // A transport failure here is the *expected* result, not a problem:
-            // sshd goes down with the machine, so the connection is closed from
-            // under the command that asked for the shutdown. Whether it worked
-            // is decided by the guest actually stopping, below — never by this
-            // exit status.
-            log.info("In-guest shutdown returned \(describe(result.outcome)).")
+        log.warn("First shutdown attempt did not stop the guest within \(primaryDescription); falling back.")
+        let fallbackSucceeded: Bool
+        switch order {
+        case .requestStopFirst:
+            fallbackSucceeded = await tryInGuestShutdown(ssh: ssh, relay: relay, timeout: Timeouts.gracefulShutdown)
+        case .inGuestFirst:
+            fallbackSucceeded = await tryRequestStop(
+                machine: machine, relay: relay, timeout: Timeouts.stopRequestFallback
+            )
         }
 
-        if await awaitGuestStop(relay: relay, timeout: Timeouts.gracefulShutdown) {
+        if fallbackSucceeded {
             try confirmStopped(machine)
             report.gracefulGuestStopObserved = true
             releaseRunVM()
@@ -951,14 +973,49 @@ final class Orchestrator {
         await forceStopForCleanup()
         throw VivError(
             .guestShutdown,
-            "The guest did not stop gracefully — neither within "
-                + "\(Timeouts.stopRequestAcknowledgement) of `requestStop()` nor within "
-                + "\(Timeouts.gracefulShutdown) of an in-guest `shutdown -h now` — so a "
-                + "destructive stop was used. Disk-persistence validation after a destructive "
-                + "stop cannot distinguish a guest that never wrote from one that never flushed, "
-                + "so this run is failed rather than validated.",
+            "The guest did not stop gracefully — neither within \(primaryDescription) nor within "
+                + "\(fallbackDescription) — so a destructive stop was used. Disk-persistence validation "
+                + "after a destructive stop cannot distinguish a guest that never wrote from one that "
+                + "never flushed, so this run is failed rather than validated.",
             inspectionHints: ["cat \(paths.runLog.path)"]
         )
+    }
+
+    /// Tries `requestStop()`, then waits up to `timeout` for `.stopped`.
+    private func tryRequestStop(machine: VZVirtualMachine, relay: VMEventRelay, timeout: Duration) async -> Bool {
+        guard machine.canRequestStop else {
+            log.warn("The guest cannot be asked to stop in its current state.")
+            return false
+        }
+        do {
+            try machine.requestStop()
+            log.info("Requested a graceful guest stop.")
+        } catch {
+            log.warn("requestStop() failed: \(VivError.describe(error))")
+            return false
+        }
+        return await awaitGuestStop(relay: relay, timeout: timeout)
+    }
+
+    /// Shuts the guest down from inside itself, then waits up to `timeout` for
+    /// `.stopped`. The password goes to sudo's stdin, never into the command
+    /// line, so it never appears in the guest's process list.
+    private func tryInGuestShutdown(ssh: SSHCommandRunner, relay: VMEventRelay, timeout: Duration) async -> Bool {
+        let result = try? await ssh.run(
+            remoteCommand: AcceptanceScript.shutdownCommand,
+            stdinData: Data((credentials.password + "\n").utf8),
+            timeout: .seconds(60),
+            redactedCommand: "sudo -S /sbin/shutdown -h now <password on stdin>"
+        )
+        if let result {
+            // A transport failure here is the *expected* result, not a problem:
+            // sshd goes down with the machine, so the connection is closed from
+            // under the command that asked for the shutdown. Whether it worked
+            // is decided by the guest actually stopping, below — never by this
+            // exit status.
+            log.info("In-guest shutdown returned \(describe(result.outcome)).")
+        }
+        return await awaitGuestStop(relay: relay, timeout: timeout)
     }
 
     private func awaitGuestStop(relay: VMEventRelay, timeout: Duration) async -> Bool {
@@ -1101,9 +1158,11 @@ final class Orchestrator {
 
             // A guest that will not shut down is reported, not fatal: the test
             // has already produced its verdict, and throwing here would throw
-            // the report away with it.
+            // the report away with it. `viv run` leads with the in-guest
+            // shutdown — see ShutdownOrder — because it is the one
+            // POC-RESULTS.md measured as actually working with auto-login on.
             do {
-                try await measure("shutdown") { try await shutdown(ssh: ssh) }
+                try await measure("shutdown") { try await shutdown(ssh: ssh, order: .inGuestFirst) }
             } catch {
                 shutdownError = error
                 log.error("The guest did not shut down cleanly: \(VivError.describe(error))")
