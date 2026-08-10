@@ -125,6 +125,11 @@ enum GuestTestScript {
     /// keeps `logs/**` — which zsh expands to the directories as well as the
     /// files beneath them — from copying a directory into itself, at the price
     /// of not harvesting empty directories.
+    ///
+    /// The failure counter is called `failures` and not the obvious `status`,
+    /// because zsh makes `status` a read-only synonym for `$?` and treats the
+    /// assignment as fatal — which silently turned this whole script into a
+    /// no-op that reported exit 1.
     static func harvestScript(patterns: [String]) -> String {
         let artifacts = ShellEscaping.singleQuoted(artifactsGuestPath)
 
@@ -133,7 +138,7 @@ enum GuestTestScript {
         setopt NULL_GLOB
 
         artifacts=\(artifacts)
-        status=0
+        failures=0
 
         cd "\(workdirShellExpression)" || {
             printf 'viv: the workdir is gone; nothing to harvest\\n' >&2
@@ -147,8 +152,15 @@ enum GuestTestScript {
                 [ -f "$match" ] || continue
                 matched=1
                 destination="$artifacts/$match"
-                /bin/mkdir -p "$(/usr/bin/dirname "$destination")" || { status=1; continue; }
-                /bin/cp "$match" "$destination" || status=1
+                if ! /bin/mkdir -p "$(/usr/bin/dirname "$destination")"; then
+                    printf 'viv: could not make a place for %s on the share\\n' "$match" >&2
+                    failures=1
+                    continue
+                fi
+                if ! /bin/cp "$match" "$destination"; then
+                    printf 'viv: could not copy %s onto the share\\n' "$match" >&2
+                    failures=1
+                fi
             done
             if [ "$matched" -eq 0 ]; then
                 printf 'viv: no files matched the artifact pattern %s\\n' "$pattern" >&2
@@ -159,7 +171,7 @@ enum GuestTestScript {
 
         # The host reads these bytes off the share as soon as this returns.
         /bin/sync
-        exit $status
+        exit $failures
         """
     }
 }

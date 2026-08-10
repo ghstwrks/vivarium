@@ -1116,6 +1116,16 @@ final class Orchestrator {
         let status: TestRunStatus = execution.timedOut
             ? .timedOut
             : (execution.exitCode == 0 ? .passed : .failed)
+
+        // Everything that writes inside the bundle happens before the bundle is
+        // deleted, and everything that writes inside `results/` happens after,
+        // so that a successful run does not resurrect the directory it just
+        // removed. The run log is copied across first: it is the only record of
+        // how the guest was reached, and on a passing run its original goes
+        // with the bundle.
+        transition(to: status == .passed ? .succeeded : .failed)
+        finish(outcome: status.rawValue)
+        preserveRunLog(in: layout)
         let deleted = await cleanUp(status: status, plan: plan, layout: layout)
 
         let report = TestRunReport(
@@ -1150,10 +1160,20 @@ final class Orchestrator {
 
         try JSONCoding.write(report, to: layout.reportJSON)
         try Data(report.markdownText.utf8).write(to: layout.reportMarkdown, options: .atomic)
-
-        transition(to: status == .passed ? .succeeded : .failed)
-        finish(outcome: status.rawValue)
         return report
+    }
+
+    /// Copies the run log into `results/`, which is the one directory a run
+    /// promises to keep.
+    private func preserveRunLog(in layout: RunLayout) {
+        guard FileManager.default.fileExists(atPath: paths.runLog.path) else { return }
+        let destination = layout.results.appendingPathComponent("run.log")
+        try? FileManager.default.removeItem(at: destination)
+        do {
+            try FileManager.default.copyItem(at: paths.runLog, to: destination)
+        } catch {
+            log.warn("Could not copy the run log into results/: \(VivError.describe(error))")
+        }
     }
 
     /// What the test command did, whether or not it got to decide.
@@ -1307,13 +1327,21 @@ final class Orchestrator {
             if let result {
                 // The guest's own complaints — an unmatched pattern, a failed
                 // copy — arrive on stderr, one per line, already phrased for a
-                // person.
-                for line in result.stderrText.split(separator: "\n") where line.hasPrefix("viv: ") {
-                    warnings.append(String(line.dropFirst("viv: ".count)))
+                // person. Anything else on that stream came from the shell
+                // rather than from the script, and is the more interesting half
+                // when the harvest went wrong in a way it did not anticipate.
+                var unexpected: [String] = []
+                for line in result.stderrText.split(separator: "\n") {
+                    if line.hasPrefix("viv: ") {
+                        warnings.append(String(line.dropFirst("viv: ".count)))
+                    } else if !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                        unexpected.append(String(line))
+                    }
                 }
                 if result.remoteExitCode != 0 {
                     warnings.append(
                         "the guest-side harvest reported \(describe(result.outcome))"
+                            + (unexpected.isEmpty ? "" : ": " + unexpected.joined(separator: "; ").trimmed(to: 500))
                     )
                 }
             } else {
@@ -1388,6 +1416,13 @@ final class Orchestrator {
             log.info("--keep-vm: keeping \(layout.bundleRoot.path).")
             return []
         }
+
+        // The run log lives inside the bundle, and a logger still holding it
+        // open recreates the directory the moment anything else is logged —
+        // which is how a deleted bundle came back as an empty one. Its contents
+        // are already in `results/run.log`; the rest of this run says its piece
+        // on the terminal.
+        log.detachFile()
 
         var deleted: [String] = []
         for url in [layout.bundleRoot, layout.shared] {
