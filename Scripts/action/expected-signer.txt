@@ -11,3 +11,5 @@
 # valid Developer ID signature, but warns that it cannot tell whose.
 #
 # Set this to the same value as the release workflow's APPLE_TEAM_ID secret.
+
+TVVX2ENCS3

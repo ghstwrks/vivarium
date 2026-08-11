@@ -107,6 +107,18 @@ printf 'hello\n' > "$work/staging/other/README"
 
 [ -n "$devid" ] && publish v1.1.1 "$devid"
 
+# An action tree identical to this one except that no team is pinned, for the
+# two cases below that are about what happens when nobody has configured a
+# signer. Before v0.1.0 the shipped expected-signer.txt was comments alone and
+# those cases could read the real file; now that it names a team, a case that
+# depended on the file being empty would be testing the file rather than the
+# code. lib.sh is copied because resolve-viv.sh sources it from
+# GITHUB_ACTION_PATH, which is the whole point of overriding it.
+noteam="$work/noteam"
+mkdir -p "$noteam/Scripts/action"
+cp "$repo/Scripts/action/lib.sh" "$noteam/Scripts/action/lib.sh"
+printf '# Comments alone: no team is configured.\n' > "$noteam/Scripts/action/expected-signer.txt"
+
 # --- The harness ----------------------------------------------------------
 
 home="$work/home"
@@ -244,16 +256,26 @@ case_is "ad-hoc signed asset, correct checksum" \
 case_is "no configured team is a warning, not silence" \
     "::warning title=Vivarium::No expected signing team" 1 \
     GITHUB_ACTION_REPOSITORY=rxbynerd/vivarium GITHUB_ACTION_REF=v9.9.9 \
+    INPUT_DOWNLOAD_BASE_URL="$base" GITHUB_ACTION_PATH="$noteam"
+
+# The other half of that: the file this repository actually ships must name the
+# team that signs its releases. An empty one is a valid state for a fork, so
+# nothing above would catch this one being emptied — and the cost of that is
+# every release accepting any Developer ID signature in the world.
+case_is "the shipped expected-signer.txt pins our team" \
+    "not signed by the expected Developer ID \(team TVVX2ENCS3\)" 1 \
+    GITHUB_ACTION_REPOSITORY=rxbynerd/vivarium GITHUB_ACTION_REF=v9.9.9 \
     INPUT_DOWNLOAD_BASE_URL="$base"
 
 if [ -n "$devid" ]; then
     # A real Developer ID signature gets *past* the signature check and stops
     # at the entitlement check, which is the only way to show the accept path
-    # without a released viv to hand.
+    # without a released viv to hand. No team pinned, because the signature on
+    # hand is whichever one this machine happened to have.
     case_is "a genuine Developer ID signature is accepted" \
         "not signed with com.apple.security.virtualization.*fault in the release" 1 \
         GITHUB_ACTION_REPOSITORY=rxbynerd/vivarium GITHUB_ACTION_REF=v1.1.1 \
-        INPUT_DOWNLOAD_BASE_URL="$base"
+        INPUT_DOWNLOAD_BASE_URL="$base" GITHUB_ACTION_PATH="$noteam"
 
     case_is "pinned to the team that signed it" \
         "not signed with com.apple.security.virtualization" 1 \
