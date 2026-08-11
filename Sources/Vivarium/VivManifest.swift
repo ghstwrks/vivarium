@@ -150,18 +150,18 @@ struct VivManifest: Sendable {
 
     /// The names become `export` statements in the guest, so they have to be
     /// shell identifiers. The *values* are quoted and may contain anything.
+    ///
+    /// The rules themselves live in `GuestEnvironment`, shared with
+    /// `--env-file`, so that a name one of them refuses is refused by both.
     private static func validate(environmentName name: String, in url: URL) throws {
-        let valid = !name.isEmpty
-            && !name.first!.isNumber
-            && name.allSatisfy { $0 == "_" || $0.isLetter && $0.isASCII || $0.isNumber && $0.isASCII }
-        guard valid else {
+        guard GuestEnvironment.isUsableName(name) else {
             throw VivError(
                 .bundlePreparation,
                 "\(url.path): \"\(name)\" is not a usable environment variable name. Names may "
                     + "contain ASCII letters, digits, and underscores, and may not begin with a digit."
             )
         }
-        guard !GuestTestScript.reservedEnvironmentNames.contains(name) else {
+        guard !GuestEnvironment.isReserved(name) else {
             throw VivError(
                 .bundlePreparation,
                 "\(url.path): \"\(name)\" is set by Vivarium and cannot be overridden by \"env\"."

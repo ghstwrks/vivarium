@@ -424,6 +424,46 @@ struct RunCommand: AsyncParsableCommand {
     )
     var timeout: Int?
 
+    @Option(
+        name: .customLong("env-file"),
+        help: ArgumentHelp(
+            "Read NAME=value lines into the test command's environment.",
+            discussion: """
+                For the values that cannot be committed to viv.json — a token, \
+                a password, a branch name. Each line is NAME=value, with the \
+                value taken literally to the end of the line: no quote \
+                stripping, no escapes, no interpolation. A name given here \
+                overrides the same name in the manifest.
+
+                A file rather than a flag because a command line is readable by \
+                every other process on the host, and these are the values that \
+                must not be. Nothing read from it is written to report.json or \
+                to the run log.
+                """,
+            valueName: "path"
+        )
+    )
+    var envFile: PathArgument?
+
+    @Option(
+        name: .customLong("run-id"),
+        help: ArgumentHelp(
+            "Name this run instead of generating an identifier for it.",
+            discussion: """
+                The run's directory is <home>/runs/<run-id>, so naming the run \
+                tells the caller where the results will be before the run \
+                starts — which is what a CI job needs in order to collect them \
+                afterwards. It is also the guest's $VIV_RUN_ID.
+
+                May contain ASCII letters, digits, dots, dashes, and \
+                underscores, and may not begin with a dot or a dash. An \
+                identifier already in use is refused rather than written over.
+                """,
+            valueName: "id"
+        )
+    )
+    var runID: String?
+
     @Flag(
         name: .customLong("keep-vm"),
         help: """
@@ -469,6 +509,7 @@ struct RunCommand: AsyncParsableCommand {
 
         var options = OrchestratorOptions()
         options.fromTemplate = plan.templateRoot
+        options.runID = plan.runID
         options.guestAddress = guest.guestAddress
         options.username = guest.username
         options.fullName = guest.fullName
@@ -562,6 +603,29 @@ struct RunCommand: AsyncParsableCommand {
         }
         let seconds = timeout ?? project?.timeout ?? Self.defaultTimeoutSeconds
 
+        // The manifest is what the project always wants; the file is what this
+        // invocation needs, so the file wins — the same way the trailing
+        // command wins over the manifest's. Which names it displaced is worth
+        // a line in the log, because a value silently replaced by a CI system
+        // is a confusing thing to debug from the guest's side.
+        var environment = project?.environment ?? [:]
+        if let envFile {
+            guard FileManager.default.fileExists(atPath: envFile.path) else {
+                throw ValidationError("No environment file at \(envFile.path).")
+            }
+            let supplied = try GuestEnvironment.read(envFile: envFile.url)
+            let overridden = supplied.keys.filter { environment[$0] != nil }.sorted()
+            if !overridden.isEmpty {
+                log.info(
+                    "\(envFile.path) overrides \(overridden.joined(separator: ", ")) "
+                        + "from the manifest."
+                )
+            }
+            environment.merge(supplied) { _, fromFile in fromFile }
+        }
+
+        let identifier = try resolvedRunID()
+
         let templateRoot: URL
         if let template {
             templateRoot = template.url
@@ -581,18 +645,67 @@ struct RunCommand: AsyncParsableCommand {
         }
 
         return TestPlan(
+            runID: identifier,
             codeDirectory: codeDirectory,
             command: command,
             commandSource: commandSource,
             manifestPath: manifestURL,
             projectName: project?.name,
             artifactPatterns: project?.artifacts ?? [],
-            environment: project?.environment ?? [:],
+            environment: environment,
             timeout: .seconds(seconds),
             templateRoot: templateRoot,
             keepVM: keepVM
         )
     }
+
+    /// Checks `--run-id` before anything is created.
+    ///
+    /// The identifier is a directory name under `<home>/runs`, so it is held to
+    /// what a directory name may be here rather than at the point where the
+    /// directory is created and a confusing path has already been printed. A
+    /// leading dot is refused because `viv gc --all` skips hidden entries, and
+    /// a leading dash because the resulting path reads as a flag in every
+    /// command anyone would then run against it.
+    private func resolvedRunID() throws -> String? {
+        guard let runID else { return nil }
+
+        func refuse(_ reason: String) -> ValidationError {
+            ValidationError(
+                "--run-id \"\(runID)\" \(reason). An identifier may contain ASCII "
+                    + "letters, digits, dots, dashes, and underscores, may not begin with a "
+                    + "dot or a dash, and may be at most \(Self.runIDLimit) characters."
+            )
+        }
+        guard !runID.isEmpty else { throw refuse("is empty") }
+        guard runID.count <= Self.runIDLimit else { throw refuse("is too long") }
+        guard !runID.hasPrefix("."), !runID.hasPrefix("-") else {
+            throw refuse("begins with \(runID.hasPrefix(".") ? "a dot" : "a dash")")
+        }
+        let allowed = CharacterSet(charactersIn:
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+        guard runID.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+            throw refuse("contains a character that may not appear in one")
+        }
+
+        // A second run under a name already taken would write its results over
+        // the first one's, which is the one outcome a caller that named the run
+        // in order to find those results afterwards cannot recover from.
+        let directory = VivariumHome.run(id: runID)
+        guard !FileManager.default.fileExists(atPath: directory.path) else {
+            throw VivError(
+                .bundlePreparation,
+                "\(directory.path) already exists, so --run-id \(runID) is already taken. "
+                    + "Choose another identifier, or delete that run first.",
+                inspectionHints: ["ls -la \(directory.path)"]
+            )
+        }
+        return runID
+    }
+
+    /// Long enough for a CI system to concatenate a workflow run, an attempt,
+    /// and a job name; short enough to stay readable in a path.
+    static let runIDLimit = 128
 
     /// Rebuilds a shell command line from the words after `--`.
     ///

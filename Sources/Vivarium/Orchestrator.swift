@@ -176,6 +176,8 @@ struct RunReport: Codable, Sendable {
 struct OrchestratorOptions: Sendable {
     var ipsw: URL?
     var bundle: URL?
+    /// The run's identifier, when the caller named one. `nil` generates a UUID.
+    var runID: String?
     var template: URL?
     var fromTemplate: URL?
     var guestAddress: String?
@@ -360,7 +362,12 @@ final class Orchestrator {
     }
 
     private func prepareRunMetadata() throws {
-        let runID = UUID().uuidString.lowercased()
+        // A generated identifier is unique and meaningless, which is right for
+        // a run nobody is waiting on; a caller that has to find the results
+        // afterwards — a CI job, a script — names the run instead and knows the
+        // path before the run exists. The name is validated by whoever supplied
+        // it, before anything has been created.
+        let runID = options.runID ?? UUID().uuidString.lowercased()
         if let bundleRoot = options.bundle {
             paths = VMBundlePaths(root: bundleRoot)
         } else {

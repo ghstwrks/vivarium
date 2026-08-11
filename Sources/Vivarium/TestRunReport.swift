@@ -6,6 +6,10 @@ import Foundation
 /// Resolved before anything is created so that a mistake — no command, no
 /// template, an unreadable manifest — costs nothing but a message.
 struct TestPlan: Sendable {
+    /// The identifier the caller pinned with `--run-id`, or `nil` to generate
+    /// one. Pinning it is what lets a caller know where the results will be
+    /// before the run that writes them has started.
+    let runID: String?
     let codeDirectory: URL
     let command: String
     /// Which of the two overriding sources the command came from, for the
