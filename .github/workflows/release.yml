@@ -1,0 +1,180 @@
+name: Release
+
+# Builds, signs, notarises, and publishes the binary the Action downloads.
+#
+# This runs on a self-hosted Apple silicon Mac for the same reason everything
+# else here does: Vivarium is built against the macOS 27 SDK, and no
+# GitHub-hosted image ships an Xcode that has it. Unlike the dogfood workflow it
+# does not need a hypervisor or a template — it never starts a guest — so any
+# Mac with the right Xcode and the signing secrets will do. Move it to a hosted
+# runner the day the images catch up.
+#
+# The secrets it needs are listed in docs/github-actions.md under "Cutting a
+# release". Without them the job fails at the signing step rather than
+# publishing something unsigned: an unsigned binary cannot create a virtual
+# machine, so a release that skipped signing would be a release that cannot run.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vivarium-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: [self-hosted, macOS, ARM64]
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: The runner has what this needs
+        run: |
+          set -euo pipefail
+          command -v swift >/dev/null || { echo "::error::swift is not on PATH; this runner needs Xcode with the macOS 27 SDK."; exit 1; }
+          command -v gh >/dev/null || { echo "::error::the gh CLI is not installed (brew install gh)."; exit 1; }
+          xcrun --find notarytool >/dev/null || { echo "::error::notarytool is not available; this runner needs a current Xcode."; exit 1; }
+
+      # A keychain of its own, added to the search list rather than made the
+      # default. This is somebody's actual Mac: a job that repoints the default
+      # keychain and then fails leaves them logging in to a broken machine.
+      - name: Unlock the signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$CERTIFICATE_P12" ] || { echo "::error::APPLE_CERTIFICATE_P12 is not set."; exit 1; }
+          keychain="$RUNNER_TEMP/vivarium-signing.keychain-db"
+          password="$(/usr/bin/uuidgen)"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$password" "$keychain"
+          # No auto-lock: a build that takes longer than the default timeout
+          # would otherwise fail at codesign with an unhelpful error.
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          # Without this, codesign prompts for permission to use the key — and
+          # a prompt on a headless runner is a job that hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+      - name: Build
+        run: swift build -c release --disable-sandbox
+
+      - name: Sign
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          [ -n "$IDENTITY" ] || { echo "::error::APPLE_SIGNING_IDENTITY is not set."; exit 1; }
+          # --options runtime is what notarisation requires; --timestamp is what
+          # keeps the signature valid after the certificate expires.
+          codesign --force --options runtime --timestamp \
+            --entitlements Vivarium.entitlements \
+            --sign "$IDENTITY" \
+            --keychain "$SIGNING_KEYCHAIN" \
+            .build/release/viv
+
+          codesign --verify --strict --verbose=2 .build/release/viv
+          codesign -d --entitlements - .build/release/viv 2>&1 \
+            | grep -q com.apple.security.virtualization \
+            || { echo "::error::the entitlement did not survive signing; this binary could not create a virtual machine."; exit 1; }
+          if [ -n "$TEAM_ID" ]; then
+            codesign --verify -R="anchor apple generic and certificate leaf[subject.OU] = \"$TEAM_ID\"" \
+              .build/release/viv \
+              || { echo "::error::signed by a team other than $TEAM_ID."; exit 1; }
+          fi
+
+      # ditto, not zip: it is what Apple's own instructions use, and notarytool
+      # takes a zip, a pkg, or a dmg — never a tarball. The same archive is
+      # notarised and published, so what the ticket covers is what people get.
+      - name: Archive
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          /usr/bin/ditto -c -k --sequesterRsrc "$PWD/.build/release/viv" "dist/viv-$TAG-macos-arm64.zip"
+          cd dist && /usr/bin/shasum -a 256 ./*.zip > checksums.txt && cat checksums.txt
+
+      - name: Notarise
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          [ -n "$NOTARY_KEY_P8" ] || { echo "::error::NOTARY_KEY_P8 is not set."; exit 1; }
+          key="$RUNNER_TEMP/notary.p8"
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$key"
+          trap 'rm -f "$key"' EXIT
+          # --wait, because a release published before Apple has accepted it is
+          # a release nobody can verify.
+          xcrun notarytool submit "dist/viv-$TAG-macos-arm64.zip" \
+            --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m
+          # A ticket cannot be stapled to a bare Mach-O — there is nowhere on it
+          # to put one — so this is the last chance to confirm the result, via
+          # Gatekeeper's online check.
+          /usr/sbin/spctl --assess --type install --verbose=2 .build/release/viv \
+            || echo "::warning::Gatekeeper did not confirm notarisation; check the notarytool log above."
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          {
+            echo "Signed and notarised \`viv\` for Apple silicon."
+            echo
+            echo 'Used by the Action as `uses: '"$GITHUB_REPOSITORY@$TAG"'`, which downloads this asset and verifies its checksum and Developer ID signature before running it.'
+            echo
+            echo "Installing it by hand — to prepare a runner's template, or to use it locally:"
+            echo
+            echo '```sh'
+            echo "curl -fsSLO https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/viv-$TAG-macos-arm64.zip"
+            echo "ditto -x -k viv-$TAG-macos-arm64.zip ."
+            echo "./viv --version"
+            echo '```'
+            echo
+            echo "See CHANGELOG.md for what is in this release."
+          } > "$notes"
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "dist/viv-$TAG-macos-arm64.zip" dist/checksums.txt --clobber
+          else
+            gh release create "$TAG" "dist/viv-$TAG-macos-arm64.zip" dist/checksums.txt \
+              --title "$TAG" --notes-file "$notes"
+          fi
+
+      # Always, and before anything else could fail: the signing key stays
+      # unlocked on somebody's Mac otherwise.
+      - name: Put the keychain away
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -n "${SIGNING_KEYCHAIN:-}" ] && [ -e "$SIGNING_KEYCHAIN" ]; then
+            security list-keychains -d user -s \
+              $(security list-keychains -d user | tr -d '"' | grep -v "$SIGNING_KEYCHAIN")
+            security delete-keychain "$SIGNING_KEYCHAIN"
+          fi
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary.p8"
