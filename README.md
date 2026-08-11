@@ -86,6 +86,16 @@ and prints its address so you can SSH in and look at it, holding until you
 press Ctrl-C — which force-stops the guest and exits with the status the run
 had earned. A passing run is never held.
 
+Two options exist for callers rather than for people. `--run-id <name>` pins
+the run's identifier, and therefore `<home>/runs/<name>` — so a script knows
+where the results will be before the run that writes them has started,
+instead of guessing which directory was its own. `--env-file <path>` reads
+`NAME=value` lines into the test command's environment, overriding the
+manifest's `env`; it is a file rather than a flag because a command line is
+readable by every process on the host, which makes it the wrong place for a
+token. Parsing is literal, not dotenv: everything after the first `=` is the
+value, quotes and `$` included.
+
 ### `viv selftest [options]`
 
 The proof of concept's thirteen-criterion acceptance run, preserved as
@@ -243,6 +253,33 @@ computed by the same code that would do it. Templates, and anything outside
 Your tests failing is not Vivarium failing. A `1` means Vivarium did its job
 completely and correctly and your command was unhappy about something; a
 `70` means Vivarium itself could not get far enough to ask.
+
+## Continuous integration
+
+`action.yml` in this repository is a GitHub Action, so a downstream project
+gets a fresh guest per job:
+
+```yaml
+jobs:
+  test:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rxbynerd/vivarium@v0.1.0
+        with:
+          command: swift test
+```
+
+It builds and caches its own signed `viv`, runs the tests, writes the report
+to the job summary, uploads `results/` as a workflow artifact, and reclaims
+disk afterwards. The runner must be **a self-hosted Apple silicon Mac with a
+template already built**: GitHub's hosted macOS runners cannot nest
+virtualization, and restoring a template is a multi-minute, 80-GiB operation
+that no workflow should perform by surprise.
+
+[`docs/github-actions.md`](docs/github-actions.md) covers preparing a
+runner, passing secrets, matrices, disk hygiene, and the security of running
+CI on hardware you own.
 
 ## Security notes
 

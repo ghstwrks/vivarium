@@ -69,6 +69,31 @@ not edited.
   validate`, and `viv selftest` (the POC's thirteen-criterion acceptance
   proof, preserved as Vivarium's own integration test), each carried over
   from the proof of concept and renamed onto the new command surface.
+- `--run-id`, which pins a run's identifier and therefore its directory.
+  Without it a caller can only find the results by guessing which of the
+  directories under `runs/` was theirs; with it, the place the results will
+  be written is known before the run that writes them starts. Refuses an
+  identifier that is empty, longer than 128 characters, starts with `.` or
+  `-`, contains anything outside `[A-Za-z0-9._-]`, or names a run directory
+  that already exists.
+- `--env-file`, which reads `NAME=value` lines and adds them to the test
+  command's environment, overriding the manifest's `env`. A file rather
+  than a flag because a command line is readable by every process on the
+  host, and this is where a CI secret belongs. Parsing is deliberately
+  literal — not dotenv: everything after the first `=` is the value, quotes
+  and `$` included, with nothing stripped, expanded, or unescaped. The name
+  rules are the manifest's own, now shared by both through
+  `GuestEnvironment`.
+- **A GitHub Action** (`action.yml`), so a downstream project gets a
+  clean-slate guest per job from a few lines of workflow. It builds and
+  caches its own signed `viv` from the ref the workflow pins, runs the
+  tests, writes the report to the job summary, uploads `results/` as a
+  workflow artifact, reclaims disk with `viv gc`, and maps Vivarium's exit
+  codes onto the step's success or failure — including the distinction that
+  matters most in CI, that exit 70 fails the step regardless of
+  `fail-on-test-failure`, because the tests never ran. Requires a
+  self-hosted Apple silicon runner: GitHub's hosted macOS runners cannot
+  nest virtualization. See `docs/github-actions.md`.
 - `examples/hello/`, a minimal committed `viv.json` project runnable as
   written.
 
