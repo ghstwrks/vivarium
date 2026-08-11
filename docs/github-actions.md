@@ -102,6 +102,11 @@ The expected team comes from `Scripts/action/expected-signer.txt` in the action
 itself, or from the `expected-team-id` input, which is what a fork signing its
 own releases sets.
 
+Every one of these refusals is tested by
+`Scripts/action/tests/resolve-viv-cases.sh`, which builds local fixtures and
+runs in a couple of seconds on any Mac. A verification step that quietly stops
+verifying does not fail a job — it turns it green — so it is worth a test.
+
 ### When there is no release to match
 
 The action **fails with instructions** rather than guessing. Three cases:

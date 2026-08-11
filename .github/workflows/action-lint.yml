@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: shellcheck
-        run: shellcheck -x Scripts/action/*.sh
+        run: shellcheck -x Scripts/action/*.sh Scripts/action/tests/*.sh
 
       - name: python
         run: python3 -m py_compile Scripts/action/report.py
@@ -96,3 +96,14 @@ jobs:
               print(f"::error title=docs/github-actions.md::{name} is not documented")
           sys.exit(1 if missing else 0)
           PY
+
+  # resolve-viv.sh decides which binary the action runs, and its refusals are
+  # the only thing between a workflow and executing whatever was served at a
+  # URL. Testing it needs codesign and ditto, so it needs a Mac — but not a
+  # hypervisor, a toolchain, or a template, which is why this runs on a hosted
+  # runner alongside the linting rather than on the self-hosted one.
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: Scripts/action/tests/resolve-viv-cases.sh
