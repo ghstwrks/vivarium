@@ -1,0 +1,13 @@
+# The Apple Developer Team ID that signs Vivarium's releases.
+#
+# The action refuses a downloaded binary that is not signed by this team, which
+# is what makes the download something other than "run whatever was at that
+# URL". A Developer ID signature alone only proves *someone* with an Apple
+# developer account built it.
+#
+# One line, the Team ID alone — the ten characters in the parentheses at the
+# end of a "Developer ID Application: Name (XXXXXXXXXX)" identity. Lines
+# starting with # are ignored. While this is unset the action still requires a
+# valid Developer ID signature, but warns that it cannot tell whose.
+#
+# Set this to the same value as the release workflow's APPLE_TEAM_ID secret.

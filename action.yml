@@ -71,15 +71,23 @@ inputs:
     default: ""
   viv-path:
     description: >-
-      An already-built, already-signed viv binary to use. Left empty, the action
-      builds one from its own checkout and caches it under the Vivarium home.
+      An already-installed, already-signed viv binary to use. Left empty, the
+      action downloads the release matching the ref it was pinned to. Required
+      when the action is used by local path, which has no release.
     required: false
     default: ""
-  xcode-path:
+  version:
     description: >-
-      Developer directory to build with, for a runner with more than one Xcode
-      (for example /Applications/Xcode-27.0.app/Contents/Developer). Sets
-      DEVELOPER_DIR for the build only.
+      Release tag to download, overriding the ref the action was pinned to. For
+      running a workflow against a different binary than the action definition,
+      which is worth doing deliberately and not by accident.
+    required: false
+    default: ""
+  expected-team-id:
+    description: >-
+      Apple Developer Team ID the downloaded binary must be signed by,
+      overriding Scripts/action/expected-signer.txt. For a fork that signs its
+      own releases.
     required: false
     default: ""
   preflight:
@@ -181,7 +189,8 @@ runs:
       env:
         VIVARIUM_HOME: ${{ inputs.vivarium-home }}
         INPUT_VIV_PATH: ${{ inputs.viv-path }}
-        INPUT_XCODE_PATH: ${{ inputs.xcode-path }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_EXPECTED_TEAM_ID: ${{ inputs.expected-team-id }}
       run: "$GITHUB_ACTION_PATH/Scripts/action/resolve-viv.sh"
 
     - id: preflight
