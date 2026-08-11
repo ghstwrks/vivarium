@@ -1,0 +1,98 @@
+name: Lint the action
+
+# Everything here runs on a hosted Linux runner in seconds. It cannot run
+# Vivarium — that needs a Mac with a hypervisor — but it can catch the whole
+# class of mistakes that would otherwise only show up on someone's self-hosted
+# runner: a script with a syntax error, a lost executable bit, a step pointing
+# at a file that is not there.
+
+on:
+  push:
+    paths:
+      - "action.yml"
+      - "Scripts/action/**"
+      - ".github/workflows/action-lint.yml"
+  pull_request:
+    paths:
+      - "action.yml"
+      - "Scripts/action/**"
+      - ".github/workflows/action-lint.yml"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck -x Scripts/action/*.sh
+
+      - name: python
+        run: python3 -m py_compile Scripts/action/report.py
+
+      - name: action.yml parses, and points at files that exist
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import os, re, sys, yaml
+
+          with open("action.yml", encoding="utf-8") as handle:
+              action = yaml.safe_load(handle)
+
+          problems = []
+
+          # Every script a step names has to exist, and a shell script has to be
+          # executable: git tracks the bit, and a lost one fails at the point
+          # where a runner has already booted a guest.
+          for step in action["runs"]["steps"]:
+              body = step.get("run", "")
+              for path in re.findall(r"\$GITHUB_ACTION_PATH/([\w./-]+)", body):
+                  if not os.path.isfile(path):
+                      problems.append(f"{step.get('id') or step.get('name')}: {path} does not exist")
+                  elif path.endswith(".sh") and not os.access(path, os.X_OK):
+                      problems.append(f"{path} is not executable")
+
+          # Composite actions resolve outputs at the end, so an output naming a
+          # step that does not exist is silently empty rather than an error.
+          ids = {step["id"] for step in action["runs"]["steps"] if "id" in step}
+          for name, output in (action.get("outputs") or {}).items():
+              for step_id in re.findall(r"steps\.([\w-]+)\.outputs", output.get("value", "")):
+                  if step_id not in ids:
+                      problems.append(f"output {name} reads steps.{step_id}, which is not a step")
+
+          # Inputs reach the scripts as INPUT_<NAME>. One declared and never
+          # read is either dead or a step that forgot to pass it on.
+          declared = {name.replace("-", "_").upper() for name in (action.get("inputs") or {})}
+          passed = set()
+          for step in action["runs"]["steps"]:
+              passed |= {key[6:] for key in (step.get("env") or {}) if key.startswith("INPUT_")}
+          for step in action["runs"]["steps"]:
+              for used in re.findall(r"inputs\.([\w-]+)", yaml.safe_dump(step)):
+                  passed.add(used.replace("-", "_").upper())
+          unused = sorted(declared - passed)
+          if unused:
+              problems.append("inputs declared but never used: " + ", ".join(unused))
+
+          for problem in problems:
+              print(f"::error title=action.yml::{problem}")
+          sys.exit(1 if problems else 0)
+          PY
+
+      - name: The docs mention every input
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import sys, yaml
+
+          with open("action.yml", encoding="utf-8") as handle:
+              action = yaml.safe_load(handle)
+          with open("docs/github-actions.md", encoding="utf-8") as handle:
+              docs = handle.read()
+
+          missing = [name for name in (action.get("inputs") or {}) if f"`{name}`" not in docs]
+          missing += [name for name in (action.get("outputs") or {}) if f"`{name}`" not in docs]
+          for name in missing:
+              print(f"::error title=docs/github-actions.md::{name} is not documented")
+          sys.exit(1 if missing else 0)
+          PY

@@ -1,0 +1,106 @@
+name: Run the action against examples/hello
+
+# Vivarium's own use of its own action. It is the only test that exercises the
+# whole thing — the build, the guest, the harvest, the report, the outputs —
+# and it can only run on hardware that can create a virtual machine, so it is
+# manual and main-branch only rather than on every push.
+#
+# The runner this targets must be prepared first: see docs/github-actions.md.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Sources/**"
+      - "Package.swift"
+      - "action.yml"
+      - "Scripts/action/**"
+      - "examples/hello/**"
+      - ".github/workflows/dogfood.yml"
+
+# v0.1 does not support concurrent runs on one host, and this workflow's two
+# jobs would otherwise contend for the same runner's disk and NAT pool.
+concurrency:
+  group: vivarium-dogfood
+  cancel-in-progress: false
+
+jobs:
+  hello:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The passing path, using examples/hello's own viv.json for the command
+      # and the artifact globs — so this also proves the manifest is read.
+      - id: pass
+        uses: ./
+        with:
+          working-directory: examples/hello
+          env: |
+            GREETING=hello from the workflow
+          artifact-name: dogfood-pass
+
+      - name: The passing run reported what it should have
+        env:
+          STATUS: ${{ steps.pass.outputs.status }}
+          PASSED: ${{ steps.pass.outputs.passed }}
+          TEST_EXIT: ${{ steps.pass.outputs.test-exit-code }}
+          ARTIFACTS: ${{ steps.pass.outputs.artifact-count }}
+          RESULTS: ${{ steps.pass.outputs.results-path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "::error::$1 was \"$2\", expected \"$3\""
+              fail=1
+            fi
+          }
+          check status "$STATUS" passed
+          check passed "$PASSED" true
+          check test-exit-code "$TEST_EXIT" 0
+          check artifact-count "$ARTIFACTS" 2
+          # The manifest's env is overridable from the workflow, and the value
+          # reaches the guest: examples/hello echoes $GREETING into an artifact.
+          grep -q "hello from the workflow" "$RESULTS/artifacts/greeting.txt" \
+            || { echo "::error::the env input did not reach the guest"; fail=1; }
+          exit $fail
+
+      # The failing path. A test that fails must fail the step, so this one
+      # turns that off and checks the outputs instead — which is also the
+      # documented way for a workflow to decide for itself.
+      - id: broken
+        uses: ./
+        with:
+          working-directory: examples/hello
+          command: |
+            echo "this run is supposed to fail"
+            exit 3
+          fail-on-test-failure: false
+          artifact-name: dogfood-fail
+
+      - name: The failing run reported a failure, not an error
+        env:
+          STATUS: ${{ steps.broken.outputs.status }}
+          PASSED: ${{ steps.broken.outputs.passed }}
+          EXIT: ${{ steps.broken.outputs.exit-code }}
+          TEST_EXIT: ${{ steps.broken.outputs.test-exit-code }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "::error::$1 was \"$2\", expected \"$3\""
+              fail=1
+            fi
+          }
+          check status "$STATUS" failed
+          check passed "$PASSED" false
+          # 1, not 70: the tests ran and gave an answer. Confusing the two is
+          # the failure mode this whole exit-code contract exists to prevent.
+          check exit-code "$EXIT" 1
+          check test-exit-code "$TEST_EXIT" 3
+          exit $fail
