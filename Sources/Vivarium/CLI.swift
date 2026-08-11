@@ -79,7 +79,7 @@ enum ExitStatus {
 struct Viv: AsyncParsableCommand {
     /// One version string, quoted by `--version` and stamped into every
     /// `report.json`, so that a report can always be traced to a build.
-    static let releaseVersion = "0.1.0-dev"
+    static let releaseVersion = "0.1.0"
 
     static let configuration = CommandConfiguration(
         commandName: "viv",
