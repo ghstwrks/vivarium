@@ -2,3 +2,4 @@
 .DS_Store
 *.ipsw
 __pycache__/
+dist/
