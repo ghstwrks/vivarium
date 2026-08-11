@@ -1,0 +1,256 @@
+name: "Vivarium"
+description: >-
+  Run a project's tests inside a fresh, disposable macOS guest on a self-hosted
+  Apple silicon runner, and collect the report it produces.
+author: "rxbynerd"
+
+branding:
+  icon: "box"
+  color: "green"
+
+# A composite action rather than a JavaScript one: everything here is a macOS
+# host tool being driven, there is no Node work to do, and a compiled bundle
+# would hide the four shell steps that are the whole of what this does. The one
+# thing composite actions cannot have is a post-run hook, so cleanup is a step
+# that runs with `if: always()` rather than an automatic one — see `gc` below.
+inputs:
+  command:
+    description: >-
+      The test command, run by the guest's shell in the copied project
+      directory. May be several lines. Overrides viv.json's "test"; leave it
+      empty to use that.
+    required: false
+    default: ""
+  working-directory:
+    description: >-
+      The project directory to copy into the guest, relative to the workspace or
+      absolute. It is copied, never mounted: nothing the guest does can reach
+      the checkout.
+    required: false
+    default: "."
+  manifest:
+    description: "Path to viv.json. Defaults to <working-directory>/viv.json when it exists."
+    required: false
+    default: ""
+  template:
+    description: >-
+      The guest template to clone. Defaults to the newest one in the Vivarium
+      home, which the runner must already have (see docs/github-actions.md).
+    required: false
+    default: ""
+  timeout:
+    description: >-
+      Seconds the test command may take. Bounds the command alone — not the
+      boot, the staging, or the harvest. Defaults to viv.json's "timeout", then
+      to 600.
+    required: false
+    default: ""
+  env:
+    description: >-
+      Extra environment for the test command, one NAME=value per line. This is
+      where a secret belongs: the values are written to a private file and
+      passed to the guest, never placed on a command line, and never recorded in
+      the report or the run log.
+    required: false
+    default: ""
+  run-id:
+    description: >-
+      Name for this run, which is also its directory under <home>/runs and the
+      guest's $VIV_RUN_ID. Defaults to one derived from the workflow run,
+      attempt, and job — set it yourself when a matrix has two legs that would
+      otherwise derive the same name.
+    required: false
+    default: ""
+  keep-vm:
+    description: "Keep VM.bundle even when the test passes. A failed run always keeps everything."
+    required: false
+    default: "false"
+  vivarium-home:
+    description: "Where Vivarium keeps templates and runs. Defaults to ~/.vivarium."
+    required: false
+    default: ""
+  viv-path:
+    description: >-
+      An already-built, already-signed viv binary to use. Left empty, the action
+      builds one from its own checkout and caches it under the Vivarium home.
+    required: false
+    default: ""
+  xcode-path:
+    description: >-
+      Developer directory to build with, for a runner with more than one Xcode
+      (for example /Applications/Xcode-27.0.app/Contents/Developer). Sets
+      DEVELOPER_DIR for the build only.
+    required: false
+    default: ""
+  preflight:
+    description: >-
+      Run `viv preflight` before the run. Two seconds that turn a
+      host/entitlement/disk-space problem into a legible failure.
+    required: false
+    default: "true"
+  summary:
+    description: "Write the run's report to the job summary."
+    required: false
+    default: "true"
+  upload-artifacts:
+    description: >-
+      Upload the run's results/ directory — report, streams, and harvested
+      artifacts — with actions/upload-artifact.
+    required: false
+    default: "true"
+  artifact-name:
+    description: "Name for the uploaded artifact. Defaults to vivarium-<run-id>."
+    required: false
+    default: ""
+  artifact-retention-days:
+    description: "Retention for the uploaded artifact. Empty uses the repository default."
+    required: false
+    default: ""
+  gc:
+    description: >-
+      Run `viv gc` afterwards, which deletes the VM.bundle and Shared/ of every
+      finished run and keeps every results/. A failed run keeps tens of
+      gigabytes on purpose, which on a long-lived runner is a full disk by
+      Thursday.
+    required: false
+    default: "true"
+  gc-older-than:
+    description: >-
+      Also delete whole run directories, results included, older than this many
+      days. Empty does not. Set it to the number of days results are still
+      worth reading on the runner itself; the uploaded artifact is the copy that
+      outlives it.
+    required: false
+    default: ""
+  fail-on-test-failure:
+    description: >-
+      Fail the step when the test command fails. Set to false to read the
+      outputs and decide for yourself — a Vivarium failure (exit 70) still fails
+      the step either way, because it means the tests never ran.
+    required: false
+    default: "true"
+
+outputs:
+  status:
+    description: "passed, failed, timedOut, or error when the run never reached a verdict."
+    value: ${{ steps.report.outputs.status }}
+  passed:
+    description: "true only when the test command exited 0."
+    value: ${{ steps.report.outputs.passed }}
+  exit-code:
+    description: "viv's own exit code: 0 passed, 1 the test failed or timed out, 2 usage, 70 Vivarium failed."
+    value: ${{ steps.run.outputs.exit-code }}
+  test-exit-code:
+    description: >-
+      The test command's exit code. Empty when it never exited — a timeout, or a
+      connection that failed underneath it — which is a different fact from
+      "exited nonzero".
+    value: ${{ steps.report.outputs.test-exit-code }}
+  run-id:
+    description: "The run's identifier, which is also the guest's $VIV_RUN_ID."
+    value: ${{ steps.run.outputs.run-id }}
+  run-path:
+    description: "The run directory on the runner."
+    value: ${{ steps.run.outputs.run-path }}
+  results-path:
+    description: "The results directory on the runner: report.json, report.md, the streams, and artifacts/."
+    value: ${{ steps.run.outputs.results-path }}
+  report-json:
+    description: "Path to results/report.json, or empty when the run failed before writing one."
+    value: ${{ steps.report.outputs.report-json }}
+  total-seconds:
+    description: "Wall-clock seconds for the whole run, from the report."
+    value: ${{ steps.report.outputs.total-seconds }}
+  artifact-count:
+    description: "How many files the harvest collected."
+    value: ${{ steps.report.outputs.artifact-count }}
+  viv-path:
+    description: "The viv binary this run used."
+    value: ${{ steps.viv.outputs.viv-path }}
+
+runs:
+  using: "composite"
+  steps:
+    # Inputs reach the scripts through the environment and never through
+    # ${{ }} interpolation into a shell body: a command input is arbitrary text
+    # from a workflow file, and interpolating it would make it arbitrary text
+    # in this action's own shell rather than in the guest's, which is the one
+    # place it is meant to run.
+    - id: viv
+      shell: bash
+      env:
+        VIVARIUM_HOME: ${{ inputs.vivarium-home }}
+        INPUT_VIV_PATH: ${{ inputs.viv-path }}
+        INPUT_XCODE_PATH: ${{ inputs.xcode-path }}
+      run: "$GITHUB_ACTION_PATH/Scripts/action/resolve-viv.sh"
+
+    - id: preflight
+      if: inputs.preflight == 'true'
+      shell: bash
+      env:
+        VIVARIUM_HOME: ${{ inputs.vivarium-home }}
+        VIV: ${{ steps.viv.outputs.viv-path }}
+      run: '"$VIV" preflight'
+
+    - id: run
+      shell: bash
+      env:
+        VIVARIUM_HOME: ${{ inputs.vivarium-home }}
+        VIV: ${{ steps.viv.outputs.viv-path }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_MANIFEST: ${{ inputs.manifest }}
+        INPUT_TEMPLATE: ${{ inputs.template }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_ENV: ${{ inputs.env }}
+        INPUT_RUN_ID: ${{ inputs.run-id }}
+        INPUT_KEEP_VM: ${{ inputs.keep-vm }}
+      run: "$GITHUB_ACTION_PATH/Scripts/action/run.sh"
+
+    # The run step returns 0 whatever the run's verdict was, so its *failing*
+    # means it never got as far as starting one — a missing template, a run-id
+    # already taken. It has already said so with an annotation of its own, and
+    # there is no report to render or verdict to reach.
+    - id: report
+      if: always() && steps.run.outcome == 'success'
+      shell: bash
+      env:
+        RESULTS_PATH: ${{ steps.run.outputs.results-path }}
+        EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+        WRITE_SUMMARY: ${{ inputs.summary }}
+      run: /usr/bin/env python3 "$GITHUB_ACTION_PATH/Scripts/action/report.py"
+
+    - name: Upload the run's results
+      if: always() && inputs.upload-artifacts == 'true' && steps.run.outputs.results-exist == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name != '' && inputs.artifact-name || format('vivarium-{0}', steps.run.outputs.run-id) }}
+        path: ${{ steps.run.outputs.results-path }}
+        retention-days: ${{ inputs.artifact-retention-days }}
+        if-no-files-found: warn
+
+    - name: Reclaim disk space
+      if: always() && inputs.gc == 'true' && steps.viv.outcome == 'success'
+      shell: bash
+      env:
+        VIVARIUM_HOME: ${{ inputs.vivarium-home }}
+        VIV: ${{ steps.viv.outputs.viv-path }}
+        OLDER_THAN: ${{ inputs.gc-older-than }}
+      run: |
+        set -uo pipefail
+        # Never fatal. Reclaiming space is housekeeping, and a job that passed
+        # its tests did not fail because a directory would not unlink.
+        "$VIV" gc || echo "::warning title=Vivarium::viv gc did not finish; the runner may be holding onto old runs."
+        if [ -n "$OLDER_THAN" ]; then
+          "$VIV" gc --older-than "$OLDER_THAN" || echo "::warning title=Vivarium::viv gc --older-than did not finish."
+        fi
+
+    - name: Report the verdict
+      if: always() && steps.run.outcome == 'success'
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+        STATUS: ${{ steps.report.outputs.status }}
+        RESULTS_PATH: ${{ steps.run.outputs.results-path }}
+        FAIL_ON_TEST_FAILURE: ${{ inputs.fail-on-test-failure }}
+      run: "$GITHUB_ACTION_PATH/Scripts/action/verdict.sh"
