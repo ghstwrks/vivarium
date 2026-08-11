@@ -38,31 +38,30 @@ the bare machine rather than a VM on it.
 
 ## Preparing a runner
 
-Once per machine. Budget an hour, most of it downloading.
+Once per machine. Budget an hour, most of it downloading. **No Xcode and no
+Swift toolchain** — the action downloads a compiled `viv`, so the runner needs
+a hypervisor and a template, not a build environment.
 
 1. **The hardware and OS.** Apple silicon, macOS 27 or later, roughly 80 GiB
    free after everything below — a template is a full macOS install, and each
    concurrent run clones one.
-2. **Xcode**, not just the Command Line Tools: Vivarium builds against the
-   macOS 27 SDK. If the machine has more than one Xcode, either set
-   `DEVELOPER_DIR` for the runner or pass the `xcode-path` input.
-3. **The Actions runner itself**, registered to the repository or organisation
+2. **The Actions runner itself**, registered to the repository or organisation
    and running **as the same user that owns `~/.vivarium`**. On macOS
    `./svc.sh install` installs a LaunchAgent, which runs in that user's login
    session; the machine therefore has to be logged in (enable automatic login
    if it is headless). A runner running as a different user, or as a system
    daemon outside a login session, will not be able to create a virtual
    machine.
-4. **A macOS 27 IPSW**, downloaded by hand. There is no download fallback and
+3. **A macOS 27 IPSW**, downloaded by hand. There is no download fallback and
    this is deliberate — see [Why a local IPSW is
    mandatory](../README.md#why-a-local-ipsw-is-mandatory).
-5. **The template**, built once, from that IPSW:
+4. **The template**, built once, from that IPSW, using a released `viv`:
 
    ```sh
-   git clone https://github.com/rxbynerd/vivarium && cd vivarium
-   just build
-   ./.build/release/viv preflight --ipsw ~/Downloads/UniversalMac_27.0_..._Restore.ipsw
-   ./.build/release/viv template create --ipsw ~/Downloads/UniversalMac_27.0_..._Restore.ipsw
+   curl -fsSLO https://github.com/rxbynerd/vivarium/releases/download/v0.1.0/viv-v0.1.0-macos-arm64.zip
+   ditto -x -k viv-v0.1.0-macos-arm64.zip .
+   ./viv preflight --ipsw ~/Downloads/UniversalMac_27.0_..._Restore.ipsw
+   ./viv template create --ipsw ~/Downloads/UniversalMac_27.0_..._Restore.ipsw
    ```
 
    Around two and a half minutes. Every later run clones this in seconds. The
@@ -71,11 +70,63 @@ Once per machine. Budget an hour, most of it downloading.
    IPSW cannot be fetched automatically anyway. A runner without a template
    fails the job immediately, with that as the message.
 
-The checkout above is only needed for `template create`. The action builds its
-own `viv` from whatever ref the workflow pins it to, and caches it under
-`~/.vivarium/bin/<key>/viv` keyed by the sources it was built from, so the
-first job on a runner pays for one release build and later jobs pay nothing. To
-skip that entirely, install `viv` yourself and pass `viv-path`.
+That `viv` was only needed for `template create` and can be deleted afterwards;
+the action fetches its own.
+
+## Which binary the action runs
+
+The action downloads the release matching **the ref the workflow pinned it
+to**. `uses: rxbynerd/vivarium@v0.1.0` runs v0.1.0's action definition and
+v0.1.0's binary — the two always agree, or the job fails saying so. It is
+cached at `~/.vivarium/bin/<tag>/viv`, so only the first job on a runner pays
+for the download.
+
+Before the binary is run, in this order:
+
+1. Its SHA-256 must match the release's `checksums.txt`.
+2. `codesign --verify --strict` must pass.
+3. It must satisfy a designated requirement demanding a genuine **Developer ID**
+   signature, and — when a team is configured — that team's. The checksum only
+   proves the bytes came from whoever served both files; the signature is what
+   proves who built it.
+4. It must carry `com.apple.security.virtualization`, without which it could not
+   create a guest.
+
+Notarisation is checked with `spctl` but is not fatal: a notarisation ticket
+cannot be stapled to a bare executable, so the check is an online one, and a
+runner behind a proxy that cannot reach Apple would otherwise be unable to run
+a binary whose signature has already verified. The check produces a warning
+annotation when it does not confirm.
+
+The expected team comes from `Scripts/action/expected-signer.txt` in the action
+itself, or from the `expected-team-id` input, which is what a fork signing its
+own releases sets.
+
+### When there is no release to match
+
+The action **fails with instructions** rather than guessing. Three cases:
+
+| Situation | Why there is no release |
+|---|---|
+| `uses: ./` | Used by local path, so there is no ref to have pinned. |
+| `uses: owner/vivarium@main` or `@<sha>` | Releases are cut from tags. |
+| A fork with no releases of its own | Nothing has been published under that name. |
+
+Each of these needs `viv-path`, naming a signed binary installed on the runner:
+
+```yaml
+      - uses: ./
+        with:
+          viv-path: ${{ github.workspace }}/.build/release/viv
+```
+
+The action will not fall back to building `viv` and will not fall back to
+"the newest release that exists". Both would mean a workflow silently running
+a binary other than the one it asked for, which is the sort of helpfulness that
+becomes a mystery two months later.
+
+`version` overrides the ref for the rare case where running a different binary
+than the action definition is the deliberate intent.
 
 ## Using it
 
@@ -195,8 +246,9 @@ never exited; a timeout is not an exit status.
 | `run-id` | derived | Names the run and its directory. |
 | `keep-vm` | `false` | Keep `VM.bundle` even on a pass. |
 | `vivarium-home` | `~/.vivarium` | Where templates and runs live. |
-| `viv-path` | — | Use an installed `viv` instead of building one. |
-| `xcode-path` | — | `DEVELOPER_DIR` for the build, on a multi-Xcode runner. |
+| `viv-path` | — | Use an installed `viv` instead of downloading one. Required when there is no release to match. |
+| `version` | the pinned ref | Release tag to download, overriding the ref. |
+| `expected-team-id` | `Scripts/action/expected-signer.txt` | Team ID the downloaded binary must be signed by. |
 | `preflight` | `true` | Run `viv preflight` first. |
 | `summary` | `true` | Write the report to the job summary. |
 | `upload-artifacts` | `true` | Upload `results/`. |
@@ -307,8 +359,13 @@ See [Security notes](../README.md#security-notes) for the rest.
 | Symptom | What it means |
 |---|---|
 | `No guest template in …/templates` | The runner was never prepared. Run `viv template create --ipsw <path>` on it once. |
-| `missing the com.apple.security.virtualization entitlement` | A `viv` given via `viv-path` was built but not signed. `codesign -s - --entitlements Vivarium.entitlements -f <path>`, or drop the input and let the action build one. |
-| `swift build failed` | Usually the wrong Xcode. Set `xcode-path` to one with the macOS 27 SDK. |
+| `missing the com.apple.security.virtualization entitlement` | A `viv` given via `viv-path` was built but not signed. `codesign -s - --entitlements Vivarium.entitlements -f <path>`. |
+| `used by local path, so there is no release to download` | `uses: ./`. Pass `viv-path` — see [When there is no release to match](#when-there-is-no-release-to-match). |
+| `pinned to "…", which is not a release tag` | The workflow pinned a branch or a SHA. Pin a tag, or pass `version`, or pass `viv-path`. |
+| `No viv-…-macos-arm64.zip in the … release` | That tag has no release, or its release has no macOS arm64 asset. Common on a fork that has not cut its own. |
+| `does not match its checksum` / `not signed by the expected Developer ID` | The download is not what the release says it is. Do not work around it; nothing is cached, and the job stopped before running anything. |
+| `No expected signing team is configured` (warning) | The action checked that the binary is Developer ID signed but not by whom. Set `expected-team-id`. |
+| `Gatekeeper did not confirm this binary is notarised` (warning) | Usually a runner that cannot reach Apple. The signature verified regardless. |
 | Exit 70, `[provisioning]` or `[addressDiscovery]` | The guest did not come up. Check the runner is running in a login session as the user owning `~/.vivarium`, and that `run.log` in the uploaded artifact does not show it running out of disk. |
 | `The run directory … already exists` | Two runs derived the same name. Give them `run-id`s. |
 | The job takes ~40 s longer than the tests | That is the guest: roughly 17 s to boot to SSH, and a shutdown at the end. It is the price of the clean slate. |
@@ -316,3 +373,40 @@ See [Security notes](../README.md#security-notes) for the rest.
 Every failed run's `run.log` and `failure.json` are in the uploaded artifact,
 and `failure.json` names the stage that failed. That is the first thing to
 read.
+
+## Cutting a release
+
+Only for maintainers of this repository, or of a fork that signs its own
+binaries. `.github/workflows/release.yml` builds, signs, notarises, and
+publishes the asset the action downloads; pushing a `v*` tag triggers it, and
+`workflow_dispatch` re-runs it against a tag that already exists.
+
+It runs on a self-hosted Apple silicon Mac — the SDK requirement again — but it
+never starts a guest, so it needs neither a hypervisor nor a template. Any Mac
+with the right Xcode and the secrets below will do.
+
+| Secret | |
+|---|---|
+| `APPLE_CERTIFICATE_P12` | The Developer ID Application certificate and key, base64 of a `.p12`. |
+| `APPLE_CERTIFICATE_PASSWORD` | The password that `.p12` was exported with. |
+| `APPLE_SIGNING_IDENTITY` | e.g. `Developer ID Application: Your Name (XXXXXXXXXX)`. |
+| `APPLE_TEAM_ID` | The ten-character Team ID. Checked after signing. |
+| `NOTARY_KEY_P8` | App Store Connect API key, base64 of the `.p8`. |
+| `NOTARY_KEY_ID` | That key's ID. |
+| `NOTARY_ISSUER_ID` | The issuer UUID from App Store Connect. |
+
+Signing is not optional dressing. An unsigned binary cannot hold
+`com.apple.security.virtualization`, and without that entitlement `viv` cannot
+create a virtual machine at all — so a release that skipped signing would be a
+release that does not work. The job fails at the signing step rather than
+publishing one.
+
+A fork that publishes its own releases must also put its own Team ID in
+`Scripts/action/expected-signer.txt`, or every workflow using it must pass
+`expected-team-id`. Until one of those is true the action still requires a
+valid Developer ID signature, but warns that it cannot tell whose.
+
+The job creates a keychain of its own, adds it to the search list rather than
+repointing the default, and removes it with `if: always()`. That matters
+because the runner is somebody's actual Mac: a job that fails halfway must not
+leave it with a signing key unlocked or a broken default keychain.

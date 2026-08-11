@@ -85,8 +85,7 @@ not edited.
   rules are the manifest's own, now shared by both through
   `GuestEnvironment`.
 - **A GitHub Action** (`action.yml`), so a downstream project gets a
-  clean-slate guest per job from a few lines of workflow. It builds and
-  caches its own signed `viv` from the ref the workflow pins, runs the
+  clean-slate guest per job from a few lines of workflow. It runs the
   tests, writes the report to the job summary, uploads `results/` as a
   workflow artifact, reclaims disk with `viv gc`, and maps Vivarium's exit
   codes onto the step's success or failure — including the distinction that
@@ -94,6 +93,25 @@ not edited.
   `fail-on-test-failure`, because the tests never ran. Requires a
   self-hosted Apple silicon runner: GitHub's hosted macOS runners cannot
   nest virtualization. See `docs/github-actions.md`.
+- **Signed, notarised release binaries**, published by
+  `.github/workflows/release.yml` when a `v*` tag is pushed: a Developer ID
+  signature with the hardened runtime, notarised by Apple, attached to the
+  GitHub release with a `checksums.txt`. Signing is not decoration — an
+  unsigned binary cannot hold `com.apple.security.virtualization`, and
+  without that entitlement `viv` cannot create a guest at all.
+- The Action **downloads that release** rather than compiling one, keyed to
+  the ref the workflow pinned it to, so `@v0.1.0` gets v0.1.0's action
+  definition and v0.1.0's binary and never a mixture. A runner therefore
+  needs no Xcode and no Swift toolchain. What arrives is verified before it
+  is trusted: its SHA-256 against the release's `checksums.txt`, a strict
+  `codesign` check, a designated requirement demanding a genuine Developer
+  ID signature (and, when configured, a specific Team ID), and the
+  virtualization entitlement. It is cached at `~/.vivarium/bin/<tag>/viv`
+  and moved into place only once every check has passed. Where no release
+  can match the ref — used by local path, pinned to a branch or a SHA, a
+  fork that publishes nothing — the Action fails with instructions rather
+  than building or guessing at a tag, both of which would mean silently
+  running a binary other than the one the workflow asked for.
 - `examples/hello/`, a minimal committed `viv.json` project runnable as
   written.
 

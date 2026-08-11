@@ -270,12 +270,14 @@ jobs:
           command: swift test
 ```
 
-It builds and caches its own signed `viv`, runs the tests, writes the report
-to the job summary, uploads `results/` as a workflow artifact, and reclaims
-disk afterwards. The runner must be **a self-hosted Apple silicon Mac with a
-template already built**: GitHub's hosted macOS runners cannot nest
-virtualization, and restoring a template is a multi-minute, 80-GiB operation
-that no workflow should perform by surprise.
+It downloads the signed, notarised `viv` from the release matching the tag the
+workflow pinned — verifying its checksum and Developer ID signature, and
+caching it for later jobs — then runs the tests, writes the report to the job
+summary, uploads `results/` as a workflow artifact, and reclaims disk
+afterwards. The runner needs no Xcode and no Swift toolchain, but it must be
+**a self-hosted Apple silicon Mac with a template already built**: GitHub's
+hosted macOS runners cannot nest virtualization, and restoring a template is a
+multi-minute, 80-GiB operation that no workflow should perform by surprise.
 
 [`docs/github-actions.md`](docs/github-actions.md) covers preparing a
 runner, passing secrets, matrices, disk hygiene, and the security of running
