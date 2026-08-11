@@ -31,7 +31,7 @@ enum Entitlement {
                 This binary is missing the \(virtualization) entitlement, so it cannot \
                 create a virtual machine. Sign it before running:
                   codesign -s - --entitlements Vivarium.entitlements -f \(CommandLine.arguments[0])
-                or build through the Makefile, which signs as part of every build.
+                or build with `just build`, which signs as part of every build.
                 """,
                 inspectionHints: ["codesign -d --entitlements - \(CommandLine.arguments[0])"]
             )
