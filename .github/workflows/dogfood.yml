@@ -31,11 +31,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The action normally downloads a signed release matching the ref it was
+      # pinned to. Used by local path there is no such ref, so this builds the
+      # binary under test — which is the point: this workflow exists to test the
+      # commit it is running on, not the last thing that was released. The
+      # runner therefore needs Xcode as well as a template, which is a
+      # requirement of this workflow and not of the action.
+      - name: Build the viv under test
+        run: |
+          set -euo pipefail
+          swift build -c release
+          codesign -s - --entitlements Vivarium.entitlements -f .build/release/viv
+          codesign -d --entitlements - .build/release/viv 2>&1 \
+            | grep -q com.apple.security.virtualization
+
       # The passing path, using examples/hello's own viv.json for the command
       # and the artifact globs — so this also proves the manifest is read.
       - id: pass
         uses: ./
         with:
+          viv-path: ${{ github.workspace }}/.build/release/viv
           working-directory: examples/hello
           env: |
             GREETING=hello from the workflow
@@ -74,6 +89,7 @@ jobs:
       - id: broken
         uses: ./
         with:
+          viv-path: ${{ github.workspace }}/.build/release/viv
           working-directory: examples/hello
           command: |
             echo "this run is supposed to fail"
