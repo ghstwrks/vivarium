@@ -36,6 +36,18 @@ enum VivState: String, Codable, Sendable {
     case failed
 }
 
+/// One state, as it was entered.
+///
+/// The monotonic offset is what the timings are computed from — a clock the
+/// user changes mid-run must not be able to produce a negative duration — and
+/// the wall-clock date is carried alongside it so a report can be correlated
+/// with a CI log or a system log after the fact.
+private struct StateEntry {
+    let state: VivState
+    let elapsedSeconds: Double
+    let at: Date
+}
+
 /// Timeouts, gathered so they are tunable in one place.
 enum Timeouts {
     static let preflight = Duration.seconds(30)
@@ -102,6 +114,10 @@ struct RunReport: Codable, Sendable {
     var guestAddress: String?
     var addressDiscoveryStrategy: String?
     var virtioFSMountPath: String?
+    /// Every state the run passed through, with the time it spent in each.
+    /// Filled in when the report is written, which is the first moment the
+    /// timeline is complete.
+    var states: [StateTiming] = []
 
     var allAcceptanceCriteriaPassed: Bool {
         restoreImageVerifiedAsMacOS27OrLater
@@ -234,6 +250,14 @@ final class Orchestrator {
     private var cleanupCompleted = false
     /// Phase timings for `viv run`, in pipeline order.
     private var phases: [PhaseTiming] = []
+    /// When each state was entered, in order, starting from the one the
+    /// orchestrator is constructed in. Durations are derived rather than
+    /// stored, so that the state a run is *in* is always accounted for — a run
+    /// that dies in `waitingForSSH` should report the ten minutes it spent
+    /// there, not nothing.
+    private var stateEntries: [StateEntry] = [
+        StateEntry(state: .idle, elapsedSeconds: 0, at: Date())
+    ]
 
     init(options: OrchestratorOptions) {
         self.options = options
@@ -1332,6 +1356,7 @@ final class Orchestrator {
             timedOut: execution.timedOut,
             testExitCode: execution.exitCode,
             phases: phases,
+            states: stateTimings(),
             totalSeconds: startedAt.distance(to: Date()),
             artifacts: artifacts,
             artifactByteCount: artifacts.reduce(0) { $0 + $1.byteCount },
@@ -1656,19 +1681,43 @@ final class Orchestrator {
     private func transition(to newState: VivState) {
         let previous = state
         state = newState
+        let now = Date()
+        let elapsedSeconds = startedAt.duration(to: .now).elapsedSeconds
+        stateEntries.append(
+            StateEntry(state: newState, elapsedSeconds: elapsedSeconds, at: now)
+        )
         log.info("State: \(previous.rawValue) -> \(newState.rawValue)")
 
         guard let stateLogURL else { return }
-        let elapsed = startedAt.duration(to: .now)
         let entry: [String: Any] = [
             "from": previous.rawValue,
             "to": newState.rawValue,
-            "elapsedSeconds": Double(elapsed.components.seconds)
-                + Double(elapsed.components.attoseconds) / 1e18,
-            "at": Date().formatted(.iso8601)
+            "elapsedSeconds": elapsedSeconds,
+            "at": now.formatted(.iso8601)
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: entry) else { return }
         appendLine(data, to: stateLogURL)
+    }
+
+    /// The timeline so far, with each state closed against the next and the
+    /// current one closed against now.
+    ///
+    /// `logs/state.jsonl` holds the same transitions, but it lives in the
+    /// bundle a passing run deletes; this is the copy that reaches `results/`
+    /// and can still be compared against next month's run.
+    private func stateTimings() -> [StateTiming] {
+        let end = startedAt.duration(to: .now).elapsedSeconds
+        return stateEntries.enumerated().map { index, entry in
+            let closedAt = index + 1 < stateEntries.count
+                ? stateEntries[index + 1].elapsedSeconds
+                : end
+            return StateTiming(
+                state: entry.state.rawValue,
+                enteredAtSeconds: entry.elapsedSeconds,
+                seconds: max(0, closedAt - entry.elapsedSeconds),
+                enteredAt: entry.at
+            )
+        }
     }
 
     private func appendLine(_ data: Data, to url: URL) {
@@ -1690,7 +1739,8 @@ final class Orchestrator {
         manifest.finishedAt = Date()
         manifest.outcome = outcome
         try? manifest.write(to: paths.runManifest)
-        if let report {
+        if report != nil {
+            report.states = stateTimings()
             try? JSONCoding.write(report, to: paths.root.appendingPathComponent("report.json"))
         }
     }
@@ -1698,13 +1748,12 @@ final class Orchestrator {
     /// Records a failure alongside the run's other results.
     func recordFailure(_ error: any Error) {
         guard let paths else { return }
-        let elapsed = startedAt.duration(to: .now)
         let failure = FailureReport(
             error: error,
             stage: stageForCurrentState(),
             vmState: virtualMachine.map { VMStateDescription.describe($0.state) },
-            elapsedSeconds: Double(elapsed.components.seconds)
-                + Double(elapsed.components.attoseconds) / 1e18,
+            elapsedSeconds: startedAt.duration(to: .now).elapsedSeconds,
+            states: stateTimings(),
             bundlePath: paths.root.path,
             cleanupCompleted: cleanupCompleted,
             lastReadinessGate: lastReadinessGate

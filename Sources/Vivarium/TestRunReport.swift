@@ -47,6 +47,28 @@ struct PhaseTiming: Codable, Sendable {
     let seconds: Double
 }
 
+/// One state's wall-clock cost, in the order the run entered its states.
+///
+/// The state machine is finer-grained than `PhaseTiming`: a phase says "boot to
+/// ssh took 17 seconds", a state says how much of that was spent waiting for an
+/// address and how much waiting for sshd. Recorded so that a regression can be
+/// located in an archived report rather than only noticed in one — which needs
+/// the timings to survive the bundle, and `logs/state.jsonl` does not: it is
+/// deleted with the bundle every time a run passes.
+struct StateTiming: Codable, Sendable {
+    /// A `VivState` raw value, kept as a string so that a report written by a
+    /// different version of Vivarium — with a state this one does not know —
+    /// still decodes.
+    let state: String
+    /// When the run entered this state, as an offset from the start of the run.
+    let enteredAtSeconds: Double
+    /// Wall-clock time in this state. The last state is closed at the moment
+    /// the report is written, so it covers everything after the final
+    /// transition.
+    let seconds: Double
+    let enteredAt: Date
+}
+
 /// A harvested file, as the host found it.
 struct ArtifactEntry: Codable, Sendable {
     /// Relative to `results/artifacts/`, which mirrors the guest's workdir.
@@ -88,6 +110,13 @@ struct TestRunReport: Codable, Sendable {
     let testExitCode: Int32?
 
     let phases: [PhaseTiming]
+    /// Every state the run passed through, with the time it spent in each.
+    ///
+    /// Optional only for reports written before this field existed: `viv gc`
+    /// decodes reports of any age, and a run archived by 0.1.0 must not stop
+    /// decoding because a later version records more. Every report Vivarium
+    /// writes now carries it.
+    let states: [StateTiming]?
     let totalSeconds: Double
 
     let artifacts: [ArtifactEntry]

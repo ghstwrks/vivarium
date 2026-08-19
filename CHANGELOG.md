@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow Semantic Versioning strictly — see
 `DESIGN-0.1.md` for what v0.1 deliberately leaves out.
 
+## [Unreleased]
+
+### Added
+
+- A per-state timing breakdown in `results/report.json`, `results/failure.json`,
+  and `viv selftest`'s report: a `states` array giving every state the run
+  entered, when it entered it (as an offset from the start of the run and as a
+  wall-clock date), and how long it stayed there. The pipeline's coarser
+  `phases` are unchanged, and remain what `report.md` and the terminal summary
+  show. The state transitions were already logged, and already written to
+  `logs/state.jsonl` — but that file lives inside the `VM.bundle` a passing run
+  deletes, so the timings for exactly the runs worth comparing did not survive.
+  Now they are in the reports that are archived, where a boot or a staging step
+  that has been getting slower can be found by comparing runs rather than by
+  happening to watch one.
+
 ## [0.1.0] - 2026-08-10
 
 ### Pivot

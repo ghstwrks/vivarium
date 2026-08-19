@@ -216,6 +216,30 @@ never exited — a timeout, or a connection that failed underneath it — which
 is a different fact from "exited nonzero" and is kept distinguishable
 rather than collapsed into `null`.
 
+Timings are recorded twice, at two resolutions. `phases` is the pipeline's own
+steps — materialise, stage code, boot to ssh, prepare guest, test, harvest,
+shutdown — and is what `report.md` and the terminal summary show,
+because it is what a person reads after waiting for a run. `states` is the
+state machine underneath it, one entry per state the run entered:
+
+```json
+"states": [
+  { "state": "waitingForSSH",
+    "enteredAtSeconds": 21.44,
+    "seconds": 16.98,
+    "enteredAt": "2026-08-19T10:02:41Z" }
+]
+```
+
+`enteredAtSeconds` is an offset from the start of the run and `seconds` is
+how long the run stayed in that state; the last state is closed when the
+report is written, so the two account for the whole run. Both are there for
+comparing runs rather than reading one: a template that boots slower after
+a host upgrade, or a project whose staging cost has been creeping up, shows
+in the archived reports before anyone thinks to time it. The same timeline
+is in `failure.json` for a run that never reached a verdict, and appears
+live in the log as `State: x -> y` lines with their elapsed offsets.
+
 ## Cleanup and `gc`
 
 A run that passes deletes its own `VM.bundle` and staged `Shared/` as its
