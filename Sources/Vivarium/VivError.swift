@@ -144,6 +144,10 @@ struct FailureReport: Codable, Sendable {
     let underlyingCode: Int?
     let vmState: String?
     let elapsedSeconds: Double
+    /// The states the run passed through on its way here, with the time it
+    /// spent in each. A failure is the case where the timeline earns its keep:
+    /// it says where the run was slow before it was wrong.
+    let states: [StateTiming]
     let bundlePath: String
     let cleanupCompleted: Bool
     let inspectionHints: [String]
@@ -154,6 +158,7 @@ struct FailureReport: Codable, Sendable {
         stage: VivStage,
         vmState: String?,
         elapsedSeconds: Double,
+        states: [StateTiming],
         bundlePath: String,
         cleanupCompleted: Bool,
         lastReadinessGate: String?
@@ -174,6 +179,7 @@ struct FailureReport: Codable, Sendable {
         }
         self.vmState = vmState
         self.elapsedSeconds = elapsedSeconds
+        self.states = states
         self.bundlePath = bundlePath
         self.cleanupCompleted = cleanupCompleted
         self.inspectionHints = pocError?.inspectionHints ?? []
