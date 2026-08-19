@@ -77,7 +77,12 @@ fi
 # --- The environment for the test command ---------------------------------
 
 env_file=""
-# shellcheck disable=SC2329  # invoked by the trap below
+# Invoked by the trap below, which shellcheck cannot see. Older versions say
+# so with SC2317 on each line of the body and newer ones with SC2329 on the
+# function, so both are named: the linter on a runner is not the one on the
+# laptop, and a warning that only appears in CI is a job that fails after
+# somebody has already pushed.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     [ -n "$env_file" ] && rm -f "$env_file"
     return 0

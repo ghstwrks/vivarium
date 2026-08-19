@@ -59,7 +59,9 @@ codesign --remove-signature "$work/staging/unsigned/viv" 2>/dev/null
 devid=""
 devid_team=""
 for candidate in /opt/homebrew/bin/* /usr/local/bin/* /Applications/*/Contents/MacOS/*; do
-    [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+    # Spelled as a refusal rather than as `A && B || continue`, which reads
+    # like an if-then-else and is not one.
+    if [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; then continue; fi
     authority="$(codesign -d --verbose=2 "$candidate" 2>&1 | grep '^Authority=Developer ID Application:' | head -1)"
     [ -n "$authority" ] || continue
     devid="$candidate"
