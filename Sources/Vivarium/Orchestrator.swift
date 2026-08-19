@@ -104,8 +104,15 @@ struct RunReport: Codable, Sendable {
     /// that passed — they are assertions that were never made, and the summary
     /// says so rather than counting them.
     var artifactDiskAsserted: Bool?
-    var restoreImageVerifiedAsMacOS27OrLater: Bool
-    var installSucceeded: Bool
+    /// Whether the image this guest was built from cleared whatever gate its
+    /// operating system has. For macOS that is the version check — a guest
+    /// older than 27 ignores provisioning options entirely — and for a guest
+    /// with no such API there is no gate to clear.
+    var guestImageAccepted: Bool
+    /// Whether the guest's system disk exists and came from that image:
+    /// restored, for macOS, and imported for a guest whose distribution did
+    /// the installing.
+    var guestImagePrepared: Bool
     var firstBootProvisioningSucceeded: Bool
     var sshAuthenticationSucceeded: Bool
     var stdoutTokenMatched: Bool
@@ -132,8 +139,8 @@ struct RunReport: Codable, Sendable {
     var assertedArtifactDisk: Bool { artifactDiskAsserted ?? true }
 
     var allAcceptanceCriteriaPassed: Bool {
-        let core = restoreImageVerifiedAsMacOS27OrLater
-            && installSucceeded
+        let core = guestImageAccepted
+            && guestImagePrepared
             && firstBootProvisioningSucceeded
             && sshAuthenticationSucceeded
             && stdoutTokenMatched
@@ -153,10 +160,15 @@ struct RunReport: Codable, Sendable {
         func line(_ passed: Bool, _ label: String) -> String {
             "\(passed ? "pass" : "FAIL")  \(label)"
         }
+        let isMac = (guestOS ?? .macOS) == .macOS
         var lines = [
-            line(restoreImageVerifiedAsMacOS27OrLater, "restore image verified as macOS 27 or later before install"),
-            line(installSucceeded, "install succeeded"),
-            line(firstBootProvisioningSucceeded, "first-boot provisioning succeeded without Setup Assistant"),
+            line(guestImageAccepted, isMac
+                ? "restore image verified as macOS 27 or later before install"
+                : "guest image accepted"),
+            line(guestImagePrepared, isMac ? "install succeeded" : "template imported"),
+            line(firstBootProvisioningSucceeded, isMac
+                ? "first-boot provisioning succeeded without Setup Assistant"
+                : "first-boot provisioning succeeded without a console"),
             line(sshAuthenticationSucceeded, "SSH authentication succeeded"),
             line(stdoutTokenMatched, "stdout token matched"),
             line(stderrTokenMatched, "stderr token matched"),
@@ -195,8 +207,8 @@ struct RunReport: Codable, Sendable {
             runID: runID,
             guestOS: guestOS,
             artifactDiskAsserted: artifactDiskAsserted,
-            restoreImageVerifiedAsMacOS27OrLater: false,
-            installSucceeded: false,
+            guestImageAccepted: false,
+            guestImagePrepared: false,
             firstBootProvisioningSucceeded: false,
             sshAuthenticationSucceeded: false,
             stdoutTokenMatched: false,
@@ -400,11 +412,11 @@ final class Orchestrator {
             "Restore image: macOS \(restoreImage.versionString) (\(restoreImage.buildVersion)) "
                 + "at \(ipsw.path)."
         )
-        report?.restoreImageVerifiedAsMacOS27OrLater = true
+        report?.guestImageAccepted = true
 
         transition(to: .preparingBundle)
         try await prepareRunMetadata()
-        report.restoreImageVerifiedAsMacOS27OrLater = true
+        report.guestImageAccepted = true
 
         manifest.sourcePath = ipsw.path
         manifest.sourceByteCount = BundleManager.fileSize(of: ipsw)
@@ -504,7 +516,7 @@ final class Orchestrator {
         manifest.cpuCount = shape.cpuCount
         manifest.memorySizeBytes = shape.memorySize
         try manifest.write(to: paths.runManifest)
-        report.installSucceeded = true
+        report.guestImagePrepared = true
     }
 
     private func snapshotTemplate(restoreImage: LoadedRestoreImage) async throws {
@@ -549,12 +561,12 @@ final class Orchestrator {
             }
             let image = try await RestoreImageManager.load(ipsw: ipsw)
             expectedBuild = image.buildVersion
-            report?.restoreImageVerifiedAsMacOS27OrLater = true
+            report?.guestImageAccepted = true
         }
 
         try await prepareRunMetadata()
         if expectedBuild != nil {
-            report.restoreImageVerifiedAsMacOS27OrLater = true
+            report.guestImageAccepted = true
         }
         manifest.startedFromTemplate = true
 
@@ -585,10 +597,10 @@ final class Orchestrator {
         // run for a check that did happen, only in an earlier process. A guest
         // that has no such gate — Linux has no provisioning API to be too old
         // for — satisfies it by having nothing to satisfy.
-        report.restoreImageVerifiedAsMacOS27OrLater = platform.os == .macOS
+        report.guestImageAccepted = platform.os == .macOS
             ? RestoreImageManager.satisfiesGuestVersionGate(templateManifest.osVersion)
             : true
-        report.installSucceeded = true
+        report.guestImagePrepared = true
         try manifest.write(to: paths.runManifest)
     }
 
@@ -610,10 +622,10 @@ final class Orchestrator {
             guestOS: platform.os,
             artifactDiskAsserted: options.includesArtifactDisk && platform.assertsArtifactDisk
         )
-        report.restoreImageVerifiedAsMacOS27OrLater = platform.os == .macOS
+        report.guestImageAccepted = platform.os == .macOS
             ? RestoreImageManager.satisfiesGuestVersionGate(manifest.guestOSVersion)
             : true
-        report.installSucceeded = true
+        report.guestImagePrepared = true
 
         // A credential belongs to the invocation that generated it, so a bundle
         // adopted from a previous one cannot be logged into. Saying that
@@ -628,7 +640,7 @@ final class Orchestrator {
     // MARK: - Provisioned boot and proof
 
     private func provisionAndValidate() async throws {
-        try await startProvisionedGuest(hasArtifactDirectory: false)
+        try await startProvisionedGuest()
 
         do {
             let ssh = try await connectToGuest()
@@ -681,7 +693,7 @@ final class Orchestrator {
     /// Deliberately outside the caller's `catch`: nothing has been started that
     /// could need stopping, and a failure here is about the configuration, not
     /// about a guest that has to be released.
-    private func startProvisionedGuest(hasArtifactDirectory: Bool) async throws {
+    private func startProvisionedGuest() async throws {
         guard credentials.isUsable else {
             throw VivError(
                 .provisioning,
@@ -693,21 +705,18 @@ final class Orchestrator {
         // Whatever this guest needs written into the bundle before it starts —
         // a cloud-init seed, for a guest that provisions itself from one — has
         // to exist before the configuration that attaches it is built.
-        try await platform.prepareRun(
-            makeProvisioningRequest(hasArtifactDirectory: hasArtifactDirectory)
-        )
+        try await platform.prepareRun(makeProvisioningRequest())
         try await createAndStartRunVM()
     }
 
-    private func makeProvisioningRequest(hasArtifactDirectory: Bool) -> ProvisioningRequest {
+    private func makeProvisioningRequest() -> ProvisioningRequest {
         ProvisioningRequest(
             paths: paths,
             credentials: credentials,
             runID: manifest.runID,
             hostname: ProvisioningRequest.hostname(forRunID: manifest.runID),
             logsInAutomatically: options.logsInAutomatically,
-            disablesRemoteLogin: options.disableRemoteLogin,
-            hasArtifactDirectory: hasArtifactDirectory
+            disablesRemoteLogin: options.disableRemoteLogin
         )
     }
 
@@ -836,7 +845,7 @@ final class Orchestrator {
     }
 
     private func makeStartOptions() throws -> VZVirtualMachineStartOptions? {
-        try platform.makeStartOptions(makeProvisioningRequest(hasArtifactDirectory: false))
+        try platform.makeStartOptions(makeProvisioningRequest())
     }
 
     private func resolveAddress() async throws -> String {
@@ -1353,7 +1362,7 @@ final class Orchestrator {
             try createDirectory(layout.results, stage: .codeStaging)
         }
 
-        try await startProvisionedGuest(hasArtifactDirectory: true)
+        try await startProvisionedGuest()
 
         let execution: TestExecution
         let status: TestRunStatus

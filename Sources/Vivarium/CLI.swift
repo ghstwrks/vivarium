@@ -83,17 +83,22 @@ struct Viv: AsyncParsableCommand {
 
     static let configuration = CommandConfiguration(
         commandName: "viv",
-        abstract: "Run tests autonomously inside a macOS virtual machine.",
+        abstract: "Run tests autonomously inside a fresh virtual machine.",
         discussion: """
-            Vivarium prepares a macOS 27 guest, runs a command in it, harvests \
-            what the command produced, and shuts the guest down. No human \
-            touches the guest at any point.
+            Vivarium prepares a guest, runs a command in it, harvests what the \
+            command produced, and shuts the guest down. No human touches the \
+            guest at any point.
 
-            The usual sequence is to build a template once from a local restore \
-            image, then run against clones of it:
+            Two guests today: macOS 27, restored from a local IPSW, and Fedora, \
+            imported from the disk image Fedora publishes. Which one a run uses \
+            comes from its template, so only `viv template create` needs to be \
+            told.
 
-              viv template create --ipsw ~/Downloads/UniversalMac_27.0_…_Restore.ipsw
-              cd ~/my-project && viv run -- swift test
+            The usual sequence is to build a template once, then run against \
+            clones of it:
+
+              viv template create --os fedora
+              cd ~/my-project && viv run -- ./run-tests.sh
 
             Vivarium keeps everything it owns under ~/.vivarium, or under \
             $VIVARIUM_HOME if that is set.
@@ -252,11 +257,19 @@ struct TemplateCommand: AsyncParsableCommand {
         commandName: "template",
         abstract: "Create and inspect the guest templates runs are cloned from.",
         discussion: """
-            macOS evaluates first-boot provisioning options exactly once, on the \
-            first boot after a restore, so every guest must come from a freshly \
-            restored disk. A template is that restored disk, snapshotted before \
-            it is ever booted; runs clone it with APFS clonefile in a fraction \
-            of a second instead of spending ninety minutes on another restore.
+            A template is a guest that exists but has never been started. Runs \
+            clone it — with APFS clonefile where the filesystem has one, and a \
+            byte copy where it does not — and boot the clone, so no run ever \
+            writes to the template and no run inherits what the last one left.
+
+            Why that matters differs by guest, and the answer is the same either \
+            way. macOS evaluates first-boot provisioning options exactly once, \
+            on the first boot after a restore, so a template that had been \
+            booted could never be provisioned again and every attempt would cost \
+            another ninety-minute restore. A Fedora image imported from the \
+            distribution costs minutes rather than an afternoon, but booting the \
+            imported image in place would leave every run's host keys, logs, and \
+            package cache in the image the next run started from.
             """,
         subcommands: [TemplateCreateCommand.self, TemplateListCommand.self],
         defaultSubcommand: TemplateListCommand.self
@@ -706,6 +719,22 @@ struct RunCommand: AsyncParsableCommand {
     )
     var keepGoing: Bool = false
 
+    @Option(
+        name: .customLong("command"),
+        help: ArgumentHelp(
+            "The command to run in the guest, as one argument.",
+            discussion: """
+                The same thing as the words after --, for a caller that has the \
+                command as a single string and would otherwise have to decide \
+                where its quoting ends. A multi-line command has no \
+                word-splitting reading at all, so this is the spelling a script \
+                or a CI action wants; the two are mutually exclusive.
+                """,
+            valueName: "script"
+        )
+    )
+    var commandOption: String?
+
     /// The test command, after a bare `--`.
     ///
     /// `.postTerminator` so that the guest's command keeps its own flags: `viv
@@ -799,17 +828,27 @@ struct RunCommand: AsyncParsableCommand {
 
         let command: String
         let commandSource: String
+        if !testCommand.isEmpty, commandOption != nil {
+            throw ValidationError(
+                "--command and a trailing -- are two spellings of the same thing. Give one."
+            )
+        }
         if !testCommand.isEmpty {
             command = Self.joined(testCommand)
             commandSource = "command line"
+        } else if let given = commandOption,
+                  !given.trimmingCharacters(in: .whitespaces).isEmpty {
+            command = given
+            commandSource = "--command"
         } else if let test = project?.test, !test.trimmingCharacters(in: .whitespaces).isEmpty {
             command = test
             commandSource = VivManifest.filename
         } else {
             throw ValidationError("""
-                No test command. Give one either way:
+                No test command. Give one any of these ways:
 
                   viv run -- swift test
+                  viv run --command 'swift test'
 
                 or in \(codeDirectory.appendingPathComponent(VivManifest.filename).path):
 
@@ -962,20 +1001,25 @@ struct SelftestCommand: AsyncParsableCommand {
         abstract: "Prove, end to end, that a guest can be provisioned and observed.",
         discussion: """
             Boots a guest with first-boot provisioning, authenticates over SSH \
-            as the provisioned account, runs a scripted command, and checks \
-            thirteen criteria covering stdout, stderr, the remote exit code, the \
-            VirtioFS share, a graceful shutdown, and an artifact disk read back \
-            on the host after the machine is released. This is Vivarium's own \
-            integration test, inherited from the proof of concept.
+            as the provisioned account, runs a scripted command, and checks the \
+            criteria its guest claims: stdout, stderr, the remote exit code, the \
+            VirtioFS share, and a graceful shutdown for every guest, plus an \
+            artifact disk read back on the host after the machine is released \
+            for a macOS one. A guest whose platform does not claim a criterion \
+            has it reported as not asserted, with the reason, rather than as \
+            passed. This is Vivarium's own integration test, inherited from the \
+            proof of concept.
 
             With no path options it clones the newest template in the Vivarium \
             home. With --from-template it clones the one named. With --ipsw and \
             no template it takes the cold path: restore, snapshot a template, \
             then run the proof, which takes around ninety minutes.
 
-            The guest password is generated per run, kept in memory, and never \
-            written to run.json, logged, or placed on a command line. That is \
-            why a bundle from an earlier invocation cannot be provisioned by a \
+            The guest's credential is generated per run and belongs to it: a \
+            macOS guest's password is kept in memory and never written to \
+            run.json, logged, or placed on a command line, and a Linux guest's \
+            key pair lives in the run's own bundle and goes when it does. Either \
+            way, a bundle from an earlier invocation cannot be provisioned by a \
             later one.
 
             Exits 1 when the guest failed to behave as asserted, and 70 when \

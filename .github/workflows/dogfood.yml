@@ -45,6 +45,13 @@ jobs:
           codesign -d --entitlements - .build/release/viv 2>&1 \
             | grep -q com.apple.security.virtualization
 
+      # The unit tests run here rather than beside the linting, for the same
+      # reason the build does: no GitHub-hosted image ships an Xcode with the
+      # macOS 27 SDK. They need no hypervisor and no template, so they are the
+      # cheapest thing in this workflow and go first.
+      - name: Unit tests
+        run: swift test
+
       # The passing path, using examples/hello's own viv.json for the command
       # and the artifact globs — so this also proves the manifest is read.
       - id: pass

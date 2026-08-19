@@ -66,12 +66,6 @@ struct VMBundlePaths: Sendable {
     /// it is the platform's answer, not this type's.
     static let systemDiskFilename = "Disk.img"
 
-    /// The share's artifact directory, addressed from a bundle rather than from
-    /// a run. `RunLayout` names the same directory; this is how a caller that
-    /// only has the bundle reaches it.
-    static func sharedArtifacts(inShare share: URL) -> URL {
-        share.appendingPathComponent("artifacts")
-    }
 }
 
 /// Paths inside a pristine post-restore template bundle.

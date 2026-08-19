@@ -95,6 +95,17 @@ struct LinuxPlatform: GuestPlatform {
         )
     }
 
+    /// Writes the seed, and nothing else.
+    ///
+    /// The share needs no preparation, which is worth recording because it is
+    /// not obvious and was measured rather than assumed: Apple's VirtioFS
+    /// presents every file in the share to the guest as owned by the guest's
+    /// own uid and gid, whatever the host's ownership is. A directory this host
+    /// user owns at mode 0700 is writable by the guest's unprivileged account.
+    /// Nothing here therefore has to reconcile a host uid with a guest one —
+    /// and if that ever changes, the workdir preparation script already refuses
+    /// with "the artifact directory is not writable by vivadmin", which is the
+    /// failure saying exactly what happened.
     func prepareRun(_ request: ProvisioningRequest) async throws {
         guard case let .privateKey(_, publicKey) = request.credentials.authentication else {
             throw VivError(
@@ -108,50 +119,6 @@ struct LinuxPlatform: GuestPlatform {
             request: request,
             publicKey: publicKey
         )
-        try openShareToTheGuest(request)
-    }
-
-    /// Opens the share to whatever account the guest ends up running as.
-    ///
-    /// VirtioFS presents the host's own ownership to the guest — a directory
-    /// this user owns arrives in the guest owned by this user's numeric uid,
-    /// which is a number the guest has no account for. The guest's account is
-    /// therefore "other" on every file in the share, and mode 0755 leaves it
-    /// unable to write the marker or an artifact. The two directories the guest
-    /// is supposed to write are opened to it; the staged code stays as it was,
-    /// because the guest only reads it.
-    ///
-    /// The sticky bit is set for the same reason `ArtifactDiskManager` sets it
-    /// on the artifact volume: it costs nothing and keeps one account from
-    /// deleting another's file, which preserves the meaning of a file found
-    /// there later. Both directories are inside one run's own directory under
-    /// the Vivarium home, and both go when the run does.
-    private func openShareToTheGuest(_ request: ProvisioningRequest) throws {
-        var directories = [request.paths.sharedDirectory]
-        if request.hasArtifactDirectory {
-            directories.append(
-                VMBundlePaths.sharedArtifacts(inShare: request.paths.sharedDirectory)
-            )
-        }
-        for directory in directories {
-            do {
-                try FileManager.default.createDirectory(
-                    at: directory, withIntermediateDirectories: true
-                )
-                try FileManager.default.setAttributes(
-                    [.posixPermissions: NSNumber(value: Int16(0o1777))],
-                    ofItemAtPath: directory.path
-                )
-            } catch {
-                throw VivError(
-                    .provisioning,
-                    "Cannot open \(directory.path) to the guest. Without it the guest cannot "
-                        + "write to the share, and nothing would be harvested.",
-                    underlying: error,
-                    inspectionHints: ["ls -ld \(directory.path)"]
-                )
-            }
-        }
     }
 
     @MainActor

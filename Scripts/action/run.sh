@@ -70,7 +70,7 @@ set_output "results-path" "$results_path"
 # up. A named template is viv's to validate.
 if [ -z "${INPUT_TEMPLATE:-}" ]; then
     if ! ls -d "$home"/templates/*.bundle > /dev/null 2>&1; then
-        fail "No guest template in $home/templates. A runner has to be prepared once, from a local macOS 27 restore image: viv template create --ipsw <path>. See docs/github-actions.md."
+        fail "No guest template in $home/templates. A runner has to be prepared once: viv template create --os fedora, or viv template create --ipsw <path to a local macOS 27 restore image>. See docs/github-actions.md."
     fi
 fi
 
@@ -101,18 +101,19 @@ fi
 args=(run --code "$code" --run-id "$run_id")
 [ -n "${INPUT_MANIFEST:-}" ] && args+=(--manifest "$(expand_tilde "$INPUT_MANIFEST")")
 [ -n "${INPUT_TEMPLATE:-}" ] && args+=(--template "$(expand_tilde "$INPUT_TEMPLATE")")
+[ -n "${INPUT_OS:-}" ] && args+=(--os "$INPUT_OS")
 [ -n "${INPUT_TIMEOUT:-}" ] && args+=(--timeout "$INPUT_TIMEOUT")
 [ -n "$env_file" ] && args+=(--env-file "$env_file")
 [ "${INPUT_KEEP_VM:-false}" = "true" ] && args+=(--keep-vm)
 
-# The command reaches the guest as one argument to its own shell rather than as
-# a list of words. Splitting it here would mean this shell deciding where a
-# quoted argument in someone else's test command ends, and a multi-line command
-# has no word-splitting reading at all. `zsh -c` is what viv would have used
-# anyway: the guest runs the command under zsh with -e and -u off, and so does
-# this.
+# The command reaches viv as one argument rather than as a list of words.
+# Splitting it here would mean this shell deciding where a quoted argument in
+# someone else's test command ends, and a multi-line command has no
+# word-splitting reading at all. `--command` takes it whole, and the guest then
+# runs it under its own shell — zsh on macOS, bash on Fedora — which is also
+# why this no longer wraps it in a `zsh -c` that a Fedora guest does not have.
 if [ -n "${INPUT_COMMAND:-}" ]; then
-    args+=(-- zsh -c "$INPUT_COMMAND")
+    args+=(--command "$INPUT_COMMAND")
 fi
 
 set +e

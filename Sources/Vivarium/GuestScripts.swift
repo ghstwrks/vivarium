@@ -334,7 +334,12 @@ struct GuestScripts: Sendable {
                 fi
                 """
             artifactAssertion = "\nrequire_writable_directory artifact \"$artifact\""
-            artifactWrite = "\nprintf '%s\\\\n' \"$marker\" > \"$artifact/$marker_file\""
+            // `\\n` is one backslash and an `n` once Swift is done with it, which
+            // is the `\n` printf needs. Two would make printf emit a literal
+            // backslash and an `n` instead of a newline — a marker one byte
+            // longer than the host expects, and a validation that fails for a
+            // reason nothing about it suggests.
+            artifactWrite = "\nprintf '%s\\n' \"$marker\" > \"$artifact/$marker_file\""
         }
 
         return """

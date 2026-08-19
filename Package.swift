@@ -27,6 +27,17 @@ let package = Package(
             ],
             path: "Sources/Vivarium",
             swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Only what can be asserted without a hypervisor: the guest scripts,
+        // the template record's compatibility with the one 0.1 wrote, the
+        // cloud-init documents, and the xz decoder. Everything that needs a
+        // running guest is `viv selftest`, which is the integration test and
+        // cannot be one of these.
+        .testTarget(
+            name: "VivariumTests",
+            dependencies: ["Vivarium"],
+            path: "Tests/VivariumTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]
 )

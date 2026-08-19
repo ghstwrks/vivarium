@@ -142,9 +142,6 @@ struct ProvisioningRequest: Sendable {
     /// Negative test, macOS only: provision without Remote Login, so the run
     /// must fail at the SSH readiness gate rather than at boot.
     let disablesRemoteLogin: Bool
-    /// Whether this run has an artifact directory on the share, which a guest
-    /// that cannot write as the host user needs opened to it.
-    let hasArtifactDirectory: Bool
 
     /// A hostname built from a run identifier.
     ///

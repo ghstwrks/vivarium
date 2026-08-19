@@ -75,7 +75,7 @@ enum CloudInitSeed {
 
     // MARK: - Documents
 
-    private static func metaData(request: ProvisioningRequest) -> String {
+    static func metaData(request: ProvisioningRequest) -> String {
         """
         instance-id: \(yaml(request.runID))
         local-hostname: \(yaml(request.hostname))
@@ -90,7 +90,7 @@ enum CloudInitSeed {
     /// that — a toolchain, a package, a repository — is what the test command
     /// is for, and installing it here would test Vivarium's idea of a developer
     /// environment rather than the project's.
-    private static func userData(request: ProvisioningRequest, publicKey: String) -> String {
+    static func userData(request: ProvisioningRequest, publicKey: String) -> String {
         let credentials = request.credentials
         return """
         #cloud-config
@@ -153,8 +153,17 @@ enum CloudInitSeed {
     /// this, including the values Vivarium generated itself: a username that
     /// happens to be `yes` or a comment containing a colon should be a string
     /// either way.
+    ///
+    /// Slashes are the one place the subset relationship is the wrong way
+    /// round. JSON permits `\/` and `JSONEncoder` writes it; YAML 1.2 permits
+    /// it too, but YAML 1.1 — which is what a PyYAML-based reader implements —
+    /// does not, and a parser that rejects the escape rejects the whole seed
+    /// and leaves the guest with no account. Every path in these documents is a
+    /// path, so this is not a corner.
     static func yaml(_ value: String) -> String {
-        guard let data = try? JSONEncoder().encode(value),
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        guard let data = try? encoder.encode(value),
               let encoded = String(data: data, encoding: .utf8) else {
             // JSONEncoder cannot fail on a String, but a fallback that quotes
             // nothing would be worse than one that quotes crudely.
