@@ -99,6 +99,11 @@ struct TestRunReport: Codable, Sendable {
 
     let templatePath: String
     let templateBuild: String?
+    /// Which operating system the guest ran, and the version it reported being.
+    /// A report is read the day after by somebody who no longer remembers which
+    /// template this was.
+    let guestOS: GuestOS
+    let guestOSVersion: String?
     let guestUsername: String
     let guestAddress: String?
     let guestWorkdir: String
@@ -147,7 +152,8 @@ struct TestRunReport: Codable, Sendable {
             ("command", command),
             ("code", codeDirectory),
             ("template", templatePath),
-            ("guest", guestAddress.map { "\(guestUsername)@\($0)" } ?? guestUsername)
+            ("guest", guestDescription
+                + (guestAddress.map { ", \(guestUsername)@\($0)" } ?? ", \(guestUsername)"))
         ]))
         lines.append("")
         lines.append(contentsOf: Self.alignedTimings(phases, total: totalSeconds))
@@ -183,6 +189,7 @@ struct TestRunReport: Codable, Sendable {
             ("code", "`\(codeDirectory)`"),
             ("template", "`\(templatePath)`")
         ]
+        rows.append(("guest os", guestDescription))
         if let templateBuild { rows.append(("guest build", templateBuild)) }
         if let projectName { rows.append(("project", projectName)) }
         if let manifestPath { rows.append(("manifest", "`\(manifestPath)`")) }
@@ -233,6 +240,11 @@ struct TestRunReport: Codable, Sendable {
         lines.append(dispositionSentence)
         lines.append("")
         return lines.joined(separator: "\n")
+    }
+
+    /// The guest, as a person would say it: "Fedora 44", or "macOS 27.0.0".
+    private var guestDescription: String {
+        guestOSVersion.map { "\(guestOS.displayName) \($0)" } ?? guestOS.displayName
     }
 
     private var statusPhrase: String {

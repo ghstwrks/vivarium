@@ -142,7 +142,7 @@ struct VivManifest: Sendable {
         guard !pattern.split(separator: "/").contains("..") else {
             throw refuse("escapes the workdir with \"..\"")
         }
-        guard pattern != GuestTestScript.artifactPatternDelimiter else {
+        guard pattern != GuestScripts.artifactPatternDelimiter else {
             throw refuse("collides with the delimiter Vivarium uses to pass patterns to the guest")
         }
         return pattern

@@ -62,8 +62,18 @@ enum TemplateInventory {
     }
 
     /// The template a command should use when the operator named none.
-    static func newest(in directory: URL = VivariumHome.templates) async -> TemplateSummary? {
-        await summaries(in: directory).first { $0.manifest != nil }
+    ///
+    /// Narrowed to one guest where the caller said which, so that a home
+    /// holding both a macOS and a Fedora template answers `--os fedora` with a
+    /// Fedora one rather than with whichever was built most recently.
+    static func newest(
+        in directory: URL = VivariumHome.templates,
+        os: GuestOS? = nil
+    ) async -> TemplateSummary? {
+        await summaries(in: directory).first { summary in
+            guard let manifest = summary.manifest else { return false }
+            return os == nil || manifest.os == os
+        }
     }
 
     /// Space actually consumed, via `du`.

@@ -112,6 +112,13 @@ struct Viv: AsyncParsableCommand {
 
 // MARK: - Shared argument types
 
+/// `--os` takes the operating system's own lowercase name.
+///
+/// The conformance is here rather than on the type, so that `GuestOS` — which
+/// is written into every template and every report — does not depend on the
+/// argument parser.
+extension GuestOS: ExpressibleByArgument {}
+
 /// A filesystem path.
 ///
 /// Tildes are expanded here as well as by the shell, because a path that
@@ -191,6 +198,21 @@ struct PreflightCommand: AsyncParsableCommand {
     )
 
     @Option(
+        name: .customLong("os"),
+        help: ArgumentHelp(
+            "Which guest to check for: \(GuestOS.allNames).",
+            discussion: """
+                The checks differ by guest. A macOS guest needs a macOS 27 host \
+                and around 80 GiB free; a Fedora guest needs neither, and \
+                checking it against the stricter numbers would refuse a host \
+                that is perfectly capable of running it.
+                """,
+            valueName: "name"
+        )
+    )
+    var os: GuestOS = .macOS
+
+    @Option(
         name: .customLong("ipsw"),
         help: ArgumentHelp(
             "Local macOS 27 restore image to inspect.",
@@ -209,7 +231,11 @@ struct PreflightCommand: AsyncParsableCommand {
     var queryLatest: Bool = false
 
     func run() async throws {
+        if ipsw != nil, os != .macOS {
+            throw ValidationError("--ipsw is a macOS restore image; --os \(os.rawValue) has none.")
+        }
         var options = OrchestratorOptions()
+        options.guestOS = os
         options.ipsw = ipsw?.url
         options.queryLatestSupported = queryLatest
 
@@ -240,34 +266,114 @@ struct TemplateCommand: AsyncParsableCommand {
 struct TemplateCreateCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "create",
-        abstract: "Restore macOS into a bundle and snapshot it as a template.",
+        abstract: "Build a template from a restore image or a published disk image.",
         discussion: """
-            Expect this to take around ninety minutes and to need roughly 80 GiB \
-            of free space. The template is snapshotted before the guest's first \
-            boot, because booting it would consume the one provisionable boot \
-            the template exists to preserve.
+            What this costs depends entirely on the guest, because the two are \
+            not the same operation wearing different flags.
 
-            A local restore image is mandatory and there is no download \
-            fallback: on this host VZMacOSRestoreImage.latestSupported resolves \
-            to macOS 26.6.1, which silently ignores guest provisioning options \
-            and would produce a template that can never be provisioned.
+            A macOS template is restored: --ipsw is mandatory, it takes around \
+            ninety minutes, and it needs roughly 80 GiB free. There is no \
+            download fallback, because on this host \
+            VZMacOSRestoreImage.latestSupported resolves to macOS 26.6.1, which \
+            silently ignores guest provisioning options and would produce a \
+            template that can never be provisioned. The template is snapshotted \
+            before the guest's first boot, because booting it would consume the \
+            one provisionable boot the template exists to preserve.
+
+            A Linux template is imported: the distribution already did the \
+            installing, so this downloads a published disk image, checks it \
+            against a digest pinned in Vivarium's own source, decompresses it, \
+            and grows it to something a build can work in. Expect a few \
+            minutes. Pass --image to import a file you already have, or \
+            --image-url with --image-sha256 to name a different one.
+
+              viv template create --ipsw ~/Downloads/UniversalMac_27.0_…_Restore.ipsw
+              viv template create --os fedora
+
+            Either way, the result is the same kind of thing: an immutable, \
+            never-booted guest that runs clone in a fraction of a second.
             """
     )
+
+    @Option(
+        name: .customLong("os"),
+        help: ArgumentHelp(
+            "Which operating system the template holds: \(GuestOS.allNames).",
+            valueName: "name"
+        )
+    )
+    var os: GuestOS = .macOS
 
     @Option(
         name: .customLong("ipsw"),
         help: ArgumentHelp("Local macOS 27 restore image to restore from.", valueName: "path")
     )
-    var ipsw: PathArgument
+    var ipsw: PathArgument?
+
+    @Option(
+        name: .customLong("image"),
+        help: ArgumentHelp(
+            "Import this disk image instead of downloading one.",
+            discussion: """
+                A raw disk image, or one compressed with xz — the form \
+                distributions publish. Use it to import an image you already \
+                have, or one Vivarium does not know about: a Fedora Server \
+                guest image converted from qcow2, for instance, which nothing \
+                above this flag assumes anything about.
+                """,
+            valueName: "path"
+        )
+    )
+    var image: PathArgument?
+
+    @Option(
+        name: .customLong("image-url"),
+        help: ArgumentHelp(
+            "Download this disk image instead of the pinned one.",
+            discussion: """
+                Requires --image-sha256. The pin in Vivarium's source goes \
+                stale when a distribution respins a compose and the old URL \
+                stops resolving; this is what gets anyone unblocked without \
+                waiting for a release.
+                """,
+            valueName: "url"
+        )
+    )
+    var imageURL: String?
+
+    @Option(
+        name: .customLong("image-sha256"),
+        help: ArgumentHelp(
+            "The digest the disk image must have.",
+            valueName: "hex"
+        )
+    )
+    var imageSHA256: String?
 
     @Option(
         name: .customLong("template"),
         help: ArgumentHelp(
-            "Where to write the template. Defaults to <home>/templates/<build>.bundle.",
+            "Where to write the template. Defaults to <home>/templates/<os>-<build>.bundle.",
             valueName: "path"
         )
     )
     var template: PathArgument?
+
+    @Option(
+        name: .customLong("disk-size"),
+        help: ArgumentHelp(
+            "The guest's system disk size, in GiB.",
+            discussion: """
+                Sparse: the space is not allocated until the guest writes to \
+                it. Defaults to 128 for macOS, which is what a restore expects, \
+                and \(LinuxTemplateBuilder.defaultDiskSizeGiB) for Linux, which \
+                is a published cloud image grown to something a build can work \
+                in.
+                """,
+            valueName: "gib"
+        )
+    )
+    var diskSize: Int?
 
     @Flag(
         name: .customLong("skip-ipsw-digest"),
@@ -286,16 +392,110 @@ struct TemplateCreateCommand: AsyncParsableCommand {
     var reuse: Bool = false
 
     func run() async throws {
+        if let diskSize, diskSize <= 0 {
+            throw ValidationError("--disk-size must be a positive number of GiB.")
+        }
+        switch os {
+        case .macOS: try await createMacOSTemplate()
+        case .fedora: try await createLinuxTemplate()
+        }
+    }
+
+    /// Restore a macOS guest and snapshot it.
+    private func createMacOSTemplate() async throws {
+        guard image == nil, imageURL == nil, imageSHA256 == nil else {
+            throw ValidationError(
+                "--image, --image-url, and --image-sha256 are for a guest that is imported from a "
+                    + "published disk image. A macOS template is restored from an IPSW."
+            )
+        }
+        guard let ipsw else {
+            throw ValidationError(
+                "--ipsw is required for a macOS template, and there is no download fallback: on "
+                    + "this host VZMacOSRestoreImage.latestSupported resolves to macOS 26.6.1, "
+                    + "which would produce a guest that silently ignores provisioning options."
+            )
+        }
+
         var options = OrchestratorOptions()
+        options.guestOS = .macOS
         options.ipsw = ipsw.url
         options.template = template?.url
         options.skipIPSWDigest = skipIPSWDigest
         options.reuse = reuse
+        options.diskSizeGiB = diskSize
 
         try await withOrchestrator(options) { orchestrator in
             try await orchestrator.runInstall()
             print("Template created.")
         }
+    }
+
+    /// Import a published Linux disk image as a template.
+    ///
+    /// No orchestrator and no virtual machine: nothing here boots anything, so
+    /// there is no run to record a failure against and no guest to stop. What
+    /// it produces is the same template every other command consumes.
+    private func createLinuxTemplate() async throws {
+        guard ipsw == nil else {
+            throw ValidationError("--ipsw is a macOS restore image; --os \(os.rawValue) has none.")
+        }
+        guard image == nil || imageURL == nil else {
+            throw ValidationError("Give either --image or --image-url, not both.")
+        }
+        if skipIPSWDigest {
+            throw ValidationError(
+                "--skip-ipsw-digest applies to a macOS restore. An imported image is always "
+                    + "hashed: it is the only thing standing between a mirror and this guest."
+            )
+        }
+
+        let source: LinuxImageSource
+        if let image {
+            source = .local(url: image.url, sha256: imageSHA256)
+        } else if let imageURL {
+            guard let url = URL(string: imageURL), url.scheme == "https" else {
+                throw ValidationError("--image-url must be an https URL.")
+            }
+            guard let sha256 = imageSHA256 else {
+                throw ValidationError(
+                    "--image-url needs --image-sha256. An image fetched over the network and "
+                        + "unpacked unchecked is whatever the network felt like sending."
+                )
+            }
+            source = .remote(url: url, sha256: sha256)
+        } else {
+            guard let release = LinuxImageCatalogue.release(for: os) else {
+                throw ValidationError(
+                    "Vivarium has no pinned image for \(os.rawValue). Pass --image, or "
+                        + "--image-url with --image-sha256."
+                )
+            }
+            log.info("Using the pinned image: \(release.summary).")
+            source = .catalogue(release)
+            if let imageSHA256, imageSHA256 != release.sha256 {
+                throw ValidationError(
+                    "--image-sha256 was given without an image to apply it to, and it does not "
+                        + "match the pinned one. Pass --image-url as well if a different image "
+                        + "was meant."
+                )
+            }
+        }
+
+        try VivariumHome.requireUsable(stage: .templateSnapshot)
+        let templateRoot = template?.url
+            ?? DefaultLocations.template(os: os, build: source.build)
+
+        try await LinuxTemplateBuilder.create(
+            LinuxTemplateBuilder.Request(
+                os: os,
+                source: source,
+                template: TemplatePaths(root: templateRoot),
+                diskSizeGiB: diskSize ?? LinuxTemplateBuilder.defaultDiskSizeGiB,
+                workingDirectory: VivariumHome.templates
+            )
+        )
+        print("Template created at \(templateRoot.path).")
     }
 }
 
@@ -313,24 +513,28 @@ struct TemplateListCommand: AsyncParsableCommand {
             print("""
                 No templates in \(directory.path).
 
-                Create one from a local macOS 27 restore image:
+                Create one:
                   viv template create --ipsw ~/Downloads/UniversalMac_27.0_<build>_Restore.ipsw
+                  viv template create --os fedora
                 """)
             return
         }
 
         let rows: [[String]] = summaries.map { summary in
+            let os: String
             let version: String
             if let manifest = summary.manifest {
-                version = "macOS " + manifest.ipswVersion
+                os = manifest.os.displayName
+                version = manifest.osVersion + " (" + manifest.osBuild + ")"
             } else {
+                os = "?"
                 version = "unreadable template.json"
             }
             let size: String = summary.onDiskByteCount?.formattedByteCount ?? "unknown"
             let created: String = summary.createdAt.map { Self.dateStyle.format($0) } ?? "unknown"
-            return [summary.name, version, size, created, summary.paths.root.path]
+            return [summary.name, os, version, size, created, summary.paths.root.path]
         }
-        let headers = ["BUILD", "VERSION", "ON DISK", "CREATED", "PATH"]
+        let headers = ["TEMPLATE", "OS", "VERSION", "ON DISK", "CREATED", "PATH"]
         print(renderTable(headers: headers, rows: rows))
     }
 
@@ -411,6 +615,21 @@ struct RunCommand: AsyncParsableCommand {
         )
     )
     var template: PathArgument?
+
+    @Option(
+        name: .customLong("os"),
+        help: ArgumentHelp(
+            "Pick the newest template of this guest: \(GuestOS.allNames).",
+            discussion: """
+                Only narrows which template is chosen when --template was not \
+                given; a named template already says what it is. With neither, \
+                the newest template of any guest is used and the run says which \
+                one it picked.
+                """,
+            valueName: "name"
+        )
+    )
+    var os: GuestOS?
 
     @Option(
         name: .customLong("timeout"),
@@ -626,23 +845,7 @@ struct RunCommand: AsyncParsableCommand {
 
         let identifier = try resolvedRunID()
 
-        let templateRoot: URL
-        if let template {
-            templateRoot = template.url
-        } else if let newest = await TemplateInventory.newest() {
-            log.info("Using the newest template: \(newest.paths.root.path).")
-            templateRoot = newest.paths.root
-        } else {
-            throw VivError(
-                .bundlePreparation,
-                """
-                No template in \(VivariumHome.templates.path), and --template was not given.
-
-                Create one:
-                  viv template create --ipsw <path to a macOS 27 restore image>
-                """
-            )
-        }
+        let templateRoot = try await Self.resolveTemplate(named: template?.url, os: os)
 
         return TestPlan(
             runID: identifier,
@@ -703,6 +906,34 @@ struct RunCommand: AsyncParsableCommand {
         return runID
     }
 
+    /// Chooses which template to clone.
+    ///
+    /// A named one wins outright. Otherwise the newest is used, narrowed to one
+    /// guest where `--os` said so — and the choice is logged either way,
+    /// because "the newest template" stopped being an obvious answer the moment
+    /// a home could hold two operating systems.
+    static func resolveTemplate(named: URL?, os: GuestOS?) async throws -> URL {
+        if let named { return named }
+        if let newest = await TemplateInventory.newest(os: os) {
+            log.info(
+                "Using the newest \(newest.manifest?.os.displayName ?? "") template: "
+                    + newest.paths.root.path
+            )
+            return newest.paths.root
+        }
+        throw VivError(
+            .bundlePreparation,
+            """
+            No \(os.map { $0.displayName + " " } ?? "")template in \
+            \(VivariumHome.templates.path), and --template was not given.
+
+            Create one:
+              viv template create --ipsw <path to a macOS 27 restore image>
+              viv template create --os fedora
+            """
+        )
+    }
+
     /// Long enough for a CI system to concatenate a workflow run, an attempt,
     /// and a job name; short enough to stay readable in a path.
     static let runIDLimit = 128
@@ -759,6 +990,15 @@ struct SelftestCommand: AsyncParsableCommand {
         help: ArgumentHelp("Clone this template instead of restoring.", valueName: "path")
     )
     var fromTemplate: PathArgument?
+
+    @Option(
+        name: .customLong("os"),
+        help: ArgumentHelp(
+            "Prove it against the newest template of this guest: \(GuestOS.allNames).",
+            valueName: "name"
+        )
+    )
+    var os: GuestOS?
 
     @Option(
         name: .customLong("ipsw"),
@@ -860,27 +1100,24 @@ struct SelftestCommand: AsyncParsableCommand {
         // template must have been made from. Restoring is the expensive path
         // and is never chosen on the operator's behalf.
         let warmPath: Bool
-        if options.fromTemplate != nil {
-            warmPath = true
-        } else if options.ipsw != nil {
+        if options.fromTemplate == nil, options.ipsw != nil, os == nil || os == .macOS {
             warmPath = false
         } else {
-            guard let newest = await TemplateInventory.newest() else {
-                throw VivError(
-                    .bundlePreparation,
-                    """
-                    No template in \(VivariumHome.templates.path), and neither \
-                    --from-template nor --ipsw was given.
-
-                    Create one:
-                      viv template create --ipsw <path to a macOS 27 restore image>
-                    """
-                )
-            }
-            log.info("Using the newest template: \(newest.paths.root.path).")
-            options.fromTemplate = newest.paths.root
+            options.fromTemplate = try await RunCommand.resolveTemplate(
+                named: options.fromTemplate, os: os
+            )
             warmPath = true
         }
+
+        // Which guest this is decides which of the flags below mean anything,
+        // and only the template knows. A flag that would be silently ignored is
+        // refused instead: a negative test that quietly stops being a negative
+        // test is exactly the kind of green nobody should trust.
+        let guestOS = warmPath
+            ? try TemplateManager.readManifest(of: TemplatePaths(root: options.fromTemplate!)).os
+            : GuestOS.macOS
+        options.guestOS = guestOS
+        try refuseFlagsThatDoNotApply(to: guestOS)
 
         try await withOrchestrator(options) { orchestrator in
             let report = warmPath
@@ -890,6 +1127,31 @@ struct SelftestCommand: AsyncParsableCommand {
             guard report.allAcceptanceCriteriaPassed else {
                 throw VivError(.acceptance, "One or more acceptance criteria failed.")
             }
+        }
+    }
+
+    /// Refuses the flags that only mean something to a macOS guest.
+    private func refuseFlagsThatDoNotApply(to guestOS: GuestOS) throws {
+        guard !guestOS.platform.assertsArtifactDisk else { return }
+
+        var offending: [String] = []
+        if artifactVolumeName != nil { offending.append("--artifact-volume-name") }
+        if artifactReadOnly { offending.append("--artifact-read-only") }
+        if disableRemoteLogin { offending.append("--disable-remote-login") }
+        guard offending.isEmpty else {
+            throw ValidationError(
+                "\(offending.joined(separator: ", ")) "
+                    + (offending.count == 1 ? "applies" : "apply")
+                    + " to the artifact disk and the framework's own provisioning, neither of "
+                    + "which a \(guestOS.displayName) guest has. Its selftest reports those "
+                    + "criteria as not asserted."
+            )
+        }
+        if validateSystemDisk, !guestOS.platform.supportsSystemDiskValidation {
+            throw ValidationError(
+                "--validate-system-disk reads the guest's system disk on the host, which cannot "
+                    + "read a \(guestOS.displayName) guest's filesystem."
+            )
         }
     }
 }

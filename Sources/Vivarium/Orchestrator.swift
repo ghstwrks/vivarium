@@ -96,6 +96,14 @@ enum Timeouts {
 /// The machine-readable outcome of a run.
 struct RunReport: Codable, Sendable {
     var runID: String
+    /// Which operating system the guest ran. Absent from a report written
+    /// before Vivarium ran more than one.
+    var guestOS: GuestOS?
+    /// Whether this guest's platform claims the detached-storage proof. When
+    /// it does not, the three artifact-disk criteria below are not assertions
+    /// that passed — they are assertions that were never made, and the summary
+    /// says so rather than counting them.
+    var artifactDiskAsserted: Bool?
     var restoreImageVerifiedAsMacOS27OrLater: Bool
     var installSucceeded: Bool
     var firstBootProvisioningSucceeded: Bool
@@ -119,8 +127,12 @@ struct RunReport: Codable, Sendable {
     /// timeline is complete.
     var states: [StateTiming] = []
 
+    /// Whether the artifact-disk criteria were asserted at all. Defaults to
+    /// true for a report that predates the field, when they always were.
+    var assertedArtifactDisk: Bool { artifactDiskAsserted ?? true }
+
     var allAcceptanceCriteriaPassed: Bool {
-        restoreImageVerifiedAsMacOS27OrLater
+        let core = restoreImageVerifiedAsMacOS27OrLater
             && installSucceeded
             && firstBootProvisioningSucceeded
             && sshAuthenticationSucceeded
@@ -130,6 +142,8 @@ struct RunReport: Codable, Sendable {
             && virtioFSMarkerMatched
             && gracefulGuestStopObserved
             && !destructiveStopRequired
+        guard assertedArtifactDisk else { return core }
+        return core
             && artifactAttachedReadOnlyAfterRelease
             && artifactMarkerMatched
             && artifactEjected
@@ -149,11 +163,23 @@ struct RunReport: Codable, Sendable {
             line(remoteExitCodeMatched, "remote exit code == 23 (observed: "
                 + (observedRemoteExitCode.map(String.init) ?? "none") + ")"),
             line(virtioFSMarkerMatched, "VirtioFS marker matched"),
-            line(gracefulGuestStopObserved && !destructiveStopRequired, "graceful guest stop observed"),
-            line(artifactAttachedReadOnlyAfterRelease, "artifact disk attached read-only after VM release"),
-            line(artifactMarkerMatched, "artifact-disk marker matched"),
-            line(artifactEjected, "artifact disk ejected")
+            line(gracefulGuestStopObserved && !destructiveStopRequired, "graceful guest stop observed")
         ]
+        if assertedArtifactDisk {
+            lines.append(contentsOf: [
+                line(artifactAttachedReadOnlyAfterRelease, "artifact disk attached read-only after VM release"),
+                line(artifactMarkerMatched, "artifact-disk marker matched"),
+                line(artifactEjected, "artifact disk ejected")
+            ])
+        } else {
+            // Named rather than dropped. A criterion that quietly stops being
+            // printed is a criterion nobody notices has stopped being checked.
+            lines.append(
+                "n/a   artifact disk attached, matched, and ejected — not asserted for a "
+                    + "\((guestOS ?? .macOS).displayName) guest: the detached-storage proof is a "
+                    + "property of the Virtualization framework, and the macOS selftest asserts it"
+            )
+        }
         if let systemDiskValidation, systemDiskValidation.attempted {
             let passed = systemDiskValidation.markerMatched == true
             lines.append(
@@ -164,9 +190,11 @@ struct RunReport: Codable, Sendable {
         return lines.joined(separator: "\n")
     }
 
-    static func empty(runID: String) -> RunReport {
+    static func empty(runID: String, guestOS: GuestOS, artifactDiskAsserted: Bool) -> RunReport {
         RunReport(
             runID: runID,
+            guestOS: guestOS,
+            artifactDiskAsserted: artifactDiskAsserted,
             restoreImageVerifiedAsMacOS27OrLater: false,
             installSucceeded: false,
             firstBootProvisioningSucceeded: false,
@@ -190,6 +218,10 @@ struct RunReport: Codable, Sendable {
 }
 
 struct OrchestratorOptions: Sendable {
+    /// Which operating system the guest runs, where the run does not learn it
+    /// from a template. A run started from a template takes the template's
+    /// answer instead, because the template is the thing that knows.
+    var guestOS: GuestOS = .macOS
     var ipsw: URL?
     var bundle: URL?
     /// The run's identifier, when the caller named one. `nil` generates a UUID.
@@ -202,6 +234,8 @@ struct OrchestratorOptions: Sendable {
     var skipIPSWDigest = false
     var validateSystemDisk = false
     var queryLatestSupported = false
+    /// The system disk's size, in GiB, for a template being created.
+    var diskSizeGiB: Int?
     var logsInAutomatically = GuestProvisioner.defaultLogsInAutomatically
     var username = "vivadmin"
     var fullName = "Vivarium Administrator"
@@ -231,6 +265,10 @@ final class Orchestrator {
     static let streamTailLimit = 256 * 1024
 
     private let options: OrchestratorOptions
+    /// Everything about this run that depends on which operating system the
+    /// guest is. Set from the options, then replaced by the template's own
+    /// answer as soon as there is a template to ask.
+    private var platform: any GuestPlatform
     private var state: VivState = .idle
     private var stateLogURL: URL?
     private let startedAt = ContinuousClock.now
@@ -261,6 +299,7 @@ final class Orchestrator {
 
     init(options: OrchestratorOptions) {
         self.options = options
+        self.platform = options.guestOS.platform
     }
 
     // MARK: - Entry points
@@ -268,6 +307,7 @@ final class Orchestrator {
     /// `preflight`: every cheap check, no bundle created.
     static func preflight(options: OrchestratorOptions) async -> PreflightReport {
         await PreflightChecker.run(
+            platform: options.guestOS.platform,
             ipsw: options.ipsw,
             targetDirectory: options.bundle ?? VivariumHome.root,
             queryLatestSupported: options.queryLatestSupported
@@ -326,6 +366,7 @@ final class Orchestrator {
         try Entitlement.require(stage: .preflight)
 
         let preflight = await PreflightChecker.run(
+            platform: platform,
             ipsw: options.ipsw,
             targetDirectory: options.bundle ?? VivariumHome.root,
             queryLatestSupported: options.queryLatestSupported
@@ -362,30 +403,30 @@ final class Orchestrator {
         report?.restoreImageVerifiedAsMacOS27OrLater = true
 
         transition(to: .preparingBundle)
-        try prepareRunMetadata()
+        try await prepareRunMetadata()
         report.restoreImageVerifiedAsMacOS27OrLater = true
 
-        manifest.ipswPath = ipsw.path
-        manifest.ipswByteCount = BundleManager.fileSize(of: ipsw)
-        manifest.restoreImageVersion = restoreImage.versionString
-        manifest.restoreImageBuild = restoreImage.buildVersion
+        manifest.sourcePath = ipsw.path
+        manifest.sourceByteCount = BundleManager.fileSize(of: ipsw)
+        manifest.guestOSVersion = restoreImage.versionString
+        manifest.guestOSBuild = restoreImage.buildVersion
 
         if !options.skipIPSWDigest {
             // Hashing 22 GB takes a while, which is noise against a ninety-
             // minute install but would dominate a --from-template run, hence
             // the opt-out.
             log.info("Digesting the restore image; pass --skip-ipsw-digest to skip this.")
-            manifest.ipswSHA256 = try await Task.detached(priority: .utility) {
+            manifest.sourceSHA256 = try await Task.detached(priority: .utility) {
                 try Digest.sha256HexOfFile(at: ipsw, stage: .restoreImage)
             }.value
-            log.info("Restore image sha256: \(manifest.ipswSHA256 ?? "unknown").")
+            log.info("Restore image sha256: \(manifest.sourceSHA256 ?? "unknown").")
         }
 
         try manifest.write(to: paths.runManifest)
         return restoreImage
     }
 
-    private func prepareRunMetadata() throws {
+    private func prepareRunMetadata() async throws {
         // A generated identifier is unique and meaningless, which is right for
         // a run nobody is waiting on; a caller that has to find the results
         // afterwards — a CI job, a script — names the run instead and knows the
@@ -410,15 +451,17 @@ final class Orchestrator {
         log.attachFile(at: paths.runLog)
         stateLogURL = paths.stateLog
 
-        credentials = GuestCredentials.generate(
+        credentials = try await platform.makeCredentials(
             username: options.username,
-            fullName: options.fullName
+            fullName: options.fullName,
+            paths: paths
         )
         let macAddress = try VMConfigurationFactory.createAndPersistMACAddress(paths: paths)
 
         manifest = RunManifest.create(
             runID: runID,
             bundle: paths,
+            guestOS: platform.os,
             credentials: credentials,
             macAddress: macAddress.string,
             logsInAutomatically: options.logsInAutomatically
@@ -433,11 +476,15 @@ final class Orchestrator {
                 artifactVolumeName: volumeName
             )
         }
-        report = RunReport.empty(runID: runID)
+        report = RunReport.empty(
+            runID: runID,
+            guestOS: platform.os,
+            artifactDiskAsserted: options.includesArtifactDisk && platform.assertsArtifactDisk
+        )
 
-        log.info("Run \(runID) in \(paths.root.path).")
+        log.info("Run \(runID) of a \(platform.os.displayName) guest in \(paths.root.path).")
         log.info("Guest account: \(credentials.username) (\(credentials.fullName)); "
-            + "the password is generated per run and is never written to disk or logged.")
+            + "credential: \(credentials.storageDescription).")
         log.info("MAC address: \(macAddress.string).")
     }
 
@@ -446,7 +493,9 @@ final class Orchestrator {
         let macAddress = try VMConfigurationFactory.loadMACAddress(paths: paths, stage: .installation)
 
         let installer = MacOSInstaller(paths: paths)
-        try await installer.createSystemDiskImage()
+        try await installer.createSystemDiskImage(
+            sizeGiB: options.diskSizeGiB ?? MacOSInstaller.defaultDiskSizeGiB
+        )
 
         transition(to: .installing)
         let shape = try await installer.install(restoreImage: restoreImage, macAddress: macAddress)
@@ -461,14 +510,17 @@ final class Orchestrator {
     private func snapshotTemplate(restoreImage: LoadedRestoreImage) async throws {
         transition(to: .snapshottingTemplate)
         let templateRoot = options.template
-            ?? DefaultLocations.template(ipswBuild: restoreImage.buildVersion)
+            ?? DefaultLocations.template(os: platform.os, build: restoreImage.buildVersion)
         let template = TemplatePaths(root: templateRoot)
 
         try await TemplateManager.snapshot(
             from: paths,
             to: template,
-            restoreImage: restoreImage,
-            ipswSHA256: manifest.ipswSHA256,
+            platform: platform,
+            osVersion: restoreImage.versionString,
+            osBuild: restoreImage.buildVersion,
+            source: manifest.sourcePath,
+            sourceSHA256: manifest.sourceSHA256,
             runID: manifest.runID
         )
         manifest.templatePath = template.root.path
@@ -478,39 +530,64 @@ final class Orchestrator {
     private func prepareBundleFromTemplate(_ templateRoot: URL) async throws {
         transition(to: .preparingBundle)
 
+        // The template is read before anything is created, because it is what
+        // says which operating system this run is of — and every decision from
+        // here on, starting with what kind of credential to generate, follows
+        // from the answer.
+        let template = TemplatePaths(root: templateRoot)
+        let templateManifest = try TemplateManager.readManifest(of: template)
+        platform = templateManifest.os.platform
+
         var expectedBuild: String?
         if let ipsw = options.ipsw {
+            guard platform.os == .macOS else {
+                throw VivError(
+                    .bundlePreparation,
+                    "--ipsw pins the build a macOS template was restored from, but "
+                        + "\(templateRoot.path) holds a \(platform.os.displayName) guest."
+                )
+            }
             let image = try await RestoreImageManager.load(ipsw: ipsw)
             expectedBuild = image.buildVersion
             report?.restoreImageVerifiedAsMacOS27OrLater = true
         }
 
-        try prepareRunMetadata()
+        try await prepareRunMetadata()
         if expectedBuild != nil {
             report.restoreImageVerifiedAsMacOS27OrLater = true
         }
         manifest.startedFromTemplate = true
 
-        // The template's MAC address comes with it, replacing the one just
-        // generated: the platform identity must stay internally consistent.
-        let templateManifest = try await TemplateManager.materialize(
-            template: TemplatePaths(root: templateRoot),
+        _ = try await TemplateManager.materialize(
+            template: template,
             into: paths,
-            expectedIPSWBuild: expectedBuild
+            expectedBuild: expectedBuild
         )
-        let macAddress = try VMConfigurationFactory.loadMACAddress(paths: paths, stage: .templateSnapshot)
-        manifest.macAddress = macAddress.string
+        // Where the template carries a MAC address it comes with it, replacing
+        // the one just generated: a macOS platform identity has to stay
+        // internally consistent. Where it does not, the freshly generated one
+        // stands, which is what keeps two Linux guests distinguishable in the
+        // host's ARP cache.
+        if platform.templateSuppliesMACAddress {
+            let macAddress = try VMConfigurationFactory.loadMACAddress(
+                paths: paths, stage: .templateSnapshot
+            )
+            manifest.macAddress = macAddress.string
+        }
         manifest.templatePath = templateRoot.path
-        manifest.restoreImageBuild = templateManifest.ipswBuild
-        manifest.restoreImageVersion = templateManifest.ipswVersion
+        manifest.guestOSBuild = templateManifest.osBuild
+        manifest.guestOSVersion = templateManifest.osVersion
         manifest.cpuCount = VMConfigurationFactory.computeCPUCount()
         manifest.memorySizeBytes = VMConfigurationFactory.computeMemorySize()
-        // The version gate was enforced when the template was installed, and
+        // The version gate was enforced when the template was created, and
         // `materialize` has just checked this clone against that build. Leaving
         // the criterion at its `false` default would fail an otherwise perfect
-        // run for a check that did happen, only in an earlier process.
-        report.restoreImageVerifiedAsMacOS27OrLater =
-            RestoreImageManager.satisfiesGuestVersionGate(templateManifest.ipswVersion)
+        // run for a check that did happen, only in an earlier process. A guest
+        // that has no such gate — Linux has no provisioning API to be too old
+        // for — satisfies it by having nothing to satisfy.
+        report.restoreImageVerifiedAsMacOS27OrLater = platform.os == .macOS
+            ? RestoreImageManager.satisfiesGuestVersionGate(templateManifest.osVersion)
+            : true
         report.installSucceeded = true
         try manifest.write(to: paths.runManifest)
     }
@@ -527,25 +604,31 @@ final class Orchestrator {
         stateLogURL = paths.stateLog
 
         manifest = try RunManifest.read(from: paths.runManifest)
-        report = RunReport.empty(runID: manifest.runID)
-        report.restoreImageVerifiedAsMacOS27OrLater =
-            RestoreImageManager.satisfiesGuestVersionGate(manifest.restoreImageVersion)
+        platform = manifest.os.platform
+        report = RunReport.empty(
+            runID: manifest.runID,
+            guestOS: platform.os,
+            artifactDiskAsserted: options.includesArtifactDisk && platform.assertsArtifactDisk
+        )
+        report.restoreImageVerifiedAsMacOS27OrLater = platform.os == .macOS
+            ? RestoreImageManager.satisfiesGuestVersionGate(manifest.guestOSVersion)
+            : true
         report.installSucceeded = true
 
-        // A password is generated per run and never persisted, so a bundle
-        // adopted from a previous invocation cannot be logged into. The
-        // credential is only reusable within one process lifetime.
+        // A credential belongs to the invocation that generated it, so a bundle
+        // adopted from a previous one cannot be logged into. Saying that
+        // outright is better than presenting an empty password as one.
         credentials = GuestCredentials(
             fullName: manifest.fullName,
             username: manifest.username,
-            password: ""
+            authentication: .unavailable
         )
     }
 
     // MARK: - Provisioned boot and proof
 
     private func provisionAndValidate() async throws {
-        try await startProvisionedGuest()
+        try await startProvisionedGuest(hasArtifactDirectory: false)
 
         do {
             let ssh = try await connectToGuest()
@@ -561,7 +644,9 @@ final class Orchestrator {
             throw error
         }
 
-        try await validateDetachedArtifact()
+        if options.includesArtifactDisk, platform.assertsArtifactDisk {
+            try await validateDetachedArtifact()
+        }
 
         if options.validateSystemDisk {
             report.systemDiskValidation = await DiskImageValidator.validateSystemDisk(
@@ -596,16 +681,34 @@ final class Orchestrator {
     /// Deliberately outside the caller's `catch`: nothing has been started that
     /// could need stopping, and a failure here is about the configuration, not
     /// about a guest that has to be released.
-    private func startProvisionedGuest() async throws {
-        guard !credentials.password.isEmpty else {
+    private func startProvisionedGuest(hasArtifactDirectory: Bool) async throws {
+        guard credentials.isUsable else {
             throw VivError(
                 .provisioning,
-                "This bundle's guest password is not available. Passwords are generated per run "
-                    + "and deliberately never persisted, so a bundle can only be provisioned by the "
-                    + "same invocation that created it. Use `all`, or `provision --from-template`."
+                "This bundle's guest credential is not available. Credentials belong to the run "
+                    + "that generated them, so a bundle can only be provisioned by the same "
+                    + "invocation that created it. Use `all`, or `provision --from-template`."
             )
         }
+        // Whatever this guest needs written into the bundle before it starts —
+        // a cloud-init seed, for a guest that provisions itself from one — has
+        // to exist before the configuration that attaches it is built.
+        try await platform.prepareRun(
+            makeProvisioningRequest(hasArtifactDirectory: hasArtifactDirectory)
+        )
         try await createAndStartRunVM()
+    }
+
+    private func makeProvisioningRequest(hasArtifactDirectory: Bool) -> ProvisioningRequest {
+        ProvisioningRequest(
+            paths: paths,
+            credentials: credentials,
+            runID: manifest.runID,
+            hostname: ProvisioningRequest.hostname(forRunID: manifest.runID),
+            logsInAutomatically: options.logsInAutomatically,
+            disablesRemoteLogin: options.disableRemoteLogin,
+            hasArtifactDirectory: hasArtifactDirectory
+        )
     }
 
     /// The other half: find the guest, and hold a runner that has authenticated
@@ -615,7 +718,7 @@ final class Orchestrator {
         let address = try await resolveAddress()
         let ssh = SSHCommandRunner(
             username: credentials.username,
-            password: credentials.password,
+            authentication: credentials.authentication,
             address: address,
             knownHostsFile: paths.knownHosts
         )
@@ -653,10 +756,8 @@ final class Orchestrator {
               guest    \(credentials.username)@\(address)
               run      \(layout?.root.path ?? paths.root.path)
 
-            The password is generated per run and lives only in this process's \
-            memory: it is never printed, logged, or written down, so there is no \
-            new SSH session to be had. What is inspectable is the run directory \
-            above and any session already open.
+            \(credentials.inspectionAdvice(
+                username: credentials.username, address: address, bundle: paths.root))
 
             Ctrl-C force-stops the guest — the equivalent of pulling its power, \
             with nothing flushed — and cleans nothing up. The run directory is \
@@ -693,7 +794,7 @@ final class Orchestrator {
     private func createAndStartRunVM() async throws {
         transition(to: .creatingRunVM)
 
-        if options.includesArtifactDisk,
+        if options.includesArtifactDisk, platform.assertsArtifactDisk,
            !FileManager.default.fileExists(atPath: paths.artifactDisk.path) {
             try await ArtifactDiskManager.create(
                 paths: paths,
@@ -702,14 +803,16 @@ final class Orchestrator {
         }
 
         let macAddress = try VMConfigurationFactory.loadMACAddress(paths: paths, stage: .runConfiguration)
-        let configuration = try VMConfigurationFactory.makeRunConfiguration(
-            paths: paths,
-            macAddress: macAddress,
-            cpuCount: manifest.cpuCount ?? VMConfigurationFactory.computeCPUCount(),
-            memorySize: manifest.memorySizeBytes ?? VMConfigurationFactory.computeMemorySize(),
-            includesArtifactDisk: options.includesArtifactDisk,
-            shareReadOnly: options.shareReadOnly,
-            artifactReadOnly: options.artifactReadOnly
+        let configuration = try platform.makeRunConfiguration(
+            RunConfigurationRequest(
+                paths: paths,
+                macAddress: macAddress,
+                cpuCount: manifest.cpuCount ?? VMConfigurationFactory.computeCPUCount(),
+                memorySize: manifest.memorySizeBytes ?? VMConfigurationFactory.computeMemorySize(),
+                includesArtifactDisk: options.includesArtifactDisk && platform.assertsArtifactDisk,
+                shareReadOnly: options.shareReadOnly,
+                artifactReadOnly: options.artifactReadOnly
+            )
         )
 
         let relay = VMEventRelay()
@@ -732,26 +835,8 @@ final class Orchestrator {
         report.firstBootProvisioningSucceeded = true
     }
 
-    private func makeStartOptions() throws -> VZMacOSVirtualMachineStartOptions {
-        if options.disableRemoteLogin {
-            // Negative test 2: provisioning without Remote Login. The account
-            // is still created, so the expected failure is at the SSH readiness
-            // gate rather than at boot.
-            log.warn("--disable-remote-login: provisioning without Remote Login, as a negative test.")
-            let provisioning = VZMacGuestProvisioningOptions()
-            provisioning.fullName = credentials.fullName
-            provisioning.username = credentials.username
-            provisioning.password = credentials.password
-            provisioning.logsInAutomatically = options.logsInAutomatically
-            provisioning.enablesRemoteLogin = false
-            let startOptions = VZMacOSVirtualMachineStartOptions()
-            try startOptions.setGuestProvisioning(provisioning)
-            return startOptions
-        }
-        return try GuestProvisioner.makeStartOptions(
-            credentials: credentials,
-            logsInAutomatically: options.logsInAutomatically
-        )
+    private func makeStartOptions() throws -> VZVirtualMachineStartOptions? {
+        try platform.makeStartOptions(makeProvisioningRequest(hasArtifactDirectory: false))
     }
 
     private func resolveAddress() async throws -> String {
@@ -818,7 +903,7 @@ final class Orchestrator {
             inspectionHints: [
                 "arp -an | grep -i \(manifest.macAddress)",
                 "cat \(paths.diagnosticsDirectory.path)/arp.txt"
-            ]
+            ] + consoleLogHint()
         )
     }
 
@@ -831,6 +916,7 @@ final class Orchestrator {
         transition(to: .waitingForSSH)
 
         let deadline = ContinuousClock.now.advanced(by: Timeouts.sshReadiness)
+        let readinessCommand = platform.scripts.readinessCommand
         var delay = Duration.seconds(3)
         var attempt = 0
         var lastReason = "no attempt made"
@@ -851,7 +937,7 @@ final class Orchestrator {
                 do {
                     return .success(
                         try await ssh.run(
-                            remoteCommand: AcceptanceScript.readinessCommand,
+                            remoteCommand: readinessCommand,
                             timeout: .seconds(30)
                         )
                     )
@@ -902,20 +988,19 @@ final class Orchestrator {
             "The guest at \(ssh.address) did not become SSH-ready within \(Timeouts.sshReadiness). "
                 + "Last gate passed: \(lastReadinessGate ?? "none"). Last reason: \(lastReason).",
             inspectionHints: [
-                "ssh \(credentials.username)@\(ssh.address)",
                 "cat \(paths.diagnosticsDirectory.path)/arp.txt"
-            ]
+            ] + consoleLogHint()
         )
     }
 
     private func runAcceptanceCommand(ssh: SSHCommandRunner) async throws -> SSHResult {
         transition(to: .executingAcceptanceCommand)
 
-        let script = AcceptanceScript.acceptanceScript(
+        let script = platform.scripts.acceptanceScript(
             expectations: manifest.expectations,
-            username: credentials.username
+            withArtifactVolume: options.includesArtifactDisk && platform.assertsArtifactDisk
         )
-        let remoteCommand = ShellEscaping.base64RemoteCommand(script: script)
+        let remoteCommand = platform.scripts.remoteCommand(script)
 
         let result = try await ssh.run(
             remoteCommand: remoteCommand,
@@ -1004,7 +1089,7 @@ final class Orchestrator {
 
         let expected = manifest.expectations.markerFileContents
         report.virtioFSMarkerMatched = contents == expected
-        report.virtioFSMountPath = AcceptanceScript.expectedSharePath
+        report.virtioFSMountPath = platform.scripts.sharePath
 
         guard report.virtioFSMarkerMatched else {
             throw VivError(
@@ -1018,21 +1103,6 @@ final class Orchestrator {
     }
 
     // MARK: - Shutdown
-
-    /// Which shutdown mechanism gets the first attempt.
-    ///
-    /// `selftest` keeps `requestStop()` first: its "graceful guest stop
-    /// observed" criterion documents that exact, measured behaviour, and
-    /// changing the order would change what the criterion proves. `viv run`
-    /// instead leads with the in-guest shutdown, because POC-RESULTS.md is
-    /// unequivocal that with auto-login on, `requestStop()` has never once
-    /// stopped a provisioned guest — it is a power-button press answered by a
-    /// confirmation dialog nobody is there to click — while the in-guest
-    /// `shutdown -h now` works every time in around six seconds.
-    enum ShutdownOrder: Sendable {
-        case requestStopFirst
-        case inGuestFirst
-    }
 
     private func shutdown(ssh: SSHCommandRunner, order: ShutdownOrder = .requestStopFirst) async throws {
         transition(to: .requestingGuestShutdown)
@@ -1117,11 +1187,17 @@ final class Orchestrator {
     /// `.stopped`. The password goes to sudo's stdin, never into the command
     /// line, so it never appears in the guest's process list.
     private func tryInGuestShutdown(ssh: SSHCommandRunner, relay: VMEventRelay, timeout: Duration) async -> Bool {
+        let scripts = platform.scripts
+        let stdin = scripts.shutdownWantsPasswordOnStdin
+            ? credentials.password.map { Data(($0 + "\n").utf8) }
+            : nil
         let result = try? await ssh.run(
-            remoteCommand: AcceptanceScript.shutdownCommand,
-            stdinData: Data((credentials.password + "\n").utf8),
+            remoteCommand: scripts.shutdownCommand,
+            stdinData: stdin,
             timeout: .seconds(60),
-            redactedCommand: "sudo -S /sbin/shutdown -h now <password on stdin>"
+            redactedCommand: scripts.shutdownWantsPasswordOnStdin
+                ? "sudo -S shutdown -h now <password on stdin>"
+                : scripts.shutdownCommand
         )
         if let result {
             // A transport failure here is the *expected* result, not a problem:
@@ -1277,7 +1353,7 @@ final class Orchestrator {
             try createDirectory(layout.results, stage: .codeStaging)
         }
 
-        try await startProvisionedGuest()
+        try await startProvisionedGuest(hasArtifactDirectory: true)
 
         let execution: TestExecution
         let status: TestRunStatus
@@ -1314,7 +1390,9 @@ final class Orchestrator {
                 // POC-RESULTS.md measured as actually working with auto-login
                 // on.
                 do {
-                    try await measure("shutdown") { try await shutdown(ssh: ssh, order: .inGuestFirst) }
+                    try await measure("shutdown") {
+                        try await shutdown(ssh: ssh, order: platform.runShutdownOrder)
+                    }
                 } catch {
                     shutdownError = error
                     log.error("The guest did not shut down cleanly: \(VivError.describe(error))")
@@ -1348,10 +1426,12 @@ final class Orchestrator {
             command: plan.command,
             commandSource: plan.commandSource,
             templatePath: plan.templateRoot.path,
-            templateBuild: manifest.restoreImageBuild,
+            templateBuild: manifest.guestOSBuild,
+            guestOS: platform.os,
+            guestOSVersion: manifest.guestOSVersion,
             guestUsername: credentials.username,
             guestAddress: self.report.guestAddress,
-            guestWorkdir: GuestTestScript.workdirDisplayPath,
+            guestWorkdir: GuestScripts.workdirDisplayPath,
             timeoutSeconds: plan.timeout.elapsedSeconds,
             timedOut: execution.timedOut,
             testExitCode: execution.exitCode,
@@ -1401,9 +1481,8 @@ final class Orchestrator {
     private func prepareGuestWorkdir(ssh: SSHCommandRunner) async throws {
         transition(to: .preparingGuestWorkdir)
 
-        let script = GuestTestScript.prepareScript
         let result = try await ssh.run(
-            remoteCommand: ShellEscaping.base64RemoteCommand(script: script),
+            remoteCommand: platform.scripts.remoteCommand(platform.scripts.prepareScript),
             timeout: Timeouts.guestWorkdirPreparation,
             redactedCommand: "<base64-encoded workdir preparation script>"
         )
@@ -1417,7 +1496,7 @@ final class Orchestrator {
                 inspectionHints: ["cat \(paths.runLog.path)"]
             )
         }
-        log.info("Guest workdir \(GuestTestScript.workdirDisplayPath) is ready.")
+        log.info("Guest workdir \(GuestScripts.workdirDisplayPath) is ready.")
     }
 
     /// Runs the user's command, streaming both of its streams to the terminal
@@ -1428,12 +1507,12 @@ final class Orchestrator {
         transition(to: .executingTestCommand)
         log.info("Running in the guest: \(plan.command)")
 
-        let script = GuestTestScript.testScript(
+        let script = platform.scripts.testScript(
             command: plan.command,
             environment: plan.environment,
             runID: manifest.runID
         )
-        let remoteCommand = ShellEscaping.base64RemoteCommand(script: script)
+        let remoteCommand = platform.scripts.remoteCommand(script)
         let redacted = "<base64-encoded test script, \(script.count) characters>"
 
         let echo = GuestEcho()
@@ -1534,9 +1613,9 @@ final class Orchestrator {
         var warnings: [String] = execution.captureWarnings
 
         if !plan.artifactPatterns.isEmpty {
-            let script = GuestTestScript.harvestScript(patterns: plan.artifactPatterns)
+            let script = platform.scripts.harvestScript(patterns: plan.artifactPatterns)
             let result = try? await ssh.run(
-                remoteCommand: ShellEscaping.base64RemoteCommand(script: script),
+                remoteCommand: platform.scripts.remoteCommand(script),
                 timeout: Timeouts.harvest,
                 redactedCommand: "<base64-encoded artifact harvest script>"
             )
@@ -1801,16 +1880,16 @@ final class Orchestrator {
 
         guard report.sshAuthenticationSucceeded,
               let address = report.guestAddress,
-              !credentials.password.isEmpty else { return }
+              credentials.isUsable else { return }
 
         let ssh = SSHCommandRunner(
             username: credentials.username,
-            password: credentials.password,
+            authentication: credentials.authentication,
             address: address,
             knownHostsFile: paths.knownHosts
         )
         guard let result = try? await ssh.run(
-            remoteCommand: ShellEscaping.base64RemoteCommand(script: AcceptanceScript.diagnosticsScript),
+            remoteCommand: platform.scripts.remoteCommand(platform.scripts.diagnosticsScript),
             timeout: .seconds(60),
             redactedCommand: "<base64-encoded guest diagnostics script>"
         ) else { return }
@@ -1820,6 +1899,19 @@ final class Orchestrator {
             to: paths.diagnosticsDirectory.appendingPathComponent("guest-state.txt")
         )
         log.info("Guest diagnostics written to \(paths.diagnosticsDirectory.path)/guest-state.txt.")
+    }
+
+    /// Points at the guest's console log, where there is one with anything in
+    /// it.
+    ///
+    /// A Linux guest that never reached sshd has left nothing over SSH to
+    /// collect, and the console is the only account of why. Naming the file in
+    /// the failure is the difference between "the guest never answered" and a
+    /// person being able to read what it said instead.
+    private func consoleLogHint() -> [String] {
+        guard let paths,
+              BundleManager.fileSize(of: paths.consoleLog) > 0 else { return [] }
+        return ["tail -n 100 \(paths.consoleLog.path)"]
     }
 
     private func describe(_ outcome: SSHOutcome) -> String {

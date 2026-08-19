@@ -26,16 +26,28 @@ enum GuestProvisioner {
     /// it as a default.
     nonisolated static let defaultLogsInAutomatically = true
 
+    /// Builds the first-boot provisioning options.
+    ///
+    /// - Parameter enablesRemoteLogin: false only for the selftest's negative
+    ///   test, which provisions an account but no way to reach it, so the
+    ///   expected failure lands at the SSH readiness gate rather than at boot.
     static func makeStartOptions(
-        credentials: GuestCredentials,
-        logsInAutomatically: Bool
+        fullName: String,
+        username: String,
+        password: String,
+        logsInAutomatically: Bool,
+        enablesRemoteLogin: Bool = true
     ) throws -> VZMacOSVirtualMachineStartOptions {
+        if !enablesRemoteLogin {
+            log.warn("Provisioning without Remote Login, as a negative test.")
+        }
+
         let provisioning = VZMacGuestProvisioningOptions()
-        provisioning.fullName = credentials.fullName
-        provisioning.username = credentials.username
-        provisioning.password = credentials.password
+        provisioning.fullName = fullName
+        provisioning.username = username
+        provisioning.password = password
         provisioning.logsInAutomatically = logsInAutomatically
-        provisioning.enablesRemoteLogin = true
+        provisioning.enablesRemoteLogin = enablesRemoteLogin
 
         let options = VZMacOSVirtualMachineStartOptions()
         do {
@@ -61,14 +73,30 @@ enum GuestProvisioner {
         return options
     }
 
-    /// Starts the VM with provisioning options.
+    /// Starts the VM, with provisioning options where the guest needs them.
+    ///
+    /// `options` is `nil` for a guest that is provisioned by something already
+    /// in its configuration — a Linux guest reads a seed image rather than
+    /// being told anything at `start` — and that is an ordinary start rather
+    /// than a start with empty options, because the framework treats the two
+    /// differently.
     static func start(
         virtualMachine: VZVirtualMachine,
-        options: VZMacOSVirtualMachineStartOptions
+        options: VZVirtualMachineStartOptions?
     ) async throws {
-        log.info("Starting the virtual machine with guest provisioning options.")
+        log.info(
+            options == nil
+                ? "Starting the virtual machine."
+                : "Starting the virtual machine with guest provisioning options."
+        )
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                guard let options else {
+                    virtualMachine.start { result in
+                        continuation.resume(with: result)
+                    }
+                    return
+                }
                 virtualMachine.start(options: options) { error in
                     if let error {
                         continuation.resume(throwing: error)
