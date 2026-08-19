@@ -172,13 +172,14 @@ struct GuestOptions: ParsableArguments {
     @Flag(
         inversion: .prefixedNo,
         help: ArgumentHelp(
-            "Log the guest in automatically at startup.",
+            "Log the guest in automatically at startup. macOS guests only.",
             discussion: """
-                On by default. macOS automounts volumes through a console user \
-                session, so with nobody logged in the artifact volume may never \
-                appear in the guest. The guest script mounts it by name as a \
-                fallback, so --no-auto-login is expected to work; it is a \
-                weaker path, not a broken one.
+                On by default, and meaningless to a guest that is not macOS. \
+                macOS automounts volumes through a console user session, so \
+                with nobody logged in the artifact volume may never appear in \
+                the guest. The guest script mounts it by name as a fallback, so \
+                --no-auto-login is expected to work; it is a weaker path, not a \
+                broken one.
                 """
         )
     )
@@ -505,7 +506,9 @@ struct TemplateCreateCommand: AsyncParsableCommand {
                 source: source,
                 template: TemplatePaths(root: templateRoot),
                 diskSizeGiB: diskSize ?? LinuxTemplateBuilder.defaultDiskSizeGiB,
-                workingDirectory: VivariumHome.templates
+                // The template's own parent, so a download lands on the volume
+                // the template will live on rather than crossing one on the way.
+                workingDirectory: templateRoot.deletingLastPathComponent()
             )
         )
         print("Template created at \(templateRoot.path).")

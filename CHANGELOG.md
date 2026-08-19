@@ -39,7 +39,8 @@ This project does not yet follow Semantic Versioning strictly — see
   goes first, what the host must be, and which acceptance criteria apply. One
   conformance per operating system; `Orchestrator`'s pipeline asks rather
   than assumes. A distribution that publishes a cloud image should be a case
-  in `GuestOS` and an entry in `LinuxImageCatalogue`, and no new code.
+  in `GuestOS` and an entry in `LinuxImageCatalogue`, and no new platform
+  code.
 - `--os <name>` on `viv run`, `viv selftest`, and `viv preflight`, to pick
   among the templates in a home that holds more than one guest. A run
   otherwise takes the newest template of any guest and says which it picked;

@@ -361,6 +361,14 @@ final class Orchestrator {
     /// `validate`: host-side disk validation against an existing bundle.
     func runValidate() async throws -> ArtifactValidationResult {
         try attachExistingBundle()
+        guard platform.assertsArtifactDisk else {
+            throw VivError(
+                .artifactValidation,
+                "\(paths.root.path) holds a \(platform.os.displayName) guest, which has no "
+                    + "artifact disk to re-check. That proof belongs to a macOS guest; a "
+                    + "\(platform.os.displayName) run's results are under its results/ directory."
+            )
+        }
         transition(to: .attachingArtifactReadOnly)
         let result = try await DiskImageValidator.validateArtifact(
             paths: paths,

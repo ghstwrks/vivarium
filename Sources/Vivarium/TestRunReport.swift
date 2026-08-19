@@ -102,7 +102,11 @@ struct TestRunReport: Codable, Sendable {
     /// Which operating system the guest ran, and the version it reported being.
     /// A report is read the day after by somebody who no longer remembers which
     /// template this was.
-    let guestOS: GuestOS
+    ///
+    /// Optional only so that `viv gc`, which decodes this record to find out
+    /// when a run finished, can still read one written by 0.1 — where the
+    /// answer could only have been macOS. Every report written since has it.
+    let guestOS: GuestOS?
     let guestOSVersion: String?
     let guestUsername: String
     let guestAddress: String?
@@ -244,7 +248,8 @@ struct TestRunReport: Codable, Sendable {
 
     /// The guest, as a person would say it: "Fedora 44", or "macOS 27.0.0".
     private var guestDescription: String {
-        guestOSVersion.map { "\(guestOS.displayName) \($0)" } ?? guestOS.displayName
+        let name = (guestOS ?? .assumedForUnlabelledTemplates).displayName
+        return guestOSVersion.map { "\(name) \($0)" } ?? name
     }
 
     private var statusPhrase: String {

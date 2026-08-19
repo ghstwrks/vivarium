@@ -467,7 +467,7 @@ the host must be, and which acceptance criteria apply. `Orchestrator`'s
 pipeline asks the platform rather than assuming.
 
 A distribution that publishes a cloud image is expected to be one case in
-`GuestOS`, one entry in `LinuxImageCatalogue`, and no new code:
+`GuestOS`, one entry in `LinuxImageCatalogue`, and no new platform code:
 `LinuxPlatform` is parameterised rather than written once per distribution.
 Something genuinely different — Windows — would be a new conformance
 alongside `MacOSPlatform` and `LinuxPlatform`.

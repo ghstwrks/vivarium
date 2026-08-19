@@ -16,8 +16,6 @@ struct LinuxImageRelease: Sendable {
     /// What this image is, in one line, for the operator who is about to spend
     /// half a gigabyte of somebody's bandwidth on it.
     let summary: String
-
-    var filename: String { url.lastPathComponent }
 }
 
 /// The images `viv template create --os <name>` fetches when told nothing else.
@@ -102,11 +100,20 @@ enum LinuxImageSource: Sendable {
     }
 
     /// What `template.json` records about where the image came from.
-    var description: String {
+    var origin: String {
         switch self {
         case let .catalogue(release): return release.url.absoluteString
         case let .remote(url, _): return url.absoluteString
         case let .local(url, _): return url.path
+        }
+    }
+
+    /// The URL to fetch, for a source that is not already on this machine.
+    var remoteURL: URL? {
+        switch self {
+        case let .catalogue(release): return release.url
+        case let .remote(url, _): return url
+        case .local: return nil
         }
     }
 

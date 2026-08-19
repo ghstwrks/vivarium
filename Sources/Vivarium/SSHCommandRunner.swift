@@ -164,7 +164,7 @@ struct SSHCommandRunner: Sendable {
         return SSHResult(outcome: Self.classify(result), command: result)
     }
 
-    static func baseArguments(
+    private static func baseArguments(
         knownHostsFile: URL,
         authentication: GuestAuthentication
     ) -> [String] {

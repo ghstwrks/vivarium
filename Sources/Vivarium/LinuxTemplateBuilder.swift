@@ -73,7 +73,7 @@ enum LinuxTemplateBuilder {
                 platform: request.os.platform,
                 osVersion: request.source.version,
                 osBuild: request.source.build,
-                source: request.source.description,
+                source: request.source.origin,
                 sourceSHA256: image.sha256,
                 systemDiskSHA256: digest,
                 runID: nil
@@ -122,7 +122,7 @@ enum LinuxTemplateBuilder {
 
         case .catalogue, .remote:
             guard let expected = request.source.expectedSHA256,
-                  let url = URL(string: request.source.description) else {
+                  let url = request.source.remoteURL else {
                 throw VivError(.templateSnapshot, "No image URL to download.")
             }
             let destination = request.workingDirectory

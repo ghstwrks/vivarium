@@ -78,9 +78,6 @@ struct GuestScripts: Sendable {
     /// The share subdirectory the guest writes artifacts into.
     var artifactsGuestPath: String { sharePath + "/artifacts" }
 
-    /// The marker the guest writes into the share, as the guest sees it.
-    var shareMarkerGuestPath: String { sharePath + "/" + Self.markerFilename }
-
     /// Wraps a script for delivery over SSH, in this guest's shell.
     func remoteCommand(_ script: String) -> String {
         ShellEscaping.base64RemoteCommand(script: script, shell: shellExecutable)
