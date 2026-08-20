@@ -1,18 +1,5 @@
 #!/bin/bash
-#
 # Exercises Scripts/action/resolve-viv.sh against local file:// fixtures.
-#
-# resolve-viv.sh is where the action decides which binary to run, and it is the
-# only thing standing between a workflow and executing whatever was served at a
-# URL. Its refusals are therefore the security boundary, and a refusal that
-# stops happening is not a failure anyone would notice: the job would go green.
-# So each one is tested here.
-#
-# Nothing here starts a virtual machine, builds anything, or reaches the
-# network. It needs a Mac — codesign and ditto — but not a hypervisor, not
-# Xcode, and not a template, so it runs on a hosted macOS runner in seconds.
-#
-# Usage: Scripts/action/tests/resolve-viv-cases.sh
 
 set -uo pipefail
 
@@ -29,9 +16,6 @@ note() { printf '%s\n' "$*"; }
 
 # --- Fixtures -------------------------------------------------------------
 
-# Built from /bin/echo rather than from viv: these stand in for release assets,
-# and what matters about them is how they are signed, not what they do. Using a
-# system binary means this suite needs no toolchain and no macOS 27 SDK.
 cat > "$work/entitlements.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -53,13 +37,10 @@ mkdir -p "$work/staging/unsigned"
 cp /bin/echo "$work/staging/unsigned/viv"
 codesign --remove-signature "$work/staging/unsigned/viv" 2>/dev/null
 
-# A genuine Developer ID signed binary, if this machine has one. There is no
-# way to manufacture one, so the cases that need it are skipped rather than
-# faked — a fake would only prove the fake was rejected.
 devid=""
 devid_team=""
 for candidate in /opt/homebrew/bin/* /usr/local/bin/* /Applications/*/Contents/MacOS/*; do
-    [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+    if [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; then continue; fi
     authority="$(codesign -d --verbose=2 "$candidate" 2>&1 | grep '^Authority=Developer ID Application:' | head -1)"
     [ -n "$authority" ] || continue
     devid="$candidate"
@@ -68,7 +49,7 @@ for candidate in /opt/homebrew/bin/* /usr/local/bin/* /Applications/*/Contents/M
     devid=""
 done
 
-# publish <tag> <file-to-zip-as-viv>  — a well-formed release of that binary.
+# publish <tag> <file-to-zip-as-viv>
 publish() {
     local tag="$1" binary="$2" stage
     stage="$work/staging/$tag"

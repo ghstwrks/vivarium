@@ -42,9 +42,10 @@ Once per machine. Budget an hour, most of it downloading. **No Xcode and no
 Swift toolchain** — the action downloads a compiled `viv`, so the runner needs
 a hypervisor and a template, not a build environment.
 
-1. **The hardware and OS.** Apple silicon, macOS 27 or later, roughly 80 GiB
-   free after everything below — a template is a full macOS install, and each
-   concurrent run clones one.
+1. **The hardware and OS.** Apple silicon, macOS 27 or later. How much free
+   space depends on which guest: roughly 80 GiB for a macOS template, which is
+   a full macOS install, and roughly 20 GiB for a Fedora one. A runner can
+   hold both.
 2. **The Actions runner itself**, registered to the repository or organisation
    and running **as the same user that owns `~/.vivarium`**. On macOS
    `./svc.sh install` installs a LaunchAgent, which runs in that user's login
@@ -52,23 +53,32 @@ a hypervisor and a template, not a build environment.
    if it is headless). A runner running as a different user, or as a system
    daemon outside a login session, will not be able to create a virtual
    machine.
-3. **A macOS 27 IPSW**, downloaded by hand. There is no download fallback and
-   this is deliberate — see [Why a local IPSW is
-   mandatory](../README.md#why-a-local-ipsw-is-mandatory).
-4. **The template**, built once, from that IPSW, using a released `viv`:
+3. **The template**, built once, using a released `viv`:
 
    ```sh
    curl -fsSLO https://github.com/rxbynerd/vivarium/releases/download/v0.1.0/viv-v0.1.0-macos-arm64.zip
    ditto -x -k viv-v0.1.0-macos-arm64.zip .
+
+   # a Fedora guest — about half a minute, and nothing to download by hand
+   ./viv template create --os fedora
+
+   # a macOS guest — around ninety minutes, from an IPSW downloaded by hand
    ./viv preflight --ipsw ~/Downloads/UniversalMac_27.0_..._Restore.ipsw
    ./viv template create --ipsw ~/Downloads/UniversalMac_27.0_..._Restore.ipsw
    ```
 
-   Around two and a half minutes. Every later run clones this in seconds. The
-   action does **not** create a template: restoring macOS is a multi-minute,
-   80-GiB operation that a workflow should never perform by surprise, and the
-   IPSW cannot be fetched automatically anyway. A runner without a template
-   fails the job immediately, with that as the message.
+   Every later run clones this in a fraction of a second. A macOS template
+   needs a **local** IPSW, downloaded by hand: there is no download fallback
+   and that is deliberate — see [Why a local IPSW is
+   mandatory](../README.md#why-a-local-ipsw-is-mandatory).
+
+   The action does **not** create a template, for either guest. Building one
+   is a multi-minute operation that a workflow should never perform by
+   surprise. A runner without a template fails the job immediately, with that
+   as the message.
+
+   A runner with templates for both guests runs whichever is newest unless a
+   job says otherwise; `os: fedora` or `os: macos` picks.
 
 That `viv` was only needed for `template create` and can be deleted afterwards;
 the action fetches its own.
@@ -246,6 +256,7 @@ never exited; a timeout is not an exit status.
 | `working-directory` | `.` | Project directory, copied into the guest. Never mounted. |
 | `manifest` | `<working-directory>/viv.json` | Path to the manifest. |
 | `template` | newest in the home | Which template to clone. |
+| `os` | newest of any guest | `macos` or `fedora`: which guest to pick a template for. |
 | `timeout` | manifest's, else 600 | Seconds for the test command alone. |
 | `env` | — | `NAME=value` per line. Where secrets go. |
 | `run-id` | derived | Names the run and its directory. |
@@ -363,7 +374,7 @@ See [Security notes](../README.md#security-notes) for the rest.
 
 | Symptom | What it means |
 |---|---|
-| `No guest template in …/templates` | The runner was never prepared. Run `viv template create --ipsw <path>` on it once. |
+| `No guest template in …/templates` | The runner was never prepared. Run `viv template create --os fedora`, or `viv template create --ipsw <path>`, on it once. |
 | `missing the com.apple.security.virtualization entitlement` | A `viv` given via `viv-path` was built but not signed. `codesign -s - --entitlements Vivarium.entitlements -f <path>`. |
 | `used by local path, so there is no release to download` | `uses: ./`. Pass `viv-path` — see [When there is no release to match](#when-there-is-no-release-to-match). |
 | `pinned to "…", which is not a release tag` | The workflow pinned a branch or a SHA. Pin a tag, or pass `version`, or pass `viv-path`. |

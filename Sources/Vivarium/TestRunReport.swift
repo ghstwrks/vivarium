@@ -99,6 +99,8 @@ struct TestRunReport: Codable, Sendable {
 
     let templatePath: String
     let templateBuild: String?
+    let guestOS: GuestOS?
+    let guestOSVersion: String?
     let guestUsername: String
     let guestAddress: String?
     let guestWorkdir: String
@@ -147,7 +149,8 @@ struct TestRunReport: Codable, Sendable {
             ("command", command),
             ("code", codeDirectory),
             ("template", templatePath),
-            ("guest", guestAddress.map { "\(guestUsername)@\($0)" } ?? guestUsername)
+            ("guest", guestDescription
+                + (guestAddress.map { ", \(guestUsername)@\($0)" } ?? ", \(guestUsername)"))
         ]))
         lines.append("")
         lines.append(contentsOf: Self.alignedTimings(phases, total: totalSeconds))
@@ -183,6 +186,7 @@ struct TestRunReport: Codable, Sendable {
             ("code", "`\(codeDirectory)`"),
             ("template", "`\(templatePath)`")
         ]
+        rows.append(("guest os", guestDescription))
         if let templateBuild { rows.append(("guest build", templateBuild)) }
         if let projectName { rows.append(("project", projectName)) }
         if let manifestPath { rows.append(("manifest", "`\(manifestPath)`")) }
@@ -233,6 +237,11 @@ struct TestRunReport: Codable, Sendable {
         lines.append(dispositionSentence)
         lines.append("")
         return lines.joined(separator: "\n")
+    }
+
+    private var guestDescription: String {
+        let name = (guestOS ?? .assumedForUnlabelledTemplates).displayName
+        return guestOSVersion.map { "\(name) \($0)" } ?? name
     }
 
     private var statusPhrase: String {

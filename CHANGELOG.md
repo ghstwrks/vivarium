@@ -21,6 +21,86 @@ This project does not yet follow Semantic Versioning strictly — see
   Now they are in the reports that are archived, where a boot or a staging step
   that has been getting slower can be found by comparing runs rather than by
   happening to watch one.
+- **Fedora guests.** `viv template create --os fedora` downloads the disk
+  image Fedora publishes, checks it against a SHA-256 pinned in Vivarium's
+  own source, decompresses it, and grows it to 64 GiB — about half a minute,
+  with nothing to download by hand and no `xz` or `qemu-img` needed on the
+  host. `viv run` then boots a clone of it in around 21 seconds end to end,
+  of which ~19 is boot-to-SSH. Everything else works as it always has: the
+  code is copied rather than mounted, the test command's streams are
+  captured separately, artifacts are harvested through the share, and a
+  passing run deletes its own bundle.
+- **A seam for the guest's operating system.** `GuestOS` is the name the
+  outside world uses — `--os fedora`, the `os` field in a template's
+  `template.json`, a column in `viv template list`, a field in
+  `report.json` — and `GuestPlatform` is everything behind it: which files a
+  template carries, whether a run inherits its MAC address, how a credential
+  comes to exist, what the guest is asked to run, which shutdown mechanism
+  goes first, what the host must be, and which acceptance criteria apply. One
+  conformance per operating system; `Orchestrator`'s pipeline asks rather
+  than assumes. A distribution that publishes a cloud image should be a case
+  in `GuestOS` and an entry in `LinuxImageCatalogue`, and no new platform
+  code.
+- `--os <name>` on `viv run`, `viv selftest`, and `viv preflight`, to pick
+  among the templates in a home that holds more than one guest. A run
+  otherwise takes the newest template of any guest and says which it picked;
+  the guest itself always comes from the template, never from a flag.
+- `--command <script>` on `viv run`: the same thing as the words after `--`,
+  for a caller holding the command as one string. The GitHub Action uses it,
+  which is also what lets the action's `command:` input work on a Fedora
+  guest — it used to wrap the command in a `zsh -c` that a Fedora guest does
+  not have.
+- `--image`, `--image-url` with `--image-sha256`, and `--disk-size` on
+  `viv template create`, for importing a disk image Vivarium does not have
+  pinned, or giving the guest more room than 64 GiB. `--disk-size` applies to
+  a macOS restore too.
+- An `os` input on the GitHub Action, and a serial console recorded to
+  `logs/console.log` for a guest that has one — the only account of a Linux
+  guest that fails before sshd, and where cloud-init's own output goes.
+- A test target: the guest scripts, the template record's compatibility with
+  the one 0.1 wrote, the cloud-init documents, and the xz decoder. `just
+  test`, and a step in the dogfood workflow. `viv selftest` remains the
+  integration test, because it is the half that needs a hypervisor.
+
+### Changed
+
+- `template.json` gained `os`, `osVersion`, `osBuild`, `source`,
+  `sourceSHA256`, and `systemDiskSHA256`, and `platformIdentitySHA256` became
+  optional. **Templates created by 0.1 are read unchanged** — the older
+  `ipswBuild`, `ipswVersion`, and `ipswSHA256` are still accepted, and a
+  macOS template written now carries both sets of names so that a 0.1 binary
+  can still read it. A restore is ninety minutes of somebody's afternoon.
+- New templates are named `<os>-<build>.bundle` rather than `<build>.bundle`.
+  Existing ones keep their names and work as they always did: what a template
+  is comes from its `template.json`, never from its directory name.
+- `viv selftest` on a guest whose platform does not claim the artifact-disk
+  proof reports those three criteria as **not asserted**, with the reason,
+  rather than as passed — and refuses the macOS-only flags that go with them
+  (`--artifact-volume-name`, `--artifact-read-only`, `--disable-remote-login`,
+  `--validate-system-disk`) instead of ignoring them.
+- `report.json` from `viv run` gained `guestOS` and `guestOSVersion`;
+  `run.json` gained `guestOS` and renamed the fields that were named for an
+  IPSW. The selftest's own record renamed
+  `restoreImageVerifiedAsMacOS27OrLater` to `guestImageAccepted` and
+  `installSucceeded` to `guestImagePrepared`, because a Fedora template is
+  imported rather than restored and neither old name was true of it.
+
+### Security
+
+- A Linux guest authenticates by SSH key rather than by password. cloud-init
+  reads its instructions from a seed image that sits in the run's bundle for
+  as long as the guest lives, so a password in it would be a password written
+  to disk — which the macOS path goes to some trouble never to do. The seed
+  carries the public half of an ed25519 pair generated for the run; the
+  private half is `id_ed25519` in the same bundle, mode 0600, and goes when
+  the bundle does. The guest keeps its distribution's own refusal of password
+  logins over SSH rather than having Vivarium turn that off.
+- Published images are pinned by digest. A hostile mirror serving something
+  else through Fedora's download redirector gets refused before anything is
+  unpacked, and `--image-url` requires `--image-sha256` for the same reason.
+- macOS's xz decoder stops at the end of the first stream, so a file holding
+  several concatenated would decompress to a silently truncated disk image.
+  Anything left unread after the stream ends is refused rather than ignored.
 
 ## [0.1.0] - 2026-08-10
 

@@ -24,6 +24,9 @@ struct VMBundlePaths: Sendable {
     var machineIdentifier: URL { root.appendingPathComponent("MachineIdentifier") }
     var macAddress: URL { root.appendingPathComponent("MACAddress") }
     var artifactDisk: URL { root.appendingPathComponent("Artifact.raw") }
+    var efiVariableStore: URL { root.appendingPathComponent("EFIVariableStore") }
+    var seedImage: URL { root.appendingPathComponent("Seed.iso") }
+    var sshPrivateKey: URL { root.appendingPathComponent("id_ed25519") }
     var knownHosts: URL { root.appendingPathComponent("ssh_known_hosts") }
     var runManifest: URL { root.appendingPathComponent("run.json") }
     var sshResult: URL { root.appendingPathComponent("ssh-result.json") }
@@ -32,12 +35,13 @@ struct VMBundlePaths: Sendable {
     var logsDirectory: URL { root.appendingPathComponent("logs") }
     var runLog: URL { logsDirectory.appendingPathComponent("run.log") }
     var installLog: URL { logsDirectory.appendingPathComponent("install.log") }
+    var consoleLog: URL { logsDirectory.appendingPathComponent("console.log") }
     var stateLog: URL { logsDirectory.appendingPathComponent("state.jsonl") }
     var diagnosticsDirectory: URL { logsDirectory.appendingPathComponent("diagnostics") }
 
     /// The marker the guest writes into the VirtioFS share. Written by the
     /// guest, read by the host: this is the whole point of the share.
-    var sharedMarker: URL { sharedDirectory.appendingPathComponent("viv-result.txt") }
+    var sharedMarker: URL { sharedDirectory.appendingPathComponent(GuestScripts.markerFilename) }
 
     init(root: URL, sharedDirectory: URL? = nil) {
         let root = root.standardizedFileURL
@@ -46,12 +50,8 @@ struct VMBundlePaths: Sendable {
             .standardizedFileURL
     }
 
-    /// The files that together constitute the VM's platform identity. They are
-    /// cloned as a set, because a hardware model paired with someone else's
-    /// auxiliary storage does not boot.
-    static let platformIdentityFilenames = [
-        "AuxiliaryStorage", "Disk.img", "HardwareModel", "MachineIdentifier", "MACAddress"
-    ]
+    static let systemDiskFilename = "Disk.img"
+
 }
 
 /// Paths inside a pristine post-restore template bundle.
@@ -160,8 +160,6 @@ struct RunLayout: Sendable {
 
     var bundleRoot: URL { root.appendingPathComponent("VM.bundle") }
 
-    /// The VirtioFS share, which the guest sees at
-    /// `AcceptanceScript.expectedSharePath`.
     var shared: URL { root.appendingPathComponent("Shared") }
     /// The staged copy of the user's code. The original directory is never
     /// mounted into a guest and never written to.
@@ -186,7 +184,7 @@ struct RunLayout: Sendable {
 enum DefaultLocations {
     static var templates: URL { VivariumHome.templates }
 
-    static func template(ipswBuild: String) -> URL {
-        templates.appendingPathComponent("\(ipswBuild).bundle")
+    static func template(os: GuestOS, build: String) -> URL {
+        templates.appendingPathComponent("\(os.rawValue)-\(build).bundle")
     }
 }
