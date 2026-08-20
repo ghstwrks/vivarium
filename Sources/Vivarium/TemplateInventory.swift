@@ -61,11 +61,6 @@ enum TemplateInventory {
         }
     }
 
-    /// The template a command should use when the operator named none.
-    ///
-    /// Narrowed to one guest where the caller said which, so that a home
-    /// holding both a macOS and a Fedora template answers `--os fedora` with a
-    /// Fedora one rather than with whichever was built most recently.
     static func newest(
         in directory: URL = VivariumHome.templates,
         os: GuestOS? = nil

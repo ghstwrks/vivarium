@@ -26,11 +26,6 @@ enum GuestProvisioner {
     /// it as a default.
     nonisolated static let defaultLogsInAutomatically = true
 
-    /// Builds the first-boot provisioning options.
-    ///
-    /// - Parameter enablesRemoteLogin: false only for the selftest's negative
-    ///   test, which provisions an account but no way to reach it, so the
-    ///   expected failure lands at the SSH readiness gate rather than at boot.
     static func makeStartOptions(
         fullName: String,
         username: String,
@@ -73,13 +68,6 @@ enum GuestProvisioner {
         return options
     }
 
-    /// Starts the VM, with provisioning options where the guest needs them.
-    ///
-    /// `options` is `nil` for a guest that is provisioned by something already
-    /// in its configuration — a Linux guest reads a seed image rather than
-    /// being told anything at `start` — and that is an ordinary start rather
-    /// than a start with empty options, because the framework treats the two
-    /// differently.
     static func start(
         virtualMachine: VZVirtualMachine,
         options: VZVirtualMachineStartOptions?

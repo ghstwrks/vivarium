@@ -2,18 +2,10 @@ import Compression
 import CryptoKit
 import Foundation
 
-/// How a published disk image arrived.
 enum DiskImageCompression: Sendable {
     case none
     case xz
 
-    /// Recognises the container from its first bytes rather than from the file
-    /// name.
-    ///
-    /// A name is what somebody typed; the magic is what the file is. `--image`
-    /// accepts a path from anywhere, and being told "this is not an xz stream"
-    /// is more useful than being told nothing because the extension was
-    /// missing.
     static func detect(at url: URL, stage: VivStage) throws -> DiskImageCompression {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             throw VivError(stage, "Cannot open \(url.path).")
@@ -24,26 +16,12 @@ enum DiskImageCompression: Sendable {
     }
 }
 
-/// Turns a published disk image into a raw one Virtualization can attach.
-///
-/// Fedora publishes its aarch64 disk images as a single xz stream, and the
-/// Virtualization framework attaches raw images and ASIF ones and nothing else,
-/// so something has to decompress. That something is the `Compression`
-/// framework, which macOS has shipped since 10.11 and whose `COMPRESSION_LZMA`
-/// reads the xz container — so the whole dependency is a system framework and
-/// an import, rather than a Homebrew `xz` the operator has to have installed
-/// and Vivarium has to find.
-///
-/// Streaming, because the decompressed image is several gigabytes and this
-/// process is about to be sharing a machine with a virtual one.
 enum DiskImageDecompressor {
-    /// What came out.
     struct Result: Sendable {
         let byteCount: Int64
         let sha256: String
     }
 
-    /// Writes the decompressed image at `source` to `destination`.
     static func decompress(
         from source: URL,
         to destination: URL,
@@ -143,12 +121,6 @@ enum DiskImageDecompressor {
             case COMPRESSION_STATUS_OK:
                 continue
             case COMPRESSION_STATUS_END:
-                // The decoder stops at the end of the first xz stream. A file
-                // holding several of them concatenated — which some parallel
-                // compressors produce — would decompress to a prefix of itself
-                // and look like a perfectly good, silently truncated disk. That
-                // is the one failure this whole step must not have, so anything
-                // left over is refused rather than ignored.
                 guard stream.src_size == 0, isAtEnd(input) else {
                     throw VivError(
                         stage,
@@ -169,7 +141,6 @@ enum DiskImageDecompressor {
         }
     }
 
-    /// Whether a descriptor has nothing left to read.
     private static func isAtEnd(_ descriptor: Int32) -> Bool {
         var byte: UInt8 = 0
         return read(descriptor, &byte, 1) == 0

@@ -3,9 +3,6 @@ import Testing
 
 @testable import Vivarium
 
-/// A template is the most expensive thing Vivarium makes — ninety minutes of
-/// somebody's afternoon, for macOS — so what it can and cannot read is worth
-/// asserting rather than assuming.
 @Suite("Template records")
 struct TemplateManifestTests {
     private func decode(_ json: String) throws -> TemplateManifest {
@@ -23,7 +20,6 @@ struct TemplateManifestTests {
         )
     }
 
-    /// Exactly what 0.1 wrote: no `os`, and three fields named for an IPSW.
     @Test("a 0.1 template still reads, as macOS")
     func legacyManifest() throws {
         let manifest = try decode("""
@@ -44,8 +40,6 @@ struct TemplateManifestTests {
         #expect(manifest.systemDiskByteCount == 27_302_821_888)
     }
 
-    /// The other direction: a macOS template written here carries 0.1's names as
-    /// well as its own, so downgrading does not cost a restore.
     @Test("a macOS template written now is still readable by 0.1")
     func macOSManifestMirrorsLegacyKeys() throws {
         let fields = try encode(
@@ -68,7 +62,6 @@ struct TemplateManifestTests {
         #expect(fields["os"] as? String == "macos")
     }
 
-    /// A Fedora template does not pretend to have come from an IPSW.
     @Test("a Linux template carries no IPSW fields")
     func linuxManifestOmitsLegacyKeys() throws {
         let fields = try encode(
@@ -92,8 +85,6 @@ struct TemplateManifestTests {
         #expect(fields["systemDiskSHA256"] as? String == "def456")
     }
 
-    /// Round-tripping is what `viv run` does every time it reads a template it
-    /// wrote.
     @Test("what is written is what is read", arguments: [GuestOS.macOS, .fedora])
     func roundTrip(os: GuestOS) throws {
         let original = TemplateManifest(

@@ -115,13 +115,6 @@ struct Viv: AsyncParsableCommand {
     )
 }
 
-// MARK: - Shared argument types
-
-/// `--os` takes the operating system's own lowercase name.
-///
-/// The conformance is here rather than on the type, so that `GuestOS` — which
-/// is written into every template and every report — does not depend on the
-/// argument parser.
 extension GuestOS: ExpressibleByArgument {}
 
 /// A filesystem path.
@@ -415,7 +408,6 @@ struct TemplateCreateCommand: AsyncParsableCommand {
         }
     }
 
-    /// Restore a macOS guest and snapshot it.
     private func createMacOSTemplate() async throws {
         guard image == nil, imageURL == nil, imageSHA256 == nil else {
             throw ValidationError(
@@ -445,11 +437,6 @@ struct TemplateCreateCommand: AsyncParsableCommand {
         }
     }
 
-    /// Import a published Linux disk image as a template.
-    ///
-    /// No orchestrator and no virtual machine: nothing here boots anything, so
-    /// there is no run to record a failure against and no guest to stop. What
-    /// it produces is the same template every other command consumes.
     private func createLinuxTemplate() async throws {
         guard ipsw == nil else {
             throw ValidationError("--ipsw is a macOS restore image; --os \(os.rawValue) has none.")
@@ -506,8 +493,6 @@ struct TemplateCreateCommand: AsyncParsableCommand {
                 source: source,
                 template: TemplatePaths(root: templateRoot),
                 diskSizeGiB: diskSize ?? LinuxTemplateBuilder.defaultDiskSizeGiB,
-                // The template's own parent, so a download lands on the volume
-                // the template will live on rather than crossing one on the way.
                 workingDirectory: templateRoot.deletingLastPathComponent()
             )
         )
@@ -948,12 +933,6 @@ struct RunCommand: AsyncParsableCommand {
         return runID
     }
 
-    /// Chooses which template to clone.
-    ///
-    /// A named one wins outright. Otherwise the newest is used, narrowed to one
-    /// guest where `--os` said so — and the choice is logged either way,
-    /// because "the newest template" stopped being an obvious answer the moment
-    /// a home could hold two operating systems.
     static func resolveTemplate(named: URL?, os: GuestOS?) async throws -> URL {
         if let named { return named }
         if let newest = await TemplateInventory.newest(os: os) {
@@ -1156,10 +1135,6 @@ struct SelftestCommand: AsyncParsableCommand {
             warmPath = true
         }
 
-        // Which guest this is decides which of the flags below mean anything,
-        // and only the template knows. A flag that would be silently ignored is
-        // refused instead: a negative test that quietly stops being a negative
-        // test is exactly the kind of green nobody should trust.
         let guestOS = warmPath
             ? try TemplateManager.readManifest(of: TemplatePaths(root: options.fromTemplate!)).os
             : GuestOS.macOS
@@ -1177,7 +1152,6 @@ struct SelftestCommand: AsyncParsableCommand {
         }
     }
 
-    /// Refuses the flags that only mean something to a macOS guest.
     private func refuseFlagsThatDoNotApply(to guestOS: GuestOS) throws {
         guard !guestOS.platform.assertsArtifactDisk else { return }
 

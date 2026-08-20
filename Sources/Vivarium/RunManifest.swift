@@ -54,24 +54,16 @@ struct RunManifest: Codable, Sendable {
     var hostBuild: String
     var hostArchitecture: String
 
-    /// What the guest was built from: a restore image on disk, or the disk
-    /// image a template was imported from. Optional throughout, because a run
-    /// started from a template never sees the source at all.
     var sourcePath: String?
     var sourceSHA256: String?
     var sourceByteCount: Int64?
-    /// The guest's own version and build, however it came to exist.
     var guestOSVersion: String?
     var guestOSBuild: String?
 
-    /// Which operating system the guest runs. Absent in a bundle written
-    /// before Vivarium ran more than one, which were all macOS.
     var guestOS: GuestOS?
 
     var username: String
     var fullName: String
-    /// Where the credential lives, for a multi-command workflow. The credential
-    /// itself is never stored here.
     var credentialStorage: String
 
     var macAddress: String
@@ -90,8 +82,6 @@ struct RunManifest: Codable, Sendable {
     var finishedAt: Date?
     var outcome: String?
 
-    /// The guest's operating system, defaulting a bundle that predates the
-    /// field to the only thing it could have been.
     var os: GuestOS { guestOS ?? .assumedForUnlabelledTemplates }
 
     static func create(
@@ -143,46 +133,21 @@ struct RunManifest: Codable, Sendable {
     }
 }
 
-/// The record written beside a template bundle.
-///
-/// The fields are named for what they hold rather than for where macOS gets it
-/// from, because a Fedora template has no IPSW. Templates written by 0.1 used
-/// the older names and are still read: a template is the most expensive thing
-/// Vivarium makes, and refusing one over a key name would be an unkind way to
-/// announce a new feature.
 struct TemplateManifest: Codable, Sendable {
-    /// Which operating system this template holds.
     let os: GuestOS
-    /// The guest's own version, as it names it: `27.0.0`, or `44`.
     let osVersion: String
-    /// The build this template was made from: an IPSW build, or a Fedora
-    /// compose.
     let osBuild: String
-    /// A digest of what it was built from — the restore image, or the
-    /// downloaded disk image, as it arrived.
     let sourceSHA256: String?
-    /// Where it came from: a path on this machine, or a URL.
     let source: String?
     let createdAt: Date
-    /// A digest over the small platform-identity files, for a guest that has
-    /// them. The system disk is deliberately excluded: it is a sparse image
-    /// whose full hash would cost minutes per template check, and the identity
-    /// files are what determine whether a template is internally consistent.
-    /// `nil` for a guest whose template is a system disk and nothing else.
     let platformIdentitySHA256: String?
     let systemDiskByteCount: Int64
-    /// A digest of the system disk as the template was written, recorded
-    /// because it can be: an imported image is hashed on its way through
-    /// decompression, where the bytes are passing anyway. Never checked on the
-    /// hot path — hashing ten gigabytes per run would cost more than it caught.
     let systemDiskSHA256: String?
     let createdByRunID: String?
 
     enum CodingKeys: String, CodingKey {
         case os, osVersion, osBuild, sourceSHA256, source, createdAt
         case platformIdentitySHA256, systemDiskByteCount, systemDiskSHA256, createdByRunID
-        /// 0.1's names for three of the above. Read always; written only for a
-        /// macOS template, so that one built here stays readable by 0.1.
         case ipswBuild, ipswVersion, ipswSHA256
     }
 
@@ -243,9 +208,6 @@ struct TemplateManifest: Codable, Sendable {
         try container.encodeIfPresent(systemDiskSHA256, forKey: .systemDiskSHA256)
         try container.encodeIfPresent(createdByRunID, forKey: .createdByRunID)
 
-        // Mirrored under 0.1's names so that a macOS template created here can
-        // still be read by a 0.1 binary. A restore is ninety minutes of
-        // somebody's afternoon, which is a lot to lose to a rename.
         if os == .macOS {
             try container.encode(osBuild, forKey: .ipswBuild)
             try container.encode(osVersion, forKey: .ipswVersion)

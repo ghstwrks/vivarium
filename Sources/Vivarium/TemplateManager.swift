@@ -1,26 +1,6 @@
 import Foundation
 
-/// Clones pristine guest images so that runs can be cheap and identical.
-///
-/// The reason differs by guest and the mechanism does not. macOS evaluates
-/// `VZMacGuestProvisioningOptions` only on the first boot after restore, and
-/// the framework cannot use them to reconfigure a guest it has already
-/// provisioned, so every failed provisioning experiment would otherwise consume
-/// a ninety-minute restore. A Linux guest imported from a published disk image
-/// costs minutes rather than an afternoon, but booting the imported image
-/// directly would leave every run's state — its host keys, its logs, its
-/// package cache, whatever the last test wrote — in the image the next run
-/// starts from, which is the same problem wearing different clothes.
-///
-/// The answer to both is the same and is the only invariant this type has: a
-/// template is immutable and is never booted in place. A run clones it, boots
-/// the clone, and throws the clone away.
 enum TemplateManager {
-    /// Snapshots a bundle as a template.
-    ///
-    /// For macOS this must be called after installation and strictly *before*
-    /// the first provisioned start: booting first burns the one provisionable
-    /// boot the template exists to preserve.
     static func snapshot(
         from bundle: VMBundlePaths,
         to template: TemplatePaths,
@@ -48,10 +28,6 @@ enum TemplateManager {
             )
         }
 
-        // Only what the platform says a guest needs to exist. Artifact.raw,
-        // Shared/, the seed image, the EFI variable store, and every result
-        // file are per-run and are recreated by the run that needs them;
-        // copying them would make the template a stale run.
         for filename in platform.templateFilenames {
             let source = bundle.root.appendingPathComponent(filename)
             let destination = template.root.appendingPathComponent(filename)
@@ -77,11 +53,6 @@ enum TemplateManager {
         log.info("Template snapshot written to \(template.root.path).")
     }
 
-    /// Writes a template's `template.json`.
-    ///
-    /// Separate from `snapshot` because a template does not have to come from a
-    /// bundle: an imported disk image is written into the template directory
-    /// directly, and then described by the same record.
     static func writeManifest(
         to template: TemplatePaths,
         platform: any GuestPlatform,
@@ -111,12 +82,6 @@ enum TemplateManager {
         try JSONCoding.write(manifest, to: template.manifest)
     }
 
-    /// Reads a template's record without touching anything else in it.
-    ///
-    /// This is how a run learns which operating system it is about to start:
-    /// the template says so, and every platform-specific decision after this
-    /// point follows from the answer rather than from a flag the caller
-    /// remembered to pass.
     static func readManifest(of template: TemplatePaths) throws -> TemplateManifest {
         guard FileManager.default.fileExists(atPath: template.manifest.path) else {
             throw VivError(
@@ -130,9 +95,6 @@ enum TemplateManager {
         )
     }
 
-    /// Clones a template into a fresh run bundle.
-    ///
-    /// The template is treated as immutable and is never booted in place.
     static func materialize(
         template: TemplatePaths,
         into bundle: VMBundlePaths,
@@ -183,18 +145,6 @@ enum TemplateManager {
         return manifest
     }
 
-    /// Copies with APFS cloning.
-    ///
-    /// `cp -c` requests `clonefile`, which makes a large sparse system disk
-    /// cost seconds and near-zero space instead of a full duplication. It is
-    /// requested explicitly rather than relying on `FileManager` doing it,
-    /// because a silent fall back to a byte copy would turn a "seconds" step
-    /// into a "minutes and tens of gigabytes" step without saying so.
-    ///
-    /// The fall back is still there, and is the reason nothing further up
-    /// depends on APFS: on a filesystem with no `clonefile` a template still
-    /// materialises, only slower. That is what keeps a run's isolation a
-    /// property of the design rather than of the volume it happens to be on.
     static func clone(from source: URL, to destination: URL, stage: VivStage) async throws {
         let result = try await ProcessRunner.run(
             "/bin/cp", ["-c", "-R", source.path, destination.path],

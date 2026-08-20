@@ -96,22 +96,9 @@ enum Timeouts {
 /// The machine-readable outcome of a run.
 struct RunReport: Codable, Sendable {
     var runID: String
-    /// Which operating system the guest ran. Absent from a report written
-    /// before Vivarium ran more than one.
     var guestOS: GuestOS?
-    /// Whether this guest's platform claims the detached-storage proof. When
-    /// it does not, the three artifact-disk criteria below are not assertions
-    /// that passed — they are assertions that were never made, and the summary
-    /// says so rather than counting them.
     var artifactDiskAsserted: Bool?
-    /// Whether the image this guest was built from cleared whatever gate its
-    /// operating system has. For macOS that is the version check — a guest
-    /// older than 27 ignores provisioning options entirely — and for a guest
-    /// with no such API there is no gate to clear.
     var guestImageAccepted: Bool
-    /// Whether the guest's system disk exists and came from that image:
-    /// restored, for macOS, and imported for a guest whose distribution did
-    /// the installing.
     var guestImagePrepared: Bool
     var firstBootProvisioningSucceeded: Bool
     var sshAuthenticationSucceeded: Bool
@@ -134,8 +121,6 @@ struct RunReport: Codable, Sendable {
     /// timeline is complete.
     var states: [StateTiming] = []
 
-    /// Whether the artifact-disk criteria were asserted at all. Defaults to
-    /// true for a report that predates the field, when they always were.
     var assertedArtifactDisk: Bool { artifactDiskAsserted ?? true }
 
     var allAcceptanceCriteriaPassed: Bool {
@@ -184,8 +169,6 @@ struct RunReport: Codable, Sendable {
                 line(artifactEjected, "artifact disk ejected")
             ])
         } else {
-            // Named rather than dropped. A criterion that quietly stops being
-            // printed is a criterion nobody notices has stopped being checked.
             lines.append(
                 "n/a   artifact disk attached, matched, and ejected — not asserted for a "
                     + "\((guestOS ?? .macOS).displayName) guest: the detached-storage proof is a "
@@ -230,9 +213,6 @@ struct RunReport: Codable, Sendable {
 }
 
 struct OrchestratorOptions: Sendable {
-    /// Which operating system the guest runs, where the run does not learn it
-    /// from a template. A run started from a template takes the template's
-    /// answer instead, because the template is the thing that knows.
     var guestOS: GuestOS = .macOS
     var ipsw: URL?
     var bundle: URL?
@@ -246,7 +226,6 @@ struct OrchestratorOptions: Sendable {
     var skipIPSWDigest = false
     var validateSystemDisk = false
     var queryLatestSupported = false
-    /// The system disk's size, in GiB, for a template being created.
     var diskSizeGiB: Int?
     var logsInAutomatically = GuestProvisioner.defaultLogsInAutomatically
     var username = "vivadmin"
@@ -277,9 +256,6 @@ final class Orchestrator {
     static let streamTailLimit = 256 * 1024
 
     private let options: OrchestratorOptions
-    /// Everything about this run that depends on which operating system the
-    /// guest is. Set from the options, then replaced by the template's own
-    /// answer as soon as there is a template to ask.
     private var platform: any GuestPlatform
     private var state: VivState = .idle
     private var stateLogURL: URL?
@@ -550,10 +526,6 @@ final class Orchestrator {
     private func prepareBundleFromTemplate(_ templateRoot: URL) async throws {
         transition(to: .preparingBundle)
 
-        // The template is read before anything is created, because it is what
-        // says which operating system this run is of — and every decision from
-        // here on, starting with what kind of credential to generate, follows
-        // from the answer.
         let template = TemplatePaths(root: templateRoot)
         let templateManifest = try TemplateManager.readManifest(of: template)
         platform = templateManifest.os.platform
@@ -583,11 +555,6 @@ final class Orchestrator {
             into: paths,
             expectedBuild: expectedBuild
         )
-        // Where the template carries a MAC address it comes with it, replacing
-        // the one just generated: a macOS platform identity has to stay
-        // internally consistent. Where it does not, the freshly generated one
-        // stands, which is what keeps two Linux guests distinguishable in the
-        // host's ARP cache.
         if platform.templateSuppliesMACAddress {
             let macAddress = try VMConfigurationFactory.loadMACAddress(
                 paths: paths, stage: .templateSnapshot
@@ -599,12 +566,6 @@ final class Orchestrator {
         manifest.guestOSVersion = templateManifest.osVersion
         manifest.cpuCount = VMConfigurationFactory.computeCPUCount()
         manifest.memorySizeBytes = VMConfigurationFactory.computeMemorySize()
-        // The version gate was enforced when the template was created, and
-        // `materialize` has just checked this clone against that build. Leaving
-        // the criterion at its `false` default would fail an otherwise perfect
-        // run for a check that did happen, only in an earlier process. A guest
-        // that has no such gate — Linux has no provisioning API to be too old
-        // for — satisfies it by having nothing to satisfy.
         report.guestImageAccepted = platform.os == .macOS
             ? RestoreImageManager.satisfiesGuestVersionGate(templateManifest.osVersion)
             : true
@@ -635,9 +596,6 @@ final class Orchestrator {
             : true
         report.guestImagePrepared = true
 
-        // A credential belongs to the invocation that generated it, so a bundle
-        // adopted from a previous one cannot be logged into. Saying that
-        // outright is better than presenting an empty password as one.
         credentials = GuestCredentials(
             fullName: manifest.fullName,
             username: manifest.username,
@@ -710,9 +668,6 @@ final class Orchestrator {
                     + "invocation that created it. Use `all`, or `provision --from-template`."
             )
         }
-        // Whatever this guest needs written into the bundle before it starts —
-        // a cloud-init seed, for a guest that provisions itself from one — has
-        // to exist before the configuration that attaches it is built.
         try await platform.prepareRun(makeProvisioningRequest())
         try await createAndStartRunVM()
     }
@@ -1918,13 +1873,6 @@ final class Orchestrator {
         log.info("Guest diagnostics written to \(paths.diagnosticsDirectory.path)/guest-state.txt.")
     }
 
-    /// Points at the guest's console log, where there is one with anything in
-    /// it.
-    ///
-    /// A Linux guest that never reached sshd has left nothing over SSH to
-    /// collect, and the console is the only account of why. Naming the file in
-    /// the failure is the difference between "the guest never answered" and a
-    /// person being able to read what it said instead.
     private func consoleLogHint() -> [String] {
         guard let paths,
               BundleManager.fileSize(of: paths.consoleLog) > 0 else { return [] }

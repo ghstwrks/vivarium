@@ -24,17 +24,8 @@ struct VMBundlePaths: Sendable {
     var machineIdentifier: URL { root.appendingPathComponent("MachineIdentifier") }
     var macAddress: URL { root.appendingPathComponent("MACAddress") }
     var artifactDisk: URL { root.appendingPathComponent("Artifact.raw") }
-    /// EFI's own non-volatile storage, for a guest whose firmware keeps boot
-    /// entries in it. Created fresh with the run rather than cloned from the
-    /// template: the firmware writes to it, and a variable store carried from
-    /// one run into the next is state leaking between guests that are supposed
-    /// to be identical.
     var efiVariableStore: URL { root.appendingPathComponent("EFIVariableStore") }
-    /// The provisioning image a guest reads its first-boot configuration from.
-    /// Per-run, because what it says is per-run.
     var seedImage: URL { root.appendingPathComponent("Seed.iso") }
-    /// The private half of the key pair a guest authenticates the host by,
-    /// where the guest authenticates by key rather than by password.
     var sshPrivateKey: URL { root.appendingPathComponent("id_ed25519") }
     var knownHosts: URL { root.appendingPathComponent("ssh_known_hosts") }
     var runManifest: URL { root.appendingPathComponent("run.json") }
@@ -44,8 +35,6 @@ struct VMBundlePaths: Sendable {
     var logsDirectory: URL { root.appendingPathComponent("logs") }
     var runLog: URL { logsDirectory.appendingPathComponent("run.log") }
     var installLog: URL { logsDirectory.appendingPathComponent("install.log") }
-    /// Whatever the guest wrote to its serial console. The only window onto a
-    /// guest that failed before it could answer SSH.
     var consoleLog: URL { logsDirectory.appendingPathComponent("console.log") }
     var stateLog: URL { logsDirectory.appendingPathComponent("state.jsonl") }
     var diagnosticsDirectory: URL { logsDirectory.appendingPathComponent("diagnostics") }
@@ -61,9 +50,6 @@ struct VMBundlePaths: Sendable {
             .standardizedFileURL
     }
 
-    /// The system disk's filename, which every guest has and which is the one
-    /// name a template is guaranteed to carry. Which *other* files travel with
-    /// it is the platform's answer, not this type's.
     static let systemDiskFilename = "Disk.img"
 
 }
@@ -174,8 +160,6 @@ struct RunLayout: Sendable {
 
     var bundleRoot: URL { root.appendingPathComponent("VM.bundle") }
 
-    /// The VirtioFS share, which the guest sees at
-    /// the guest's own share path (see `GuestScripts.sharePath`).
     var shared: URL { root.appendingPathComponent("Shared") }
     /// The staged copy of the user's code. The original directory is never
     /// mounted into a guest and never written to.
@@ -200,13 +184,6 @@ struct RunLayout: Sendable {
 enum DefaultLocations {
     static var templates: URL { VivariumHome.templates }
 
-    /// Where a template goes when the operator did not say.
-    ///
-    /// Named for the guest and the build it holds, because a directory listing
-    /// is the first thing anyone looks at and `26A5388g.bundle` alone stopped
-    /// being self-explanatory the moment a second operating system existed.
-    /// Templates created before this are found and used as they always were:
-    /// what a template is comes from its `template.json`, never from its name.
     static func template(os: GuestOS, build: String) -> URL {
         templates.appendingPathComponent("\(os.rawValue)-\(build).bundle")
     }

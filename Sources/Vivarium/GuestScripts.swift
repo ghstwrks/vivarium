@@ -1,98 +1,37 @@
 import Foundation
 
-/// The shell a guest's scripts are written in.
-///
-/// Only two things about a shell reach these scripts: how globbing is turned
-/// on, and how a variable holding a pattern is expanded as one. Everything else
-/// they use is POSIX, so a third dialect would be a third case here rather than
-/// a third copy of the scripts.
 enum ShellDialect: String, Sendable {
     case zsh
     case bash
 }
 
-/// Every command Vivarium asks a guest to run, in that guest's own shell.
-///
-/// One value per guest operating system, supplied by its `GuestPlatform`. The
-/// scripts themselves are written once: the guests differ in where the share is
-/// mounted, which shell interprets the script, how that shell is asked to glob,
-/// and how the machine is asked to shut itself down — and in nothing else, which
-/// is why they are parameters rather than separate scripts. Every absolute path
-/// below (`/bin/cp`, `/usr/bin/id`, `/bin/mkdir`) exists at that path on both a
-/// macOS guest and a usr-merged Linux one.
 struct GuestScripts: Sendable {
     let dialect: ShellDialect
-    /// The shell every remote script is piped into.
     let shellExecutable: String
-    /// Where the VirtioFS share appears in the guest.
-    ///
-    /// On macOS this is where the automount tag puts it; on Linux it is where
-    /// the guest was told to mount it during provisioning. Either way the
-    /// scripts assert it is really there rather than assuming it.
     let sharePath: String
-    /// A command that must exit zero and print the account's short name and
-    /// nothing else.
-    ///
-    /// Run before anything is asserted, so that "the guest is not ready yet"
-    /// stays distinguishable from a deliberate non-zero exit later.
     let readinessCommand: String
-    /// A graceful shutdown requested from inside the guest.
     let shutdownCommand: String
-    /// Whether `shutdownCommand` expects the account password on stdin, as
-    /// `sudo -S` does. False for a guest whose account escalates without one.
     let shutdownWantsPasswordOnStdin: Bool
-    /// What to collect from a guest whose run has gone wrong.
     let diagnosticsScript: String
 
-    // MARK: - Fixed vocabulary
-
-    /// Where the code is copied to before the test runs.
-    ///
-    /// Guest-local rather than the share itself: builds and test runners
-    /// hardlink, mmap, chmod, and create sockets, and doing that on a VirtioFS
-    /// mount is a well-known source of failures that have nothing to do with
-    /// the code under test.
     static let workdirShellExpression = "$HOME/vivwork"
 
-    /// The workdir as it reads in a report, where `$HOME` means nothing.
     static let workdirDisplayPath = "~/vivwork"
 
-    /// The file the guest writes its marker into, on every surface the run
-    /// checks.
     static let markerFilename = "viv-result.txt"
 
-    /// Variables Vivarium sets for the test command, and which a manifest's
-    /// `env` therefore may not set.
     static let reservedEnvironmentNames: Set<String> = ["VIV_RUN_ID", "VIV_ARTIFACTS"]
 
-    /// The here-document delimiter the artifact patterns are passed under.
-    ///
-    /// Quoted at the point of use, so the patterns undergo no expansion on
-    /// their way into the guest; a pattern equal to this word is rejected when
-    /// the manifest is read.
     static let artifactPatternDelimiter = "VIV_ARTIFACT_PATTERNS"
 
-    /// The share subdirectory the staged code arrives in.
     var codeGuestPath: String { sharePath + "/code" }
 
-    /// The share subdirectory the guest writes artifacts into.
     var artifactsGuestPath: String { sharePath + "/artifacts" }
 
-    /// Wraps a script for delivery over SSH, in this guest's shell.
     func remoteCommand(_ script: String) -> String {
         ShellEscaping.base64RemoteCommand(script: script, shell: shellExecutable)
     }
 
-    // MARK: - Globbing
-
-    /// Turns on the globbing behaviour the harvest depends on.
-    ///
-    /// `**` is deliberately left meaning `*` in both dialects. zsh only treats
-    /// `**` as recursive when it is followed by a slash, so `logs/**` has
-    /// always matched one level on a macOS guest; enabling bash's `globstar`
-    /// would make the same manifest harvest a different set of files depending
-    /// on which guest ran it, which is worse than a pattern that is merely less
-    /// powerful than it looks.
     private var globPreamble: String {
         switch dialect {
         case .zsh:
@@ -116,23 +55,13 @@ struct GuestScripts: Sendable {
         }
     }
 
-    /// Expands a variable holding a glob pattern as a glob.
     private func globExpansion(of variable: String) -> String {
         switch dialect {
-        // Without the tilde, zsh treats the variable's contents as a literal
-        // filename rather than a pattern.
         case .zsh: return "${~\(variable)}"
         case .bash: return "$\(variable)"
         }
     }
 
-    // MARK: - `viv run`
-
-    /// Copies the staged code out of the share into the guest-local workdir.
-    ///
-    /// A pre-existing workdir is removed rather than merged: a guest is fresh
-    /// every run today, and if that ever stops being true, a test that passes
-    /// because of a file left by a previous run is the worst kind of failure.
     var prepareScript: String {
         let share = ShellEscaping.singleQuoted(sharePath)
         let code = ShellEscaping.singleQuoted(codeGuestPath)
@@ -172,27 +101,6 @@ struct GuestScripts: Sendable {
         """
     }
 
-    /// The user's test command, and nothing else.
-    ///
-    /// The command is the script's last statement, so the shell exits with the
-    /// command's own status and the run reports what the test decided. `set -e`
-    /// covers the preamble: a failure to reach the workdir must not be reported
-    /// as the test's result.
-    ///
-    /// It is then turned off again for the command itself, because the command
-    /// is the user's shell script and not Vivarium's. Under `-e` a multi-line
-    /// `test:` stops at its first non-zero line — including the ones that are
-    /// meant to fail, like a grep that finds nothing — and under `-u` a
-    /// reference to an unset variable kills the run outright. Neither is what
-    /// the same lines would do in the shell the user tried them in, and a test
-    /// harness that quietly changes the semantics of what it runs is worse than
-    /// one that runs it plainly.
-    ///
-    /// Vivarium's own variables are exported last so that they hold whatever
-    /// the caller passed: the manifest parser rejects an `env` that names one
-    /// of them, but this script is the only place that can guarantee it, and
-    /// `$VIV_ARTIFACTS` pointing somewhere other than the share would silently
-    /// harvest nothing.
     func testScript(
         command: String,
         environment: [String: String],
@@ -219,23 +127,6 @@ struct GuestScripts: Sendable {
         """
     }
 
-    /// Resolves the manifest's globs in the guest and copies what they matched
-    /// into `$VIV_ARTIFACTS`, from where the host lifts them off the share.
-    ///
-    /// Resolved in the guest because that is where the files are: a build that
-    /// produced `logs/build.log` produced it in the workdir, which the host
-    /// cannot see. The patterns travel in a quoted here-document, so nothing in
-    /// them is expanded on the way, and each is then expanded as a pattern by
-    /// the one mechanism this shell has for it.
-    ///
-    /// Only regular files are copied, each under its own relative path. That
-    /// keeps a pattern that matches directories as well as files from copying a
-    /// directory into itself, at the price of not harvesting empty directories.
-    ///
-    /// The failure counter is called `failures` and not the obvious `status`,
-    /// because zsh makes `status` a read-only synonym for `$?` and treats the
-    /// assignment as fatal — which silently turned this whole script into a
-    /// no-op that reported exit 1.
     func harvestScript(patterns: [String]) -> String {
         let artifacts = ShellEscaping.singleQuoted(artifactsGuestPath)
 
@@ -284,21 +175,6 @@ struct GuestScripts: Sendable {
         """
     }
 
-    // MARK: - `viv selftest`
-
-    /// The acceptance command.
-    ///
-    /// Every value interpolated here is generated by this tool — a UUID, a hex
-    /// nonce, a volume name it chose — so none of it is attacker-influenced.
-    /// It is still single-quoted, and the whole script is delivered base64-
-    /// encoded, so that a marker containing an unexpected character could never
-    /// change the script's meaning.
-    ///
-    /// - Parameter withArtifactVolume: whether this guest's acceptance run
-    ///   asserts on the separate artifact disk. A guest whose platform does not
-    ///   claim that proof is not asked to write to a volume that was never
-    ///   attached; `RunReport` says so rather than passing the criterion by
-    ///   default.
     func acceptanceScript(
         expectations: RunExpectations,
         withArtifactVolume: Bool
@@ -331,11 +207,6 @@ struct GuestScripts: Sendable {
                 fi
                 """
             artifactAssertion = "\nrequire_writable_directory artifact \"$artifact\""
-            // `\\n` is one backslash and an `n` once Swift is done with it, which
-            // is the `\n` printf needs. Two would make printf emit a literal
-            // backslash and an `n` instead of a newline — a marker one byte
-            // longer than the host expects, and a validation that fails for a
-            // reason nothing about it suggests.
             artifactWrite = "\nprintf '%s\\n' \"$marker\" > \"$artifact/$marker_file\""
         }
 

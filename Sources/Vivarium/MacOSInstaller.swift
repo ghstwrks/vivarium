@@ -22,7 +22,6 @@ final class MacOSInstaller {
         self.paths = paths
     }
 
-    /// The size a macOS restore expects to land in.
     static let defaultDiskSizeGiB = 128
 
     /// Creates the system disk image.

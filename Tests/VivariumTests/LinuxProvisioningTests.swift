@@ -4,9 +4,6 @@ import Testing
 
 @testable import Vivarium
 
-/// The seed is the whole of a Linux guest's provisioning, and it is read exactly
-/// once by something that cannot report back. What it says has to be right
-/// before the guest starts.
 @Suite("Cloud-init seed")
 struct CloudInitSeedTests {
     private func userData(username: String = "vivadmin", fullName: String = "Vivarium Administrator")
@@ -26,12 +23,9 @@ struct CloudInitSeedTests {
             logsInAutomatically: true,
             disablesRemoteLogin: false
         )
-        // `write` reaches for hdiutil; the document it would write does not.
         return CloudInitSeed.userData(request: request, publicKey: "ssh-ed25519 AAAAC3Nz test")
     }
 
-    /// The seed sits in the run's bundle for as long as the guest lives, so the
-    /// one thing it must never carry is a secret.
     @Test("the seed carries a public key and no password")
     func noSecrets() {
         let text = userData()
@@ -42,8 +36,6 @@ struct CloudInitSeedTests {
         #expect(!text.lowercased().contains("plain_text_passwd"))
     }
 
-    /// The guest is told where to put the share, and the tag it is told to mount
-    /// is the tag the host attached.
     @Test("the seed mounts the share the host exported")
     func mountsTheShare() {
         let text = userData()
@@ -52,8 +44,6 @@ struct CloudInitSeedTests {
         #expect(CloudInitSeed.shareMountPath == LinuxPlatform(os: .fedora).scripts.sharePath)
     }
 
-    /// A cloud image is published at the size it was built; a guest with four
-    /// gigabytes free is not a developer environment.
     @Test("the seed grows the root filesystem")
     func growsTheRoot() {
         let text = userData()
@@ -61,9 +51,6 @@ struct CloudInitSeedTests {
         #expect(text.contains("resize_rootfs: true"))
     }
 
-    /// Everything interpolated goes through the quoter, including values
-    /// Vivarium generated: a full name containing a colon is a string, not a
-    /// mapping.
     @Test("values are quoted as YAML scalars")
     func quoting() {
         let text = userData(username: "odd:name", fullName: "A \"quoted\" name: with punctuation")
@@ -71,8 +58,6 @@ struct CloudInitSeedTests {
         #expect(text.contains(#"gecos: "A \"quoted\" name: with punctuation""#))
     }
 
-    /// A run identifier may hold dots, underscores, and eighty characters. A
-    /// hostname may hold none of those.
     @Test("hostnames are reduced to something a label can be")
     func hostnames() {
         #expect(ProvisioningRequest.hostname(forRunID: "smoke1") == "viv-smoke1")
@@ -83,10 +68,6 @@ struct CloudInitSeedTests {
     }
 }
 
-/// macOS's `Compression` framework decodes the xz container, which is why
-/// nothing here needs an `xz` on the host. What it will not do is read past the
-/// end of the first stream, and a file holding several would otherwise
-/// decompress to a silently truncated disk image.
 @Suite("Disk image decompression")
 struct DiskImageDecompressorTests {
     private func temporaryDirectory() throws -> URL {
@@ -96,8 +77,6 @@ struct DiskImageDecompressorTests {
         return url
     }
 
-    /// Round-trips through the framework's own encoder, which writes the same
-    /// container `xz` does.
     private func compress(_ data: Data) throws -> Data {
         var output = Data()
         let capacity = 1 << 16
@@ -150,8 +129,6 @@ struct DiskImageDecompressorTests {
         #expect(try Data(contentsOf: destination) == original)
     }
 
-    /// The one failure this step must not have: producing a disk image that is a
-    /// prefix of the real one and saying nothing.
     @Test("a multi-stream file is refused rather than truncated")
     func refusesConcatenatedStreams() throws {
         let directory = try temporaryDirectory()
@@ -170,8 +147,6 @@ struct DiskImageDecompressorTests {
         }
     }
 
-    /// An uncompressed image is recognised from its bytes, not its name, so
-    /// `--image` accepts a file whoever produced it forgot to name `.raw`.
     @Test("a raw image is recognised as raw")
     func detectsRaw() throws {
         let directory = try temporaryDirectory()
@@ -182,8 +157,6 @@ struct DiskImageDecompressorTests {
     }
 }
 
-/// A template's directory name and the manifest inside it both come from the
-/// source it was built from.
 @Suite("Image sources")
 struct LinuxImageSourceTests {
     @Test("the pinned image is a Fedora one, with a digest")

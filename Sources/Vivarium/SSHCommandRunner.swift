@@ -34,16 +34,6 @@ struct SSHResult: Sendable {
     }
 }
 
-/// Runs commands in the guest over the system OpenSSH client.
-///
-/// `/usr/bin/ssh` needs no library and makes stdout, stderr, and termination
-/// status trivially separable through `Process`. What it costs depends on how
-/// the guest authenticates. A key is free: `-i` and a file. A password is not,
-/// because OpenSSH will not read one from an argument or from stdin, so an
-/// askpass helper is required — acceptable against a NAT-local VM whose
-/// credential is generated per run and never persisted, but not a
-/// credential-management design, and the limitations are documented on
-/// `AskpassHelper`.
 struct SSHCommandRunner: Sendable {
     let username: String
     let authentication: GuestAuthentication
@@ -123,8 +113,6 @@ struct SSHCommandRunner: Sendable {
         onStdout: (@Sendable (Data) -> Void)? = nil,
         onStderr: (@Sendable (Data) -> Void)? = nil
     ) async throws -> SSHResult {
-        // The helper exists only where a password does. Creating one for a key
-        // authentication would put a script on disk for nothing.
         let helper: AskpassHelper?
         let environment: [String: String]?
         switch authentication {
@@ -180,10 +168,6 @@ struct SSHCommandRunner: Sendable {
             "-o", "LogLevel=ERROR"
         ]
 
-        // Exactly one mechanism is offered in each case. A client that would
-        // fall back to the other would turn "the key was not installed" into a
-        // password prompt nobody answers, which reads as a hang rather than as
-        // the provisioning failure it is.
         switch authentication {
         case .password:
             arguments += [
@@ -196,9 +180,6 @@ struct SSHCommandRunner: Sendable {
             arguments += [
                 "-i", path.path,
                 "-o", "PreferredAuthentications=publickey",
-                // Without IdentitiesOnly the client also offers whatever the
-                // operator's agent is holding, which is their own key on
-                // somebody else's guest.
                 "-o", "IdentitiesOnly=yes",
                 "-o", "PasswordAuthentication=no",
                 "-o", "BatchMode=yes"

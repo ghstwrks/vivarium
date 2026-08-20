@@ -1,36 +1,11 @@
 import Foundation
 
-/// The provisioning image a Linux guest reads its first-boot configuration
-/// from.
-///
-/// This is the Linux answer to `VZMacGuestProvisioningOptions`. A macOS guest
-/// is told who to be by the framework at `start`; a Linux guest is told by
-/// cloud-init, which looks for a filesystem labelled `cidata` holding
-/// `user-data` and `meta-data` and treats what it finds there as instructions.
-/// Attaching one read-only block device is the whole mechanism — no agent, no
-/// injection into the guest's filesystem, and nothing that has to understand
-/// btrfs from the host.
-///
-/// It carries no secret. The only credential in it is the public half of a key
-/// pair generated for this run, which is why the image can live in the run's
-/// bundle for as long as the guest does.
 enum CloudInitSeed {
-    /// The ISO9660 volume label cloud-init's NoCloud datasource looks for.
-    ///
-    /// ISO9660 volume identifiers are upper-case by specification; cloud-init
-    /// matches the label case-insensitively, so this is the same `cidata` every
-    /// other tool writes.
     static let volumeLabel = "CIDATA"
 
-    /// Where the share is mounted in the guest, and the tag it is mounted by.
-    ///
-    /// The tag is a name the host and the guest have to agree on, and the mount
-    /// point is where this seed tells the guest to put it — so both live here,
-    /// beside the line that uses them.
     static let shareTag = "viv"
     static let shareMountPath = "/mnt/viv"
 
-    /// Builds the seed image for one run.
     static func write(
         to destination: URL,
         request: ProvisioningRequest,
@@ -56,10 +31,6 @@ enum CloudInitSeed {
 
         try? FileManager.default.removeItem(at: destination)
 
-        // `makehybrid` is the one image builder macOS ships that writes an
-        // ISO9660 filesystem with a volume identifier of our choosing, which is
-        // the whole requirement. `-joliet` is what keeps `user-data` spelled
-        // that way: ISO9660's own name space has no lower case.
         try await ProcessRunner.runChecked(
             "/usr/bin/hdiutil",
             ["makehybrid", "-iso", "-joliet",
@@ -73,8 +44,6 @@ enum CloudInitSeed {
         log.info("Cloud-init seed written to \(destination.path).")
     }
 
-    // MARK: - Documents
-
     static func metaData(request: ProvisioningRequest) -> String {
         """
         instance-id: \(yaml(request.runID))
@@ -82,14 +51,6 @@ enum CloudInitSeed {
         """
     }
 
-    /// The configuration the guest applies to itself on its first and only
-    /// boot.
-    ///
-    /// Deliberately small. Vivarium's job is to hand over a machine that is
-    /// reachable and has the share mounted; anything a project needs on top of
-    /// that — a toolchain, a package, a repository — is what the test command
-    /// is for, and installing it here would test Vivarium's idea of a developer
-    /// environment rather than the project's.
     static func userData(request: ProvisioningRequest, publicKey: String) -> String {
         let credentials = request.credentials
         return """
@@ -145,28 +106,11 @@ enum CloudInitSeed {
         """
     }
 
-    /// Quotes a value as a YAML double-quoted scalar.
-    ///
-    /// JSON's string escaping is a subset of YAML's double-quoted form, so the
-    /// encoder that is already here produces a scalar YAML reads back
-    /// unchanged. Everything interpolated into the documents above goes through
-    /// this, including the values Vivarium generated itself: a username that
-    /// happens to be `yes` or a comment containing a colon should be a string
-    /// either way.
-    ///
-    /// Slashes are the one place the subset relationship is the wrong way
-    /// round. JSON permits `\/` and `JSONEncoder` writes it; YAML 1.2 permits
-    /// it too, but YAML 1.1 — which is what a PyYAML-based reader implements —
-    /// does not, and a parser that rejects the escape rejects the whole seed
-    /// and leaves the guest with no account. Every path in these documents is a
-    /// path, so this is not a corner.
     static func yaml(_ value: String) -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
         guard let data = try? encoder.encode(value),
               let encoded = String(data: data, encoding: .utf8) else {
-            // JSONEncoder cannot fail on a String, but a fallback that quotes
-            // nothing would be worse than one that quotes crudely.
             return "\"" + value.replacingOccurrences(of: "\"", with: "\\\"") + "\""
         }
         return encoded

@@ -1,20 +1,6 @@
 import Foundation
 import Virtualization
 
-/// Builds every VM configuration Vivarium needs.
-///
-/// Apple's sample builds exactly one configuration and reuses it. This splits
-/// it up, because the install VM must expose only the system disk — the
-/// installer's behaviour when several writable block devices are present is
-/// not documented, and guessing wrong costs a ninety-minute restore — while the
-/// run VM needs the artifact disk and the VirtioFS share the proof depends on.
-///
-/// Every guest's configuration is built here rather than inside its
-/// `GuestPlatform`, and that concentration is deliberate: a device attached in
-/// the wrong order, or with the wrong synchronisation mode, is the hardest
-/// class of bug in this program to see, and having every such decision in one
-/// file is what makes them reviewable side by side. The platform decides
-/// *which* configuration a guest gets; this file knows *how* each one is built.
 enum VMConfigurationFactory {
     static let artifactBlockDeviceIdentifier = "viv-artifacts"
 
@@ -172,12 +158,6 @@ enum VMConfigurationFactory {
         }
     }
 
-    /// The VirtioFS share, under a tag the guest knows to look for.
-    ///
-    /// macOS is handed the framework's automount tag, which is what makes the
-    /// share appear under `/Volumes/My Shared Files` without the guest running
-    /// `mount`. A Linux guest has no such convention, so it gets an ordinary
-    /// tag and is told during provisioning where to mount it.
     static func makeVirtioFileSystemShare(
         paths: VMBundlePaths,
         tag: String,
@@ -190,7 +170,6 @@ enum VMConfigurationFactory {
         return fileSystem
     }
 
-    /// The cloud-init seed, attached read-only.
     static func makeSeedDisk(paths: VMBundlePaths) throws -> VZVirtioBlockDeviceConfiguration {
         guard FileManager.default.fileExists(atPath: paths.seedImage.path) else {
             throw VivError(
@@ -216,13 +195,6 @@ enum VMConfigurationFactory {
         }
     }
 
-    /// EFI firmware with its own variable store.
-    ///
-    /// The store is created fresh whenever it is missing, which for a run is
-    /// always: it is not cloned out of the template, so no boot entry written
-    /// by one guest can survive into the next. A published cloud image installs
-    /// its loader at the removable-media path the firmware falls back to, so an
-    /// empty store still boots.
     static func makeEFIBootLoader(paths: VMBundlePaths) throws -> VZEFIBootLoader {
         let bootLoader = VZEFIBootLoader()
         if FileManager.default.fileExists(atPath: paths.efiVariableStore.path) {
@@ -244,10 +216,6 @@ enum VMConfigurationFactory {
         return bootLoader
     }
 
-    /// A virtio console whose output the host appends to `logs/console.log`.
-    ///
-    /// Write-only: nothing types at this guest, and offering it a readable
-    /// stdin would leave a file handle open on a pipe nobody ever writes to.
     static func makeConsoleSerialPort(
         paths: VMBundlePaths
     ) throws -> VZVirtioConsoleDeviceSerialPortConfiguration {
@@ -348,14 +316,6 @@ enum VMConfigurationFactory {
         return configuration
     }
 
-    /// The macOS run configuration: system disk, then artifact disk, then the
-    /// share.
-    ///
-    /// `includesArtifactDisk` is what `viv selftest` needs: proving a write
-    /// survived detachment is one of its criteria. `viv run` does not — it
-    /// harvests through the share — and attaching it anyway would add a
-    /// `diskutil` partitioning step, and its failure modes, to every run for
-    /// nothing.
     static func makeMacRunConfiguration(
         _ request: RunConfigurationRequest
     ) throws -> VZVirtualMachineConfiguration {
@@ -397,14 +357,6 @@ enum VMConfigurationFactory {
         return configuration
     }
 
-    /// The Linux run configuration: EFI firmware, the imported system disk, the
-    /// cloud-init seed, and the share.
-    ///
-    /// Headless, and deliberately: there is no display device, because nobody
-    /// is going to look at one and a framebuffer costs memory that the test
-    /// command would rather have. What replaces it is a serial console the host
-    /// records — the only account of a guest that fails before sshd, which is
-    /// precisely the failure a Linux guest is most likely to have.
     static func makeLinuxRunConfiguration(
         _ request: RunConfigurationRequest
     ) throws -> VZVirtualMachineConfiguration {
@@ -416,9 +368,6 @@ enum VMConfigurationFactory {
         configuration.bootLoader = try makeEFIBootLoader(paths: paths)
         configuration.networkDevices = [makeNetworkDevice(macAddress: request.macAddress)]
 
-        // The system disk first, so the firmware's fallback boot path finds the
-        // guest rather than the seed. The seed is read-only because nothing in
-        // the guest has any business changing what it was told to be.
         configuration.storageDevices = [
             try makeSystemDisk(paths: paths, stage: .runConfiguration),
             try makeSeedDisk(paths: paths)
@@ -433,8 +382,6 @@ enum VMConfigurationFactory {
         ]
 
         configuration.serialPorts = [try makeConsoleSerialPort(paths: paths)]
-        // sshd wants entropy early, and a guest with no hardware to harvest it
-        // from can spend its first minute waiting for some.
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [
             VZVirtioTraditionalMemoryBalloonDeviceConfiguration()

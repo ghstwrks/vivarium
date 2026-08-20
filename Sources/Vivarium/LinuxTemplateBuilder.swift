@@ -1,29 +1,6 @@
 import Foundation
 
-/// Builds a Linux template out of a published disk image.
-///
-/// This is the Linux counterpart of restoring an IPSW, and it is deliberately
-/// not made to look like one. A macOS template costs ninety minutes because the
-/// installer has to run; a Linux template costs a download and a decompression
-/// because the distribution already ran it. What the two have in common is the
-/// only thing that matters downstream: what they leave behind is an immutable,
-/// never-booted disk that a run clones.
-///
-/// Nothing in here boots the image, and that is the answer to the state
-/// question. An imported image used directly as a base would accumulate every
-/// run's host keys, logs, package cache, and leftovers; a template that is
-/// cloned and never started cannot, because no run ever writes to it. The
-/// cloning is `clonefile` where the filesystem has it and a byte copy where it
-/// does not, so the isolation is a property of the design rather than of APFS.
 enum LinuxTemplateBuilder {
-    /// The size the imported disk is grown to.
-    ///
-    /// A published cloud image is sized to be downloaded, not to be worked in:
-    /// Fedora's is five gigabytes with about four free, which is not enough to
-    /// install a toolchain and build anything with it. The file is grown by
-    /// `ftruncate`, so the space costs nothing until the guest writes to it, and
-    /// cloud-init grows the partition and the filesystem into the new room on
-    /// first boot.
     static let defaultDiskSizeGiB = 64
 
     struct Request: Sendable {
@@ -31,9 +8,6 @@ enum LinuxTemplateBuilder {
         let source: LinuxImageSource
         let template: TemplatePaths
         let diskSizeGiB: Int
-        /// Where to keep the downloaded file. The template's own parent, so a
-        /// download lands on the volume the template will live on rather than
-        /// crossing one on the way.
         let workingDirectory: URL
     }
 
@@ -50,10 +24,6 @@ enum LinuxTemplateBuilder {
 
         try manager.createDirectory(at: request.workingDirectory, withIntermediateDirectories: true)
 
-        // Built beside the template under a name `viv template list` ignores,
-        // and moved into place only once it is complete. An import that fails
-        // half way leaves something to delete rather than a template that looks
-        // usable and is not.
         let staging = request.template.root
             .deletingLastPathComponent()
             .appendingPathComponent(".\(request.template.root.lastPathComponent).partial")
@@ -88,9 +58,6 @@ enum LinuxTemplateBuilder {
         log.info("Template written to \(request.template.root.path).")
     }
 
-    // MARK: - The image
-
-    /// A published image on this machine, and whether Vivarium put it there.
     private struct ObtainedImage {
         let url: URL
         let sha256: String
@@ -131,9 +98,6 @@ enum LinuxTemplateBuilder {
             do {
                 try require(digest: digest, matches: expected, describing: url.absoluteString)
             } catch {
-                // A file that failed its digest is not kept: leaving it invites
-                // somebody to pass it back with --image and skip the check that
-                // just refused it.
                 try? FileManager.default.removeItem(at: destination)
                 throw error
             }
@@ -153,15 +117,6 @@ enum LinuxTemplateBuilder {
         log.info("Image sha256 \(digest) matches what was expected.")
     }
 
-    // MARK: - Unpacking
-
-    /// Puts the raw disk where the template wants it, decompressing on the way
-    /// if it arrived compressed.
-    ///
-    /// Returns the digest of the raw image, which is recorded in the template's
-    /// manifest. It costs nothing to compute here — the bytes are going past
-    /// anyway — and it is the only description of the template's contents that
-    /// does not depend on remembering what it was made from.
     private static func materialize(
         _ image: URL,
         to disk: URL,
@@ -193,13 +148,6 @@ enum LinuxTemplateBuilder {
         }
     }
 
-    /// Grows the disk image, sparsely.
-    ///
-    /// `ftruncate` moves the end of the file without allocating anything, so a
-    /// sixty-four gigabyte disk costs what the five gigabytes in it cost until
-    /// the guest starts writing. A disk that is already larger than asked for is
-    /// left alone: shrinking one would cut the partition table's backup header
-    /// off the end and leave an image that does not boot.
     private static func grow(_ disk: URL, toGiB sizeGiB: Int) throws {
         let target = off_t(sizeGiB) * 1024 * 1024 * 1024
         let current = BundleManager.fileSize(of: disk)
@@ -229,16 +177,7 @@ enum LinuxTemplateBuilder {
     }
 }
 
-/// Fetches a published image over HTTPS.
-///
-/// A plain download, with two things it will not do: it does not resume, and it
-/// does not cache. Both are deliberate for now — a template is built rarely, and
-/// a cache is a directory with a lifetime, an eviction policy, and a `viv gc`
-/// flag, which is a feature rather than a detail. `--image` is the answer for
-/// anyone who would rather keep the file: download it once, keep it, and point
-/// at it.
 enum LinuxImageDownloader {
-    /// Downloads `url` to `destination`, returning the digest of what arrived.
     static func download(from url: URL, to destination: URL) async throws -> String {
         log.info("Downloading \(url.absoluteString).")
         try? FileManager.default.removeItem(at: destination)
@@ -288,12 +227,6 @@ enum LinuxImageDownloader {
     }
 }
 
-/// Logs download progress at ten-percent granularity.
-///
-/// A five-hundred-megabyte download with no output for two minutes is
-/// indistinguishable from one that has stalled, and the operator watching it
-/// has no way to tell. Ten lines is enough to answer "is it moving?" without
-/// being a progress bar in a log file.
 private final class DownloadProgress: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var lastLoggedTenth = -1
@@ -324,7 +257,5 @@ private final class DownloadProgress: NSObject, URLSessionDownloadDelegate, @unc
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        // Required by the protocol; the async `download(from:)` moves the file
-        // itself and hands back the URL it moved it to.
     }
 }
