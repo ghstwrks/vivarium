@@ -3,11 +3,10 @@ import Virtualization
 
 /// Builds the two distinct VM configurations Vivarium needs.
 ///
-/// Apple's sample builds exactly one configuration and reuses it. This splits
-/// it in two, because the install VM must expose only the system disk — the
-/// installer's behaviour when several writable block devices are present is
-/// not documented, and guessing wrong costs a ninety-minute restore — while the
-/// run VM needs the artifact disk and the VirtioFS share the proof depends on.
+/// The install VM exposes only the system disk because installer behaviour
+/// with several writable block devices is undocumented. The run VM is a
+/// separate configuration that adds the artifact disk and VirtioFS share used
+/// by the acceptance proof.
 enum VMConfigurationFactory {
     static let artifactBlockDeviceIdentifier = "viv-artifacts"
 

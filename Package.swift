@@ -12,11 +12,8 @@ let package = Package(
         .executable(name: "viv", targets: ["Vivarium"])
     ],
     dependencies: [
-        // The POC hand-rolled its parser to keep the dependency graph empty, so
-        // that a resolved package could never be blamed for an unexpected
-        // Virtualization result. That rationale expired with the POC, and the
-        // hand-rolled parser rejected `--flag=value`; swift-argument-parser
-        // gives that, subcommand trees, and generated help for free.
+        // ArgumentParser provides consistent `--flag value` and `--flag=value`
+        // parsing, subcommand dispatch, generated help, and usage diagnostics.
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.8.2")
     ],
     targets: [
@@ -27,6 +24,11 @@ let package = Package(
             ],
             path: "Sources/Vivarium",
             swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "VivariumTests",
+            dependencies: ["Vivarium"],
+            path: "Tests/VivariumTests"
         )
     ]
 )

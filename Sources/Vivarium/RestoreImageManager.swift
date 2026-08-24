@@ -37,9 +37,8 @@ enum RestoreImageManager {
 
     /// Loads a local IPSW and applies the version gate.
     ///
-    /// The gate runs before anything expensive so that pointing the tool at the
-    /// macOS 26.6.1 image `VZMacOSRestoreImage.latestSupported` offers fails in
-    /// seconds rather than after a ninety-minute install.
+    /// The gate runs before any bundle or VM is created, so an incompatible
+    /// image fails immediately instead of after an installation attempt.
     static func load(ipsw url: URL, stage: VivStage = .restoreImage) async throws -> LoadedRestoreImage {
         guard url.isFileURL else {
             throw VivError(stage, "The IPSW path \(url) is not a file URL.")
@@ -87,9 +86,8 @@ enum RestoreImageManager {
 
     /// Reports what the framework would download, without downloading it.
     ///
-    /// This exists so the hard requirement for a local image can be lifted the
-    /// day Apple publishes a macOS 27 restore image, and so a run's log records
-    /// why it was still necessary.
+    /// This lets operators compare the framework's current download candidate
+    /// with the minimum guest version without downloading it.
     static func queryLatestSupported() async -> Result<(version: String, build: String), any Error> {
         do {
             let image = try await withCheckedThrowingContinuation { continuation in

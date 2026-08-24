@@ -40,9 +40,8 @@ enum GuestTestScript {
 
     /// Copies the staged code out of the share into the guest-local workdir.
     ///
-    /// A pre-existing workdir is removed rather than merged: a guest is fresh
-    /// every run today, and if that ever stops being true, a test that passes
-    /// because of a file left by a previous run is the worst kind of failure.
+    /// A pre-existing workdir is removed rather than merged, preserving run
+    /// isolation even if guest lifecycle assumptions change.
     static var prepareScript: String {
         let share = ShellEscaping.singleQuoted(AcceptanceScript.expectedSharePath)
         let code = ShellEscaping.singleQuoted(codeGuestPath)

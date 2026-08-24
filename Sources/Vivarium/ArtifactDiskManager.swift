@@ -72,17 +72,11 @@ enum ArtifactDiskManager {
     ///
     /// `diskutil` creates an APFS volume root owned by `root:wheel` with mode
     /// 0775. The provisioned guest account is in `staff` and `admin` but not
-    /// `wheel`, so it lands on the `other` bits and cannot write — the guest
-    /// mounts the volume with ownership enforced, and the acceptance script
-    /// fails its `test -w` before writing anything. Observed as an acceptance
-    /// command exiting 1 with no output at all, since `set -eu` makes a failed
-    /// `test` silent.
+    /// `wheel`, so the guest cannot write while ownership is enforced.
     ///
-    /// The host can fix this without privileges only because it mounts
-    /// image-backed volumes `noowners`, which is exactly the difference that
-    /// made the failure confusing: the same directory is writable from the host
-    /// and not from the guest. The mode is stored on disk, so the guest honours
-    /// it.
+    /// The host can change the mode without privileges because image-backed
+    /// volumes mount `noowners`; the mode is stored on disk and enforced when
+    /// the guest mounts the volume.
     ///
     /// 1777 rather than 0777: the sticky bit keeps one account from deleting
     /// another's marker, which costs nothing and preserves the meaning of a

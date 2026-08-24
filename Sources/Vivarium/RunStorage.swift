@@ -11,14 +11,26 @@ import Darwin
 /// restoring write permission, because a guest writes into the share as itself
 /// and can leave entries the host's first attempt cannot unlink.
 ///
-/// `viv gc` (Phase 3) is the other caller this exists for: it deletes the same
-/// kinds of directory for the same reasons.
+/// `viv gc` is the other caller: it deletes the same kinds of directory for
+/// the same reasons.
 enum RunStorage {
     /// Removes `url` if it exists. Returns whether anything was deleted.
+    ///
+    /// Existence is checked with `lstat` rather than `FileManager.fileExists`
+    /// so a dangling symlink is still removed. This matters to `viv gc --all`,
+    /// which treats entries directly under `runs/` as links rather than
+    /// following their targets.
     @discardableResult
     static func remove(_ url: URL) throws -> Bool {
         let manager = FileManager.default
-        guard manager.fileExists(atPath: url.path) else { return false }
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else {
+            if errno == ENOENT { return false }
+            throw VivError(
+                .cleanup,
+                "Could not inspect \(url.path) before deleting it: \(String(cString: strerror(errno)))."
+            )
+        }
 
         do {
             try manager.removeItem(at: url)

@@ -54,9 +54,8 @@ final class LineStream: @unchecked Sendable {
 /// Every byte is written to `file` as it arrives and echoed a line at a time;
 /// nothing is accumulated. A test that prints a gigabyte should cost a
 /// gigabyte of disk, not a gigabyte of resident memory in a process that is
-/// also hosting a virtual machine — and the earlier arrangement, which held
-/// the whole stream so it could be written out at the end, spent that memory
-/// twice and then lost the lot if the run died before the write.
+/// also hosting a virtual machine. Writing incrementally also preserves output
+/// if the run ends before the command does.
 ///
 /// The file is opened before the command starts, so the output of an attempt
 /// abandoned on timeout is already on disk: there is nothing left to flush.

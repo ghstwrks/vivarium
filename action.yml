@@ -62,7 +62,7 @@ inputs:
     required: false
     default: ""
   keep-vm:
-    description: "Keep VM.bundle even when the test passes. A failed run always keeps everything."
+    description: "Keep VM.bundle and Shared/ when the test passes. A failed run always keeps everything."
     required: false
     default: "false"
   vivarium-home:

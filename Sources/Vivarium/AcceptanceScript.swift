@@ -4,10 +4,8 @@ import Foundation
 enum AcceptanceScript {
     /// The path the VirtioFS automount tag is expected to produce.
     ///
-    /// Expected, not assumed: the script locates the real mount and fails
-    /// loudly if it is somewhere else, because confirming this path on the
-    /// selected guest build was one of the POC's open questions; POC-RESULTS.md
-    /// records macOS 27 mounting the share exactly here.
+    /// Expected, not assumed: the script checks the real mount and fails
+    /// clearly if the selected guest build does not mount the share here.
     static let expectedSharePath = "/Volumes/My Shared Files"
 
     /// A trivial command that must exit zero.

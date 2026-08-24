@@ -102,8 +102,8 @@ struct RunManifest: Codable, Sendable {
     var memorySizeBytes: UInt64?
 
     var expectations: RunExpectations
-    /// Recorded because Phase 5 treats it as a load-bearing assumption to be
-    /// re-tested, not a settled choice.
+    /// Recorded because automatic login affects artifact-volume mounting and
+    /// therefore the conditions under which the acceptance result was produced.
     var logsInAutomatically: Bool
 
     var guestAddress: String?

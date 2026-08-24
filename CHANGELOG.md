@@ -22,6 +22,27 @@ This project does not yet follow Semantic Versioning strictly — see
   that has been getting slower can be found by comparing runs rather than by
   happening to watch one.
 
+### Fixed
+
+- `viv gc --all` now removes dangling symlinks under `runs/` as links. The
+  safety model already refused to follow these entries, but the final removal
+  used an existence check that follows symlinks and therefore treated a link to
+  a missing target as if the link itself did not exist.
+- Manifest validation now rejects NUL bytes in test commands, environment
+  values, and artifact patterns, and rejects every Unicode line separator in
+  artifact patterns. These values are passed through shell strings or a
+  line-oriented here-document and cannot be represented faithfully otherwise.
+
+### Changed
+
+- Added focused unit tests for manifest/environment parsing and safe run-storage
+  deletion.
+- Aligned the README, generated CLI help, and Action documentation with actual
+  behavior, including `--keep-vm` retaining both `VM.bundle` and `Shared/`, the
+  fields that can override `viv.json`, and the measured versus maximum restore
+  duration. Implementation comments now describe current invariants rather
+  than past debugging history.
+
 ## [0.1.0] - 2026-08-10
 
 ### Pivot

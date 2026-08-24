@@ -85,10 +85,9 @@ enum Timeouts {
     /// first attempt (`viv run`'s shutdown order — see `ShutdownOrder`).
     ///
     /// Short for the same reason `stopRequestAcknowledgement` is short: with
-    /// auto-login on, POC-RESULTS.md never once observed `requestStop()` stop
-    /// a provisioned guest, so this budget only has to cover the case where
-    /// the in-guest shutdown could not even be attempted (SSH already gone),
-    /// not the case where it is expected to work.
+    /// auto-login on, `requestStop()` normally presents a confirmation dialog.
+    /// This fallback only covers the case where in-guest shutdown could not be
+    /// attempted because SSH was already unavailable.
     static let stopRequestFallback = Duration.seconds(30)
     static let diskAttach = Duration.seconds(120)
 }
@@ -347,9 +346,10 @@ final class Orchestrator {
         guard let ipsw = options.ipsw else {
             throw VivError(
                 .bundlePreparation,
-                "--ipsw is required. There is no download fallback: on this host "
-                    + "VZMacOSRestoreImage.latestSupported resolves to macOS 26.6.1, which would "
-                    + "produce a guest that silently ignores provisioning options."
+                "--ipsw is required. There is no download fallback; supply a local macOS "
+                    + "\(RestoreImageManager.minimumGuestMajorVersion) restore image so the guest "
+                    + "supports first-boot provisioning. Use `viv preflight --query-latest` to "
+                    + "inspect the image currently offered by the framework."
             )
         }
 
@@ -371,9 +371,9 @@ final class Orchestrator {
         manifest.restoreImageBuild = restoreImage.buildVersion
 
         if !options.skipIPSWDigest {
-            // Hashing 22 GB takes a while, which is noise against a ninety-
-            // minute install but would dominate a --from-template run, hence
-            // the opt-out.
+            // The digest records the exact source image in the template
+            // manifest. It can be skipped for iteration where that provenance
+            // is not needed.
             log.info("Digesting the restore image; pass --skip-ipsw-digest to skip this.")
             manifest.ipswSHA256 = try await Task.detached(priority: .utility) {
                 try Digest.sha256HexOfFile(at: ipsw, stage: .restoreImage)
@@ -1021,14 +1021,11 @@ final class Orchestrator {
 
     /// Which shutdown mechanism gets the first attempt.
     ///
-    /// `selftest` keeps `requestStop()` first: its "graceful guest stop
-    /// observed" criterion documents that exact, measured behaviour, and
-    /// changing the order would change what the criterion proves. `viv run`
-    /// instead leads with the in-guest shutdown, because POC-RESULTS.md is
-    /// unequivocal that with auto-login on, `requestStop()` has never once
-    /// stopped a provisioned guest — it is a power-button press answered by a
-    /// confirmation dialog nobody is there to click — while the in-guest
-    /// `shutdown -h now` works every time in around six seconds.
+    /// `selftest` keeps `requestStop()` first because its "graceful guest stop
+    /// observed" criterion measures that API path. `viv run` leads with an
+    /// in-guest shutdown because `requestStop()` behaves like a power-button
+    /// press and an auto-logged-in macOS guest answers it with a confirmation
+    /// dialog nobody is present to click.
     enum ShutdownOrder: Sendable {
         case requestStopFirst
         case inGuestFirst
@@ -1152,13 +1149,10 @@ final class Orchestrator {
 
     /// Confirms the guest reached `.stopped`, and lets go of it either way.
     ///
-    /// A confirmation that throws used to leave the machine object alive with
-    /// the disk images still open. `viv run` demotes a shutdown error to a
-    /// warning on a report it has already earned, and then deletes the bundle —
-    /// out from under a guest that, by the definition of this failure, might
-    /// still be running on it. So anything not verifiably stopped is stopped by
-    /// force before the error travels: the caller was asking for a stop, and
-    /// this is the one that cannot be refused.
+    /// `viv run` can preserve a test verdict after a shutdown error and then
+    /// delete the bundle. Anything not verifiably stopped must therefore be
+    /// stopped by force before the error returns, so no live machine retains or
+    /// writes disk images that cleanup may remove.
     private func confirmStoppedOrForce(_ machine: VZVirtualMachine) async throws {
         do {
             try confirmStopped(machine)
@@ -1310,9 +1304,7 @@ final class Orchestrator {
                 // A guest that will not shut down is reported, not fatal: the
                 // test has already produced its verdict, and throwing here
                 // would throw the report away with it. `viv run` leads with the
-                // in-guest shutdown — see ShutdownOrder — because it is the one
-                // POC-RESULTS.md measured as actually working with auto-login
-                // on.
+                // in-guest shutdown; see ShutdownOrder.
                 do {
                     try await measure("shutdown") { try await shutdown(ssh: ssh, order: .inGuestFirst) }
                 } catch {
@@ -1444,8 +1436,8 @@ final class Orchestrator {
         let stderr = try CapturedStream(file: layout.testStderr) { echo.stderr($0) }
         func captureWarnings() -> [String] { [stdout.warning, stderr.warning].compactMap { $0 } }
 
-        // Two bounds on one attempt, per the rule the POC paid for: the ssh
-        // process gets the user's budget and is killed at it, and the attempt
+        // Two bounds on one attempt: the ssh process gets the user's budget
+        // and is killed at it, and the attempt
         // as a whole gets a short grace period on top so that a child the
         // kernel will not reap cannot hang the run. The streams are held here
         // rather than inside the attempt, so an abandoned attempt still closes

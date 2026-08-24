@@ -26,8 +26,8 @@ struct PreflightReport: Codable, Sendable {
 
 /// Every cheap check, run before anything expensive happens.
 ///
-/// The whole value of this type is turning a ninety-minute failure into a
-/// two-second one. It creates no bundle and writes nothing outside the log.
+/// Runs before installation so host, entitlement, disk-space, and image
+/// failures are reported without creating a bundle or starting a VM.
 enum PreflightChecker {
     /// Headroom for the restored system disk plus the artifact disk. The system
     /// disk is a 128 GiB sparse image whose actual consumption after a restore

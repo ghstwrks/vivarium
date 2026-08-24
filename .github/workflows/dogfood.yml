@@ -13,6 +13,7 @@ on:
     branches: [main]
     paths:
       - "Sources/**"
+      - "Tests/**"
       - "Package.swift"
       - "action.yml"
       - "Scripts/action/**"
@@ -37,9 +38,10 @@ jobs:
       # commit it is running on, not the last thing that was released. The
       # runner therefore needs Xcode as well as a template, which is a
       # requirement of this workflow and not of the action.
-      - name: Build the viv under test
+      - name: Test and build the viv under test
         run: |
           set -euo pipefail
+          swift test
           swift build -c release
           codesign -s - --entitlements Vivarium.entitlements -f .build/release/viv
           codesign -d --entitlements - .build/release/viv 2>&1 \

@@ -181,8 +181,8 @@ struct PreflightCommand: AsyncParsableCommand {
         abstract: "Check the host, the entitlement, free space, and a restore image.",
         discussion: """
             Creates nothing and starts no virtual machine. Its whole value is \
-            turning a ninety-minute failure into a two-second one, so it is \
-            cheap enough to run before anything else.
+            finding host, entitlement, disk-space, and restore-image problems \
+            before an installation starts.
 
             Without --ipsw it checks only what does not depend on an image: \
             architecture, host version, the virtualization entitlement on this \
@@ -230,7 +230,7 @@ struct TemplateCommand: AsyncParsableCommand {
             first boot after a restore, so every guest must come from a freshly \
             restored disk. A template is that restored disk, snapshotted before \
             it is ever booted; runs clone it with APFS clonefile in a fraction \
-            of a second instead of spending ninety minutes on another restore.
+            of a second instead of performing another restore.
             """,
         subcommands: [TemplateCreateCommand.self, TemplateListCommand.self],
         defaultSubcommand: TemplateListCommand.self
@@ -242,15 +242,15 @@ struct TemplateCreateCommand: AsyncParsableCommand {
         commandName: "create",
         abstract: "Restore macOS into a bundle and snapshot it as a template.",
         discussion: """
-            Expect this to take around ninety minutes and to need roughly 80 GiB \
-            of free space. The template is snapshotted before the guest's first \
+            A measured restore takes around two and a half minutes, but the \
+            command allows up to ninety minutes and needs roughly 80 GiB of \
+            free space. The template is snapshotted before the guest's first \
             boot, because booting it would consume the one provisionable boot \
             the template exists to preserve.
 
-            A local restore image is mandatory and there is no download \
-            fallback: on this host VZMacOSRestoreImage.latestSupported resolves \
-            to macOS 26.6.1, which silently ignores guest provisioning options \
-            and would produce a template that can never be provisioned.
+            A local macOS 27 restore image is mandatory and there is no download \
+            fallback. Use `viv preflight --query-latest` to inspect the image \
+            currently offered by VZMacOSRestoreImage.latestSupported.
             """
     )
 
@@ -272,9 +272,9 @@ struct TemplateCreateCommand: AsyncParsableCommand {
     @Flag(
         name: .customLong("skip-ipsw-digest"),
         help: """
-            Skip hashing the restore image. Hashing 22 GB is noise against a \
-            ninety-minute restore, so it is on by default; skip it when \
-            iterating.
+            Skip hashing the restore image. The digest records exactly which \
+            image produced a template, so hashing is enabled by default; skip \
+            it only when that provenance is not needed.
             """
     )
     var skipIPSWDigest: Bool = false
@@ -467,8 +467,8 @@ struct RunCommand: AsyncParsableCommand {
     @Flag(
         name: .customLong("keep-vm"),
         help: """
-            Keep VM.bundle even when the test passes. A failed run always keeps \
-            everything.
+            Keep VM.bundle and Shared/ even when the test passes. A failed run \
+            always keeps everything.
             """
     )
     var keepVM: Bool = false
@@ -735,17 +735,18 @@ struct SelftestCommand: AsyncParsableCommand {
             thirteen criteria covering stdout, stderr, the remote exit code, the \
             VirtioFS share, a graceful shutdown, and an artifact disk read back \
             on the host after the machine is released. This is Vivarium's own \
-            integration test, inherited from the proof of concept.
+            integration test.
 
             With no path options it clones the newest template in the Vivarium \
             home. With --from-template it clones the one named. With --ipsw and \
             no template it takes the cold path: restore, snapshot a template, \
-            then run the proof, which takes around ninety minutes.
+            then run the proof. The installation budget is ninety minutes, \
+            though measured restores are much faster.
 
             The guest password is generated per run, kept in memory, and never \
             written to run.json, logged, or placed on a command line. That is \
-            why a bundle from an earlier invocation cannot be provisioned by a \
-            later one.
+            why a bundle cannot be authenticated after the invocation that \
+            provisioned it exits.
 
             Exits 1 when the guest failed to behave as asserted, and 70 when \
             Vivarium could not get far enough to ask.

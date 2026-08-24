@@ -53,8 +53,8 @@ shape of each command. All flags accept both `--flag value` and
 ### `viv preflight [--ipsw <path>]`
 
 Checks the host, the entitlement, free space, and — if given — a restore
-image. Creates nothing and starts no virtual machine, so it turns a
-ninety-minute failure into a two-second one. Without `--ipsw` it checks only
+image. It creates nothing and starts no virtual machine, so host and image
+problems are reported before installation. Without `--ipsw` it checks only
 what does not depend on an image.
 
 ### `viv template create --ipsw <path>`
@@ -64,8 +64,8 @@ a template. macOS evaluates first-boot provisioning options exactly once, on
 the first boot after a restore, so every guest a run provisions must come
 from a freshly restored disk; the template exists so that restore only
 happens once. Expect around two and a half minutes and roughly 80 GiB of
-free space. `--skip-ipsw-digest` skips hashing the restore image, which is on
-by default only for `--reuse`d iteration.
+free space. The restore image is hashed by default so the template records its
+exact source; `--skip-ipsw-digest` skips that provenance step when iterating.
 
 ### `viv template list`
 
@@ -80,7 +80,7 @@ command line wins. `--code <dir>` selects the project directory (default:
 the working directory), `--manifest <path>` overrides the default
 `<code>/viv.json`, `--template <path>` overrides the newest template in the
 Vivarium home, `--timeout <seconds>` bounds the test command (default 600),
-and `--keep-vm` keeps `VM.bundle` even when the test passes.
+and `--keep-vm` keeps both `VM.bundle` and `Shared/` even when the test passes.
 `--keep-going` goes further: when a run fails, it leaves the guest running
 and prints its address so you can SSH in and look at it, holding until you
 press Ctrl-C — which force-stops the guest and exits with the status the run
@@ -104,8 +104,9 @@ proves stdout, stderr, and exit status are captured independently, that the
 VirtioFS share and an artifact disk both survive, and that the guest shuts
 down cleanly. With no path options it clones the newest template; with
 `--from-template` it clones the one named; with `--ipsw` and no template it
-takes the cold path — restore, snapshot, then prove — which takes around
-ninety minutes. A warm run takes about two minutes, most of it a
+takes the cold path — restore, snapshot, then prove. Installation is allowed
+up to ninety minutes, although the measured restore is around two and a half
+minutes. A warm run takes about two minutes, most of it a
 deliberately slower measured shutdown path that `viv run` does not use. See
 `POC-RESULTS.md` for a worked example and the negative-test flags
 (`--share-read-only`, `--artifact-read-only`, `--disable-remote-login`).
@@ -131,9 +132,9 @@ home, which Vivarium does not read or write.
 
 ## The `viv.json` manifest
 
-Optional. Every field can be overridden on the command line, so the
-manifest records what a project usually wants rather than what a given
-invocation must do.
+Optional. The test command and timeout can be overridden on the command line,
+and `--env-file` can override or add environment values. The project name and
+artifact patterns come from the manifest.
 
 ```json
 {
@@ -233,9 +234,10 @@ state machine underneath it, one entry per state the run entered:
 
 `enteredAtSeconds` is an offset from the start of the run and `seconds` is
 how long the run stayed in that state; the last state is closed when the
-report is written, so the two account for the whole run. Both are there for
-comparing runs rather than reading one: a template that boots slower after
-a host upgrade, or a project whose staging cost has been creeping up, shows
+report is written. Together, the state durations account for the whole run.
+They are intended for comparing runs rather than reading one. A template that
+boots slower after a host upgrade, or a project whose staging cost has been
+creeping up, shows
 in the archived reports before anyone thinks to time it. The same timeline
 is in `failure.json` for a run that never reached a verdict, and appears
 live in the log as `State: x -> y` lines with their elapsed offsets.
@@ -244,7 +246,7 @@ live in the log as `State: x -> y` lines with their elapsed offsets.
 
 A run that passes deletes its own `VM.bundle` and staged `Shared/` as its
 last step, automatically, keeping only `results/`. `--keep-vm` keeps the
-bundle even on success, for a run you want to poke at afterwards.
+bundle and staged share on success, for a run you want to inspect afterwards.
 
 A run that fails or times out keeps everything — bundle, share, and
 results — and says so: *"run kept for inspection: viv gc cleans it up
@@ -373,14 +375,14 @@ cp -cR ~/VRE-POC/templates/26A5388g.bundle ~/.vivarium/templates/
 
 ## Why a local IPSW is mandatory
 
-`VZMacOSRestoreImage.latestSupported` currently resolves to macOS 26.6.1 on
-this host. A macOS 26 guest ignores provisioning options entirely and boots
-into Setup Assistant, so a download fallback would produce a run that fails
-for a reason that looks nothing like the actual cause. `viv template create`
-and `viv selftest`'s cold path refuse to proceed without `--ipsw`, and
-`viv preflight` rejects any image below major version 27.
-`viv preflight --query-latest` reports what `latestSupported` currently
-offers, so the day it reaches 27 the requirement can be lifted deliberately.
+A guest older than macOS 27 ignores provisioning options and boots into Setup
+Assistant. Vivarium therefore requires an explicitly selected local image and
+preflights its version instead of silently downloading whatever image the
+framework currently offers. `viv template create` and `viv selftest`'s cold
+path refuse to proceed without `--ipsw`, and `viv preflight` rejects any image
+below major version 27. `viv preflight --query-latest` reports
+`VZMacOSRestoreImage.latestSupported` for comparison; it does not download or
+substitute that image.
 
 ## History
 

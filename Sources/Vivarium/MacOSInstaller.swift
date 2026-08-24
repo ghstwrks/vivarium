@@ -81,7 +81,7 @@ final class MacOSInstaller {
             installLogWriter.writeProgress(fraction: fraction)
         }
 
-        log.info("Starting macOS installation. This normally takes tens of minutes.")
+        log.info("Starting macOS installation. This may take several minutes.")
 
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in

@@ -11,17 +11,12 @@ import Virtualization
 enum GuestProvisioner {
     /// Whether the guest is logged in automatically at startup.
     ///
-    /// The plan originally specified `false`. It is `true` because macOS
-    /// automounts external volumes through `diskarbitrationd` in the context of
-    /// a console user session, and with nobody logged in the preformatted APFS
-    /// artifact volume may never appear in the guest — failing the acceptance
-    /// run for a reason unrelated to what is being proved.
-    ///
-    /// This does not weaken any acceptance criterion. The criterion is that no
-    /// human interacts with Setup Assistant, which still holds. The remote
-    /// script mounts the artifact volume by name as a fallback; once that
-    /// fallback is confirmed to work unaided, this can go back to `false`. The
-    /// value used is recorded in `run.json` either way.
+    /// Enabled because macOS automounts external volumes through
+    /// `diskarbitrationd` in the context of a console user session. Without a
+    /// logged-in user, the preformatted APFS artifact volume may not appear.
+    /// The acceptance criterion is unattended Setup Assistant provisioning,
+    /// which automatic login does not weaken. The value used is recorded in
+    /// `run.json`.
     /// `nonisolated` so option parsing, which is not on the main actor, can use
     /// it as a default.
     nonisolated static let defaultLogsInAutomatically = true
@@ -39,10 +34,8 @@ enum GuestProvisioner {
 
         let options = VZMacOSVirtualMachineStartOptions()
         do {
-            // The Objective-C selector is setGuestProvisioningOptions:error:,
-            // but Swift drops the suffix that matches the guestProvisioningOptions
-            // property and imports it as setGuestProvisioning(_:) throws.
-            // Verified by compiling against the macOS 27 SDK on this host.
+            // The Objective-C selector is setGuestProvisioningOptions:error:;
+            // Swift imports it as the throwing setGuestProvisioning(_:).
             //
             // It validates internally and leaves the current options unchanged
             // on failure, so a separate validate() call would be redundant. A

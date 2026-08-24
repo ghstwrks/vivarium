@@ -1,13 +1,11 @@
 import Foundation
 
-/// Clones post-restore bundles so that provisioning can be iterated on.
+/// Clones post-restore bundles for provisioned runs.
 ///
 /// macOS evaluates `VZMacGuestProvisioningOptions` only on the first boot after
-/// restore, and the framework cannot use them to reconfigure a guest it has
-/// already provisioned. Every failed provisioning experiment therefore consumes
-/// one restore. Without a template that is roughly ninety minutes per attempt,
-/// which is the difference between a guest that can be rebuilt in seconds and
-/// one that costs an afternoon.
+/// restore, and cannot use them to reconfigure an already-provisioned guest. A
+/// pristine, unbooted template lets every run start from that required state
+/// without repeating the restore.
 enum TemplateManager {
     /// Snapshots a freshly restored bundle.
     ///
