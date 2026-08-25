@@ -15,7 +15,7 @@ just build
 viv template create --os fedora
 cd ~/my-project && viv run -- ./run-tests.sh
 
-# a macOS guest: about ninety minutes, once, from a local restore image
+# a macOS guest: a few minutes, once, from a local restore image
 viv template create --ipsw ~/Downloads/UniversalMac_27.0_26A5388g_Restore.ipsw
 cd ~/my-project && viv run -- swift test
 ```

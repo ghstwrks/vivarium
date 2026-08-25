@@ -260,10 +260,10 @@ struct TemplateCommand: AsyncParsableCommand {
             way. macOS evaluates first-boot provisioning options exactly once, \
             on the first boot after a restore, so a template that had been \
             booted could never be provisioned again and every attempt would cost \
-            another ninety-minute restore. A Fedora image imported from the \
-            distribution costs minutes rather than an afternoon, but booting the \
-            imported image in place would leave every run's host keys, logs, and \
-            package cache in the image the next run started from.
+            another restore. A Fedora image imported from the distribution costs \
+            no restore at all, but booting the imported image in place would \
+            leave every run's host keys, logs, and package cache in the image the \
+            next run started from.
             """,
         subcommands: [TemplateCreateCommand.self, TemplateListCommand.self],
         defaultSubcommand: TemplateListCommand.self

@@ -71,7 +71,7 @@ This project does not yet follow Semantic Versioning strictly — see
   optional. **Templates created by 0.1 are read unchanged** — the older
   `ipswBuild`, `ipswVersion`, and `ipswSHA256` are still accepted, and a
   macOS template written now carries both sets of names so that a 0.1 binary
-  can still read it. A restore is ninety minutes of somebody's afternoon.
+  can still read it. Refusing one would cost a restore that is not needed.
 - New templates are named `<os>-<build>.bundle` rather than `<build>.bundle`.
   Existing ones keep their names and work as they always did: what a template
   is comes from its `template.json`, never from its directory name.
