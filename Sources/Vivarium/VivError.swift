@@ -3,7 +3,7 @@ import Foundation
 /// The stage of the workflow a failure belongs to. Every failure the tool
 /// reports is attributed to exactly one stage so that a failed run says *where*
 /// it broke, not just that it broke.
-enum VivStage: String, Codable, Sendable {
+enum VivStage: String, Codable, Sendable, CaseIterable {
     case preflight
     case bundlePreparation
     case restoreImage

@@ -63,6 +63,12 @@ This project does not yet follow Semantic Versioning strictly — see
   integration test, because it is the half that needs a hypervisor.
 - Unit tests for manifest and environment parsing, and for the run-storage
   deletion `viv gc` relies on.
+- Unit tests across the surface that can be exercised without a hypervisor:
+  `viv gc`'s classification and its refusals, address discovery's DHCP, ARP,
+  and `ifconfig` parsing, the exit code every stage earns, shell quoting
+  (asserted by running the quoted value back through a shell), the template
+  inventory's ordering and `--os` filtering, and the run directory layout the
+  three lifetimes depend on.
 
 ### Changed
 
