@@ -70,13 +70,6 @@ struct CloudInitSeedTests {
 
 @Suite("Disk image decompression")
 struct DiskImageDecompressorTests {
-    private func temporaryDirectory() throws -> URL {
-        let url = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("viv-decompress-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return url
-    }
-
     private func compress(_ data: Data) throws -> Data {
         var output = Data()
         let capacity = 1 << 16
@@ -112,7 +105,7 @@ struct DiskImageDecompressorTests {
 
     @Test("an xz stream decompresses to exactly what went in")
     func roundTrip() throws {
-        let directory = try temporaryDirectory()
+        let directory = try temporaryDirectory("viv-decompress")
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let original = Data((0..<200_000).map { UInt8($0 % 251) })
@@ -131,7 +124,7 @@ struct DiskImageDecompressorTests {
 
     @Test("a multi-stream file is refused rather than truncated")
     func refusesConcatenatedStreams() throws {
-        let directory = try temporaryDirectory()
+        let directory = try temporaryDirectory("viv-decompress")
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let half = Data(repeating: 0xAB, count: 50_000)
@@ -149,7 +142,7 @@ struct DiskImageDecompressorTests {
 
     @Test("a raw image is recognised as raw")
     func detectsRaw() throws {
-        let directory = try temporaryDirectory()
+        let directory = try temporaryDirectory("viv-decompress")
         defer { try? FileManager.default.removeItem(at: directory) }
         let source = directory.appendingPathComponent("image.raw.xz")
         try Data(repeating: 0, count: 4096).write(to: source)

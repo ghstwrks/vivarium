@@ -1,12 +1,13 @@
 import Foundation
-import XCTest
+import Testing
+
 @testable import Vivarium
 
-final class RunStorageTests: XCTestCase {
-    func testRemoveDeletesDanglingSymlinkWithoutFollowingIt() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("vivarium-run-storage-tests-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+@Suite("Run storage deletion")
+struct RunStorageTests {
+    @Test("a dangling symlink is removed as a link, not followed")
+    func removesDanglingSymlink() throws {
+        let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
 
         let link = root.appendingPathComponent("dangling-run")
@@ -15,16 +16,17 @@ final class RunStorageTests: XCTestCase {
             withDestinationPath: root.appendingPathComponent("missing-target").path
         )
 
-        XCTAssertTrue(try RunStorage.remove(link))
+        #expect(try RunStorage.remove(link))
 
         var info = stat()
-        XCTAssertEqual(lstat(link.path, &info), -1)
-        XCTAssertEqual(errno, ENOENT)
+        #expect(lstat(link.path, &info) == -1)
+        #expect(errno == ENOENT)
     }
 
-    func testRemoveReturnsFalseForMissingPath() throws {
+    @Test("a path that was never there reports nothing removed")
+    func reportsMissingPath() throws {
         let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent("vivarium-missing-\(UUID().uuidString)")
-        XCTAssertFalse(try RunStorage.remove(missing))
+        #expect(try RunStorage.remove(missing) == false)
     }
 }
