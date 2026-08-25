@@ -23,7 +23,7 @@ enum GuestEnvironment {
     /// somewhere other than the share would silently harvest nothing, so
     /// neither source may claim one of these.
     static func isReserved(_ name: String) -> Bool {
-        GuestTestScript.reservedEnvironmentNames.contains(name)
+        GuestScripts.reservedEnvironmentNames.contains(name)
     }
 
     /// Reads a `NAME=value` file.

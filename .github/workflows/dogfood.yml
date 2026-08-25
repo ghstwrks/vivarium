@@ -1,12 +1,5 @@
 name: Run the action against examples/hello
 
-# Vivarium's own use of its own action. It is the only test that exercises the
-# whole thing — the build, the guest, the harvest, the report, the outputs —
-# and it can only run on hardware that can create a virtual machine, so it is
-# manual and main-branch only rather than on every push.
-#
-# The runner this targets must be prepared first: see docs/github-actions.md.
-
 on:
   workflow_dispatch:
   push:
@@ -20,8 +13,7 @@ on:
       - "examples/hello/**"
       - ".github/workflows/dogfood.yml"
 
-# v0.1 does not support concurrent runs on one host, and this workflow's two
-# jobs would otherwise contend for the same runner's disk and NAT pool.
+# Prevent concurrent jobs from sharing the runner's VM resources.
 concurrency:
   group: vivarium-dogfood
   cancel-in-progress: false
@@ -32,23 +24,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The action normally downloads a signed release matching the ref it was
-      # pinned to. Used by local path there is no such ref, so this builds the
-      # binary under test — which is the point: this workflow exists to test the
-      # commit it is running on, not the last thing that was released. The
-      # runner therefore needs Xcode as well as a template, which is a
-      # requirement of this workflow and not of the action.
-      - name: Test and build the viv under test
+      - name: Build the viv under test
         run: |
           set -euo pipefail
-          swift test
           swift build -c release
           codesign -s - --entitlements Vivarium.entitlements -f .build/release/viv
           codesign -d --entitlements - .build/release/viv 2>&1 \
             | grep -q com.apple.security.virtualization
 
-      # The passing path, using examples/hello's own viv.json for the command
-      # and the artifact globs — so this also proves the manifest is read.
+      - name: Unit tests
+        run: swift test
+
       - id: pass
         uses: ./
         with:
@@ -79,15 +65,10 @@ jobs:
           check passed "$PASSED" true
           check test-exit-code "$TEST_EXIT" 0
           check artifact-count "$ARTIFACTS" 2
-          # The manifest's env is overridable from the workflow, and the value
-          # reaches the guest: examples/hello echoes $GREETING into an artifact.
           grep -q "hello from the workflow" "$RESULTS/artifacts/greeting.txt" \
             || { echo "::error::the env input did not reach the guest"; fail=1; }
           exit $fail
 
-      # The failing path. A test that fails must fail the step, so this one
-      # turns that off and checks the outputs instead — which is also the
-      # documented way for a workflow to decide for itself.
       - id: broken
         uses: ./
         with:

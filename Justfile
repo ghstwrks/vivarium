@@ -34,6 +34,12 @@ sign-debug:
         && echo "signed: {{debug_binary}} carries com.apple.security.virtualization" \
         || (echo "ERROR: the entitlement is missing after signing" >&2; exit 1)
 
+# the tests that need no hypervisor: guest scripts, template records,
+# cloud-init documents, the xz decoder. `viv selftest` is the other half, and
+# needs a machine that can create a virtual machine.
+test:
+    swift test
+
 # build, sign, and run the entitlement/host preflight
 check: build
     {{release_binary}} preflight

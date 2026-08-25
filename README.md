@@ -1,22 +1,34 @@
 # Vivarium
 
-Vivarium runs a test command autonomously inside a macOS virtual machine,
+Vivarium runs a test command autonomously inside a fresh virtual machine,
 against a copy of your project's code. The host does everything: it clones a
 template, provisions and boots a fresh guest, copies your code in, runs your
 command, streams its output live, harvests whatever it produced, writes a
 report, and shuts the guest down. No human touches the guest at any point.
 
+Two guests, on the same Apple silicon host:
+
 ```sh
 just build
+
+# a Fedora guest: about half a minute to build the template
+viv template create --os fedora
+cd ~/my-project && viv run -- ./run-tests.sh
+
+# a macOS guest: about ninety minutes, once, from a local restore image
 viv template create --ipsw ~/Downloads/UniversalMac_27.0_26A5388g_Restore.ipsw
 cd ~/my-project && viv run -- swift test
 ```
 
-The first command builds and signs the `viv` binary. The second restores
-macOS into a template once — expect roughly two and a half minutes — from
-which every later run clones a fresh guest in seconds. The third runs a
-warm test: about 35–40 seconds from `viv run` to a report on Apple silicon
-running macOS 27, of which roughly 17 seconds is boot-to-SSH.
+`just build` builds and signs the `viv` binary. `viv template create` makes
+the guest once; every later run clones it in a fraction of a second.
+`viv run` then takes about 35–40 seconds end to end for a macOS guest (~17 s
+of it boot-to-SSH) and about 21 seconds for a Fedora one (~19 s of it
+boot-to-SSH).
+
+Which guest a run uses comes from its template, so only `viv template
+create` has to be told. With templates for both in the home, `viv run --os
+fedora` picks which.
 
 Derived from the `vre-poc` proof of concept, which answered a narrower
 question: whether `VZMacGuestProvisioningOptions` could get a macOS 27 guest
@@ -28,9 +40,20 @@ could then prove what the guest did. It could. See [History](#history).
 - Apple silicon Mac running macOS 27 or later.
 - Xcode (this uses the macOS 27.0 SDK; Command Line Tools alone are not
   enough).
+
+For a **macOS** guest, additionally:
+
 - A **local** macOS 27 IPSW. There is no download fallback — see
   [Why a local IPSW](#why-a-local-ipsw-is-mandatory).
 - Roughly 80 GiB free.
+
+For a **Fedora** guest:
+
+- Roughly 20 GiB free, and a network connection the first time.
+
+Nothing else is needed on the host: the disk image is fetched over HTTPS
+and decompressed in-process with the `Compression` framework, so there is
+no `xz`, `qemu-img`, or package manager in the way.
 
 ## Build
 
@@ -50,27 +73,53 @@ silently use an unsigned build.
 shape of each command. All flags accept both `--flag value` and
 `--flag=value`.
 
-### `viv preflight [--ipsw <path>]`
+### `viv preflight [--os <name>] [--ipsw <path>]`
 
 Checks the host, the entitlement, free space, and — if given — a restore
 image. It creates nothing and starts no virtual machine, so host and image
 problems are reported before installation. Without `--ipsw` it checks only
-what does not depend on an image.
+what does not depend on an image. The thresholds depend on the guest:
+`--os fedora` needs neither macOS 27 nor 80 GiB, and checking it against the
+stricter numbers would refuse a host perfectly capable of running it.
 
-### `viv template create --ipsw <path>`
+### `viv template create [--os <name>] …`
 
-Restores macOS from a local IPSW into a bundle and snapshots it, unbooted, as
-a template. macOS evaluates first-boot provisioning options exactly once, on
-the first boot after a restore, so every guest a run provisions must come
-from a freshly restored disk; the template exists so that restore only
-happens once. Expect around two and a half minutes and roughly 80 GiB of
-free space. The restore image is hashed by default so the template records its
-exact source; `--skip-ipsw-digest` skips that provenance step when iterating.
+Makes a guest that has never been started, which every run then clones. The
+two guests get there by genuinely different routes, and the flags say so.
+
+**macOS** is restored: `--ipsw <path>` is mandatory and it needs roughly 80
+GiB free. A measured restore takes around two and a half minutes, though
+Vivarium allows the installation up to ninety. macOS evaluates first-boot
+provisioning options exactly once, on the first boot after a restore, so the
+template is snapshotted before that boot is spent. The restore image is
+hashed by default so the template records its exact source;
+`--skip-ipsw-digest` skips that provenance step, for `--reuse`d iteration.
+
+**Fedora** is imported: `viv template create --os fedora` downloads the disk
+image Fedora publishes, checks it against a SHA-256 pinned in Vivarium's own
+source, decompresses it, and grows it to 64 GiB. Expect about half a minute.
+Three ways to point it elsewhere:
+
+| flag | for |
+|---|---|
+| `--image <path>` | a raw or `.xz` image already on this machine |
+| `--image-url <url> --image-sha256 <hex>` | a different published image |
+| `--disk-size <gib>` | a guest that needs more room than 64 GiB |
+
+The pinned image is [Fedora Cloud
+Base](https://fedoraproject.org/cloud/download/), not Fedora Server, and the
+difference is worth knowing: Fedora Server's VM guest image is published
+only as qcow2, which Virtualization cannot attach and macOS has no tool to
+convert, and its raw image ships `initial-setup` rather than cloud-init, so
+its first boot waits at a console prompt for a human — which Vivarium has
+nobody to provide. Cloud Base is the same Fedora built to be started by a
+machine. `--image` imports the Server image for anyone who converts it
+themselves.
 
 ### `viv template list`
 
-Lists templates in the Vivarium home with their build, size on disk, and
-creation date.
+Lists templates in the Vivarium home with their guest, version, size on
+disk, and creation date.
 
 ### `viv run [options] [-- <command…>]`
 
@@ -79,8 +128,9 @@ from a trailing `-- <command…>` or from `viv.json`'s `test` field — the
 command line wins. `--code <dir>` selects the project directory (default:
 the working directory), `--manifest <path>` overrides the default
 `<code>/viv.json`, `--template <path>` overrides the newest template in the
-Vivarium home, `--timeout <seconds>` bounds the test command (default 600),
-and `--keep-vm` keeps both `VM.bundle` and `Shared/` even when the test passes.
+Vivarium home and `--os <name>` narrows that choice to one guest,
+`--timeout <seconds>` bounds the test command (default 600), and `--keep-vm`
+keeps both `VM.bundle` and `Shared/` even when the test passes.
 `--keep-going` goes further: when a run fails, it leaves the guest running
 and prints its address so you can SSH in and look at it, holding until you
 press Ctrl-C — which force-stops the guest and exits with the status the run
@@ -98,18 +148,26 @@ value, quotes and `$` included.
 
 ### `viv selftest [options]`
 
-The proof of concept's thirteen-criterion acceptance run, preserved as
-Vivarium's own integration test: boots a guest, authenticates over SSH,
-proves stdout, stderr, and exit status are captured independently, that the
-VirtioFS share and an artifact disk both survive, and that the guest shuts
-down cleanly. With no path options it clones the newest template; with
-`--from-template` it clones the one named; with `--ipsw` and no template it
-takes the cold path — restore, snapshot, then prove. Installation is allowed
-up to ninety minutes, although the measured restore is around two and a half
-minutes. A warm run takes about two minutes, most of it a
-deliberately slower measured shutdown path that `viv run` does not use. See
-`POC-RESULTS.md` for a worked example and the negative-test flags
-(`--share-read-only`, `--artifact-read-only`, `--disable-remote-login`).
+The proof of concept's acceptance run, preserved as Vivarium's own
+integration test: boots a guest, authenticates over SSH, proves stdout,
+stderr, and exit status are captured independently, that the VirtioFS share
+survives, and that the guest shuts down cleanly. With no path options it
+clones the newest template; `--os <name>` narrows that to one guest;
+`--from-template` clones the one named; and `--ipsw` with no template takes
+the macOS cold path — restore, snapshot, then prove. Installation is allowed
+up to ninety minutes, although the measured restore is around two and a half.
+
+Three of the thirteen criteria concern a separate, detachable artifact
+disk, and only a macOS guest asserts them. That proof is a statement about
+the Virtualization framework — that a guest's write to a block device
+survives the machine being released — rather than about any guest, so it is
+made once rather than reimplemented against a filesystem both a Linux guest
+and `diskutil` can agree on. A Fedora selftest reports those three as **not
+asserted**, with the reason, rather than as passed; the macOS-only flags
+that go with them (`--artifact-volume-name`, `--artifact-read-only`,
+`--disable-remote-login`, `--validate-system-disk`) are refused rather than
+silently ignored. See `POC-RESULTS.md` for a worked example and the
+negative-test flags.
 
 ### `viv validate --bundle <path>`
 
@@ -180,18 +238,25 @@ supply one.
   the share; anything the test command writes there is harvested
   automatically, whether or not it matches an `artifacts` glob.
 - **The test command is your script, run as written.** It is executed by the
-  guest's `zsh` with `-e` and `-u` off, so a multi-line `test` runs every
-  line — a step that exits non-zero does not stop the ones after it — and an
-  unset variable expands empty. The run's verdict is the exit status of the
-  last line, exactly as it would be in a shell. Put `set -e` at the top of
-  your own command if you want it.
-- **Artifact globs are resolved by the guest's zsh**, relative to the guest's
-  copy of the code directory. `logs/**` behaves like `logs/*` — zsh's
-  recursive-glob qualifier is a property of `**/`, not `**`, so a bare `**`
-  matches one level; write `logs/**/*` to reach everything beneath `logs/`.
-  Only regular files are harvested — a pattern that matches a directory
-  harvests nothing for that match, which keeps `logs/**` from trying to copy
-  a directory into itself.
+  guest's own shell — `zsh` on macOS, `bash` on Fedora — with `-e` and `-u`
+  off, so a multi-line `test` runs every line (a step that exits non-zero
+  does not stop the ones after it) and an unset variable expands empty. The
+  run's verdict is the exit status of the last line, exactly as it would be
+  in a shell. Put `set -e` at the top of your own command if you want it.
+- **Artifact globs are resolved by the guest's shell**, relative to the
+  guest's copy of the code directory, and mean the same thing on both
+  guests. `logs/**` behaves like `logs/*`: zsh treats `**` as recursive only
+  when it is followed by a slash, and bash's `globstar` — which would make
+  the same pattern recursive — is deliberately left off so that one
+  `viv.json` does not harvest two different sets of files depending on which
+  guest ran it. Write `logs/**/*` to reach everything beneath `logs/`. Only
+  regular files are harvested; a pattern that matches a directory harvests
+  nothing for that match, which keeps `logs/**` from trying to copy a
+  directory into itself.
+- **The share is where the two sides meet, and the guest owns what it sees
+  there.** Apple's VirtioFS presents every file in the share to the guest as
+  owned by the guest's own account, whatever the host's ownership is, so
+  nothing has to reconcile a host uid with a guest one.
 - **`--timeout`** (default 600 seconds) bounds the test command alone. It
   does not bound the boot, the code staging, or the harvest; a slow build
   step inside your test command counts against it, a slow guest boot does
@@ -293,7 +358,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: rxbynerd/vivarium@v0.1.0
         with:
-          command: swift test
+          os: fedora
+          command: ./run-tests.sh
 ```
 
 It downloads the signed, notarised `viv` from the release matching the tag the
@@ -302,8 +368,10 @@ caching it for later jobs — then runs the tests, writes the report to the job
 summary, uploads `results/` as a workflow artifact, and reclaims disk
 afterwards. The runner needs no Xcode and no Swift toolchain, but it must be
 **a self-hosted Apple silicon Mac with a template already built**: GitHub's
-hosted macOS runners cannot nest virtualization, and restoring a template is a
-multi-minute, 80-GiB operation that no workflow should perform by surprise.
+hosted macOS runners cannot nest virtualization, and building a template is a
+multi-minute operation that no workflow should perform by surprise. A runner
+can hold templates for both guests; `os:` picks between them, and a matrix
+over it tests a project on both.
 
 [`docs/github-actions.md`](docs/github-actions.md) covers preparing a
 runner, passing secrets, matrices, disk hygiene, and the security of running
@@ -311,19 +379,35 @@ CI on hardware you own.
 
 ## Security notes
 
-- The generated guest password exists in process memory and in the
-  environment of a short-lived askpass helper. It is never written to
-  `run.json`, a log line, a command line, or a file. Because it is held in
-  memory only, a bundle from an earlier invocation cannot be logged into by
-  a later one — which is why `viv run` and `viv selftest` clone a fresh
-  guest from a template rather than reusing one already provisioned.
-- OpenSSH accepts a password only from a terminal or an askpass program, so
-  the askpass helper writes a fixed two-line script into a mode-0700
-  temporary directory and passes the password via the child process's
-  environment, removing the directory immediately afterwards. Environment
-  variables are readable by sufficiently privileged local processes; this is
-  adequate for a NAT-local VM with a one-run credential and is not a
-  credential-management design.
+- **The guest's credential belongs to the run**, whichever guest it is, and
+  a bundle from an earlier invocation cannot be logged into by a later one —
+  which is why `viv run` and `viv selftest` clone a fresh guest from a
+  template rather than reusing one already provisioned.
+- **A macOS guest authenticates by password.** It exists in process memory
+  and in the environment of a short-lived askpass helper, and is never
+  written to `run.json`, a log line, a command line, or a file. OpenSSH
+  accepts a password only from a terminal or an askpass program, so the
+  helper writes a fixed two-line script into a mode-0700 temporary directory
+  and passes the password via the child process's environment, removing the
+  directory immediately afterwards. Environment variables are readable by
+  sufficiently privileged local processes; this is adequate for a NAT-local
+  VM with a one-run credential and is not a credential-management design.
+- **A Fedora guest authenticates by key.** cloud-init reads its instructions
+  from a seed image that sits in the run's bundle for as long as the guest
+  lives, so a password in it would be a password written to disk. The seed
+  carries the public half of an ed25519 pair generated for the run; the
+  private half is `id_ed25519` in the same bundle, mode 0600, and goes when
+  the bundle does. The guest keeps its distribution's own refusal of
+  password logins over SSH rather than having Vivarium turn that off. One
+  consequence is a convenience rather than a compromise: `--keep-going` on a
+  Fedora run prints an `ssh -i` command that actually works, which the macOS
+  path cannot offer because its password is unrecoverable by design.
+- **Published images are pinned by digest, not by trust in the transport.**
+  `viv template create --os fedora` fetches through Fedora's mirror
+  redirector and refuses anything that does not hash to the SHA-256 in
+  Vivarium's own source. A hostile mirror can therefore serve nothing that
+  gets unpacked. `--image-url` requires `--image-sha256` for the same
+  reason.
 - Host-key checking is never disabled. Each run uses its own known-hosts
   file with `StrictHostKeyChecking=accept-new`, which records the guest's
   key on first contact, still refuses a *changed* key, and keeps a recycled
@@ -336,12 +420,14 @@ CI on hardware you own.
 
 ## How it works
 
-`viv run`, in order: clone the newest (or given) **template** with
-`clonefile`, so a large sparse system disk costs seconds and near-zero
-space; **stage** the code directory onto the share, again by clonefile where
-the volume allows it; **provision** and boot the guest with a per-run
-password and `VZMacGuestProvisioningOptions`, so no human sees Setup
-Assistant; connect over **SSH** once the guest answers, then copy the staged
+`viv run`, in order: read the **template**'s `template.json` to learn which
+guest this is, then clone it with `clonefile`, so a large sparse system disk
+costs seconds and near-zero space; **stage** the code directory onto the
+share, again by clonefile where the volume allows it; **provision** and boot
+the guest — `VZMacGuestProvisioningOptions` with a per-run password for
+macOS, so no human sees Setup Assistant, or a per-run cloud-init seed image
+carrying a public key for Fedora, so no human sees a console; connect over
+**SSH** once the guest answers, then copy the staged
 code from the share into a guest-local working directory; **stream** the
 test command's stdout and stderr to the terminal and to `results/` at once,
 as they arrive, and record its exit status; **harvest** the manifest's artifact
@@ -357,7 +443,7 @@ Everything Vivarium owns lives under `~/.vivarium` (override with
 
 ```
 ~/.vivarium/
-  templates/<build>.bundle/    restored, unbooted, cloned per run
+  templates/<os>-<build>.bundle/  restored or imported, unbooted, cloned per run
   runs/<run-id>/
     VM.bundle/                 deleted on a passing run
     Shared/                    staged code + harvest channel; deleted on a passing run
@@ -372,6 +458,22 @@ copying (APFS clone, so it costs nothing) into the new location:
 mkdir -p ~/.vivarium/templates
 cp -cR ~/VRE-POC/templates/26A5388g.bundle ~/.vivarium/templates/
 ```
+
+## Adding an operating system
+
+`GuestOS` is the name — `--os fedora`, the `os` field in a template's
+`template.json`, a column in `viv template list`, a field in `report.json` —
+and `GuestPlatform` is everything behind it: which files a template carries,
+whether a run inherits its MAC address, how a credential comes to exist,
+what the guest is asked to run, which shutdown mechanism goes first, what
+the host must be, and which acceptance criteria apply. `Orchestrator`'s
+pipeline asks the platform rather than assuming.
+
+A distribution that publishes a cloud image is expected to be one case in
+`GuestOS`, one entry in `LinuxImageCatalogue`, and no new platform code:
+`LinuxPlatform` is parameterised rather than written once per distribution.
+Something genuinely different — Windows — would be a new conformance
+alongside `MacOSPlatform` and `LinuxPlatform`.
 
 ## Why a local IPSW is mandatory
 
@@ -398,7 +500,7 @@ Concept"), encoded an assumption that turned out to be wrong: the reverse
 engineering never happened, because the public Virtualization API was
 sufficient on its own. **Vivarium** replaces it — a vivarium is a sealed
 enclosure in which something is kept alive so its behaviour can be
-observed, which is exactly what this tool does with a macOS guest.
+observed, which is exactly what this tool does with a guest.
 
 The Virtualization sample this project started from, Apple's [Running macOS
 in a virtual machine on Apple

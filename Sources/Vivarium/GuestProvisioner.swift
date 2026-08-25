@@ -22,15 +22,22 @@ enum GuestProvisioner {
     nonisolated static let defaultLogsInAutomatically = true
 
     static func makeStartOptions(
-        credentials: GuestCredentials,
-        logsInAutomatically: Bool
+        fullName: String,
+        username: String,
+        password: String,
+        logsInAutomatically: Bool,
+        enablesRemoteLogin: Bool = true
     ) throws -> VZMacOSVirtualMachineStartOptions {
+        if !enablesRemoteLogin {
+            log.warn("Provisioning without Remote Login, as a negative test.")
+        }
+
         let provisioning = VZMacGuestProvisioningOptions()
-        provisioning.fullName = credentials.fullName
-        provisioning.username = credentials.username
-        provisioning.password = credentials.password
+        provisioning.fullName = fullName
+        provisioning.username = username
+        provisioning.password = password
         provisioning.logsInAutomatically = logsInAutomatically
-        provisioning.enablesRemoteLogin = true
+        provisioning.enablesRemoteLogin = enablesRemoteLogin
 
         let options = VZMacOSVirtualMachineStartOptions()
         do {
@@ -54,14 +61,23 @@ enum GuestProvisioner {
         return options
     }
 
-    /// Starts the VM with provisioning options.
     static func start(
         virtualMachine: VZVirtualMachine,
-        options: VZMacOSVirtualMachineStartOptions
+        options: VZVirtualMachineStartOptions?
     ) async throws {
-        log.info("Starting the virtual machine with guest provisioning options.")
+        log.info(
+            options == nil
+                ? "Starting the virtual machine."
+                : "Starting the virtual machine with guest provisioning options."
+        )
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                guard let options else {
+                    virtualMachine.start { result in
+                        continuation.resume(with: result)
+                    }
+                    return
+                }
                 virtualMachine.start(options: options) { error in
                     if let error {
                         continuation.resume(throwing: error)

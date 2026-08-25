@@ -1,7 +1,8 @@
 # `hello` — a minimal Vivarium example
 
 The smallest project that exercises the manifest, both harvesting paths, and
-streamed output.
+streamed output. Its test command is POSIX `sh`, so it runs unchanged on
+either guest.
 
 ```
 examples/hello/

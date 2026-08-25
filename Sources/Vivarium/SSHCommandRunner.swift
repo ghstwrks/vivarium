@@ -34,18 +34,9 @@ struct SSHResult: Sendable {
     }
 }
 
-/// Runs commands in the guest over the system OpenSSH client.
-///
-/// `/usr/bin/ssh` needs no library and makes stdout, stderr, and termination
-/// status trivially separable through `Process`. The cost is the password:
-/// OpenSSH will not read one from an argument or from stdin, so an askpass
-/// helper is required. That is acceptable against a NAT-local VM whose
-/// credential is generated per run and never persisted; it is not a
-/// credential-management design, and the limitations are documented on
-/// `AskpassHelper`.
 struct SSHCommandRunner: Sendable {
     let username: String
-    let password: String
+    let authentication: GuestAuthentication
     let address: String
     let knownHostsFile: URL
 
@@ -71,7 +62,7 @@ struct SSHCommandRunner: Sendable {
     /// argument vector visible in the guest's process list.
     func run(
         remoteCommand: String,
-        stdinData: Data,
+        stdinData: Data?,
         timeout: Duration,
         redactedCommand: String? = nil
     ) async throws -> SSHResult {
@@ -122,20 +113,33 @@ struct SSHCommandRunner: Sendable {
         onStdout: (@Sendable (Data) -> Void)? = nil,
         onStderr: (@Sendable (Data) -> Void)? = nil
     ) async throws -> SSHResult {
-        let helper = try AskpassHelper()
-        defer { helper.remove() }
+        let helper: AskpassHelper?
+        let environment: [String: String]?
+        switch authentication {
+        case let .password(password):
+            let created = try AskpassHelper()
+            helper = created
+            environment = created.environment(password: password)
+        case .privateKey, .unavailable:
+            helper = nil
+            environment = nil
+        }
+        defer { helper?.remove() }
 
-        var arguments = Self.baseArguments(knownHostsFile: knownHostsFile)
+        let base = Self.baseArguments(
+            knownHostsFile: knownHostsFile, authentication: authentication
+        )
+        var arguments = base
         arguments.append("\(username)@\(address)")
         arguments.append(remoteCommand)
 
-        var redacted = Self.baseArguments(knownHostsFile: knownHostsFile)
+        var redacted = base
         redacted.append("\(username)@\(address)")
         redacted.append(redactedCommand ?? remoteCommand)
 
         let result = try await ProcessRunner.run(
             "/usr/bin/ssh", arguments,
-            environment: helper.environment(password: password),
+            environment: environment,
             stdinData: stdinData,
             timeout: timeout,
             redactedArguments: redacted,
@@ -148,22 +152,42 @@ struct SSHCommandRunner: Sendable {
         return SSHResult(outcome: Self.classify(result), command: result)
     }
 
-    static func baseArguments(knownHostsFile: URL) -> [String] {
-        [
+    private static func baseArguments(
+        knownHostsFile: URL,
+        authentication: GuestAuthentication
+    ) -> [String] {
+        var arguments = [
             "-o", "ConnectTimeout=5",
             "-o", "ConnectionAttempts=1",
-            "-o", "PreferredAuthentications=password,keyboard-interactive",
-            "-o", "PubkeyAuthentication=no",
             // accept-new records the guest's key on first contact but still
             // refuses a *changed* key. Host-key checking is never disabled
             // globally; the per-run file keeps a reused address from poisoning
             // the operator's own known_hosts.
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "UserKnownHostsFile=\(knownHostsFile.path)",
-            "-o", "LogLevel=ERROR",
-            "-o", "BatchMode=no",
-            "-o", "NumberOfPasswordPrompts=1"
+            "-o", "LogLevel=ERROR"
         ]
+
+        switch authentication {
+        case .password:
+            arguments += [
+                "-o", "PreferredAuthentications=password,keyboard-interactive",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "BatchMode=no",
+                "-o", "NumberOfPasswordPrompts=1"
+            ]
+        case let .privateKey(path, _):
+            arguments += [
+                "-i", path.path,
+                "-o", "PreferredAuthentications=publickey",
+                "-o", "IdentitiesOnly=yes",
+                "-o", "PasswordAuthentication=no",
+                "-o", "BatchMode=yes"
+            ]
+        case .unavailable:
+            arguments += ["-o", "BatchMode=yes"]
+        }
+        return arguments
     }
 
     /// Separates remote exit statuses from SSH's own failures.

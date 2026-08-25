@@ -38,6 +38,14 @@ inputs:
       home, which the runner must already have (see docs/github-actions.md).
     required: false
     default: ""
+  os:
+    description: >-
+      Which guest to run on — "macos" or "fedora" — when the runner has a
+      template for more than one. Narrows the default choice; a named template
+      already says what it is. Left empty, the newest template of any guest is
+      used.
+    required: false
+    default: ""
   timeout:
     description: >-
       Seconds the test command may take. Bounds the command alone — not the
@@ -199,7 +207,13 @@ runs:
       env:
         VIVARIUM_HOME: ${{ inputs.vivarium-home }}
         VIV: ${{ steps.viv.outputs.viv-path }}
-      run: '"$VIV" preflight'
+        INPUT_OS: ${{ inputs.os }}
+      run: |
+        if [ -n "${INPUT_OS:-}" ]; then
+          "$VIV" preflight --os "$INPUT_OS"
+        else
+          "$VIV" preflight
+        fi
 
     - id: run
       shell: bash
@@ -210,6 +224,7 @@ runs:
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         INPUT_MANIFEST: ${{ inputs.manifest }}
         INPUT_TEMPLATE: ${{ inputs.template }}
+        INPUT_OS: ${{ inputs.os }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
         INPUT_ENV: ${{ inputs.env }}
         INPUT_RUN_ID: ${{ inputs.run-id }}

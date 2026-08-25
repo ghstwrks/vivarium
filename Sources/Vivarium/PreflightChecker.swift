@@ -29,27 +29,27 @@ struct PreflightReport: Codable, Sendable {
 /// Runs before installation so host, entitlement, disk-space, and image
 /// failures are reported without creating a bundle or starting a VM.
 enum PreflightChecker {
-    /// Headroom for the restored system disk plus the artifact disk. The system
-    /// disk is a 128 GiB sparse image whose actual consumption after a restore
-    /// is far smaller, but a run that fills the volume mid-install leaves an
-    /// unusable bundle, so the check is deliberately conservative.
-    static let requiredFreeBytes: Int64 = 80 * 1024 * 1024 * 1024
-
     static func run(
+        platform: any GuestPlatform,
         ipsw: URL?,
         targetDirectory: URL,
         queryLatestSupported: Bool
     ) async -> PreflightReport {
         var checks: [PreflightCheck] = []
 
+        checks.append(PreflightCheck(
+            name: "guest",
+            passed: true,
+            detail: platform.os.displayName
+        ))
         checks.append(checkArchitecture())
-        checks.append(checkHostVersion())
+        checks.append(checkHostVersion(platform.hostRequirement))
         checks.append(checkEntitlement())
-        checks.append(checkFreeSpace(at: targetDirectory))
+        checks.append(checkFreeSpace(at: targetDirectory, required: platform.requiredFreeBytes))
 
         if let ipsw {
             checks.append(contentsOf: await checkRestoreImage(ipsw))
-        } else {
+        } else if platform.os == .macOS {
             checks.append(PreflightCheck(
                 name: "restore image",
                 passed: true,
@@ -85,14 +85,18 @@ enum PreflightChecker {
         #endif
     }
 
-    private static func checkHostVersion() -> PreflightCheck {
+    private static func checkHostVersion(_ requirement: HostRequirement) -> PreflightCheck {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         let text = "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
             + " (\(HostInfo.buildVersion))"
+        let passed = version.majorVersion >= requirement.majorVersion
         return PreflightCheck(
             name: "host macOS version",
-            passed: version.majorVersion >= 27,
-            detail: version.majorVersion >= 27 ? text : "\(text); macOS 27 or later required"
+            passed: passed,
+            detail: passed
+                ? text
+                : "\(text); macOS \(requirement.majorVersion) or later required, because "
+                    + requirement.reason
         )
     }
 
@@ -108,7 +112,7 @@ enum PreflightChecker {
         )
     }
 
-    private static func checkFreeSpace(at directory: URL) -> PreflightCheck {
+    private static func checkFreeSpace(at directory: URL, required: Int64) -> PreflightCheck {
         // Check the nearest existing ancestor: the run directory itself does
         // not exist yet during preflight.
         var probe = directory.standardizedFileURL
@@ -122,10 +126,10 @@ enum PreflightChecker {
             let gibibytes = Double(available) / Double(1 << 30)
             return PreflightCheck(
                 name: "free space",
-                passed: available >= requiredFreeBytes,
+                passed: available >= required,
                 detail: String(
                     format: "%.1f GiB available on %@ (need %.0f GiB)",
-                    gibibytes, probe.path, Double(requiredFreeBytes) / Double(1 << 30)
+                    gibibytes, probe.path, Double(required) / Double(1 << 30)
                 )
             )
         } catch {

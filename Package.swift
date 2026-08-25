@@ -28,7 +28,8 @@ let package = Package(
         .testTarget(
             name: "VivariumTests",
             dependencies: ["Vivarium"],
-            path: "Tests/VivariumTests"
+            path: "Tests/VivariumTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]
 )

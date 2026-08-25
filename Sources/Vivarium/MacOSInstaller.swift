@@ -22,13 +22,15 @@ final class MacOSInstaller {
         self.paths = paths
     }
 
+    static let defaultDiskSizeGiB = 128
+
     /// Creates the system disk image.
     ///
     /// On macOS 16 and later the framework supports ASIF, a sparse format whose
     /// sparsity travels with the file rather than depending on the host
     /// filesystem. Since this package targets macOS 27, the RAW branch present
     /// in Apple's sample is unreachable here and is not carried over.
-    func createSystemDiskImage(sizeGiB: Int = 128) async throws {
+    func createSystemDiskImage(sizeGiB: Int = defaultDiskSizeGiB) async throws {
         guard !FileManager.default.fileExists(atPath: paths.systemDisk.path) else {
             throw VivError(
                 .installation,

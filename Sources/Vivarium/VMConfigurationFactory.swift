@@ -1,12 +1,6 @@
 import Foundation
 import Virtualization
 
-/// Builds the two distinct VM configurations Vivarium needs.
-///
-/// The install VM exposes only the system disk because installer behaviour
-/// with several writable block devices is undocumented. The run VM is a
-/// separate configuration that adds the artifact disk and VirtioFS share used
-/// by the acceptance proof.
 enum VMConfigurationFactory {
     static let artifactBlockDeviceIdentifier = "viv-artifacts"
 
@@ -166,17 +160,87 @@ enum VMConfigurationFactory {
 
     static func makeVirtioFileSystemShare(
         paths: VMBundlePaths,
+        tag: String,
         readOnly: Bool = false
     ) -> VZVirtioFileSystemDeviceConfiguration {
         let directory = VZSharedDirectory(url: paths.sharedDirectory, readOnly: readOnly)
         let share = VZSingleDirectoryShare(directory: directory)
-        // The automount tag is what makes the share appear under
-        // /Volumes/My Shared Files without the guest running `mount`.
-        let fileSystem = VZVirtioFileSystemDeviceConfiguration(
-            tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag
-        )
+        let fileSystem = VZVirtioFileSystemDeviceConfiguration(tag: tag)
         fileSystem.share = share
         return fileSystem
+    }
+
+    static func makeSeedDisk(paths: VMBundlePaths) throws -> VZVirtioBlockDeviceConfiguration {
+        guard FileManager.default.fileExists(atPath: paths.seedImage.path) else {
+            throw VivError(
+                .runConfiguration,
+                "\(paths.seedImage.path) is missing, so the guest would boot with nothing to "
+                    + "tell it who to be and no way in."
+            )
+        }
+        do {
+            let attachment = try VZDiskImageStorageDeviceAttachment(
+                url: paths.seedImage,
+                readOnly: true,
+                cachingMode: .automatic,
+                synchronizationMode: .none
+            )
+            return VZVirtioBlockDeviceConfiguration(attachment: attachment)
+        } catch {
+            throw VivError(
+                .runConfiguration,
+                "Failed to attach the cloud-init seed at \(paths.seedImage.path).",
+                underlying: error
+            )
+        }
+    }
+
+    static func makeEFIBootLoader(paths: VMBundlePaths) throws -> VZEFIBootLoader {
+        let bootLoader = VZEFIBootLoader()
+        if FileManager.default.fileExists(atPath: paths.efiVariableStore.path) {
+            bootLoader.variableStore = VZEFIVariableStore(url: paths.efiVariableStore)
+            return bootLoader
+        }
+        do {
+            bootLoader.variableStore = try VZEFIVariableStore(
+                creatingVariableStoreAt: paths.efiVariableStore,
+                options: []
+            )
+        } catch {
+            throw VivError(
+                .runConfiguration,
+                "Failed to create the EFI variable store at \(paths.efiVariableStore.path).",
+                underlying: error
+            )
+        }
+        return bootLoader
+    }
+
+    static func makeConsoleSerialPort(
+        paths: VMBundlePaths
+    ) throws -> VZVirtioConsoleDeviceSerialPortConfiguration {
+        let manager = FileManager.default
+        try? manager.createDirectory(
+            at: paths.consoleLog.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !manager.fileExists(atPath: paths.consoleLog.path) {
+            manager.createFile(atPath: paths.consoleLog.path, contents: nil)
+        }
+        guard let handle = try? FileHandle(forWritingTo: paths.consoleLog) else {
+            throw VivError(
+                .runConfiguration,
+                "Cannot open \(paths.consoleLog.path) for the guest's console."
+            )
+        }
+        _ = try? handle.seekToEnd()
+
+        let port = VZVirtioConsoleDeviceSerialPortConfiguration()
+        port.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: nil,
+            fileHandleForWriting: handle
+        )
+        return port
     }
 
     /// A network device with the run's persisted MAC address.
@@ -252,40 +316,33 @@ enum VMConfigurationFactory {
         return configuration
     }
 
-    /// The run configuration: system disk, then artifact disk, then the share.
-    /// - Parameter includesArtifactDisk: whether to attach the separate block
-    ///   device. `viv selftest` needs it: proving a write survived detachment
-    ///   is one of its criteria. `viv run` does not — it harvests through the
-    ///   share — and attaching it anyway would add a `diskutil` partitioning
-    ///   step, and its failure modes, to every run for nothing.
-    static func makeRunConfiguration(
-        paths: VMBundlePaths,
-        macAddress: VZMACAddress,
-        cpuCount: Int,
-        memorySize: UInt64,
-        includesArtifactDisk: Bool = true,
-        shareReadOnly: Bool = false,
-        artifactReadOnly: Bool = false
+    static func makeMacRunConfiguration(
+        _ request: RunConfigurationRequest
     ) throws -> VZVirtualMachineConfiguration {
+        let paths = request.paths
         let configuration = VZVirtualMachineConfiguration()
         configuration.platform = try loadInstalledPlatform(paths: paths)
-        configuration.cpuCount = cpuCount
-        configuration.memorySize = memorySize
+        configuration.cpuCount = request.cpuCount
+        configuration.memorySize = request.memorySize
         configuration.bootLoader = VZMacOSBootLoader()
         configuration.graphicsDevices = [makeGraphicsDevice()]
-        configuration.networkDevices = [makeNetworkDevice(macAddress: macAddress)]
+        configuration.networkDevices = [makeNetworkDevice(macAddress: request.macAddress)]
 
         // Order matters: the system disk must remain the first block device so
         // the boot loader finds the same device it installed onto.
         configuration.storageDevices = [try makeSystemDisk(paths: paths, stage: .runConfiguration)]
-        if includesArtifactDisk {
+        if request.includesArtifactDisk {
             configuration.storageDevices.append(
-                try makeArtifactDisk(paths: paths, readOnly: artifactReadOnly)
+                try makeArtifactDisk(paths: paths, readOnly: request.artifactReadOnly)
             )
         }
 
         configuration.directorySharingDevices = [
-            makeVirtioFileSystemShare(paths: paths, readOnly: shareReadOnly)
+            makeVirtioFileSystemShare(
+                paths: paths,
+                tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag,
+                readOnly: request.shareReadOnly
+            )
         ]
 
         configuration.pointingDevices = [VZMacTrackpadConfiguration()]
@@ -295,6 +352,49 @@ enum VMConfigurationFactory {
             try configuration.validate()
         } catch {
             throw VivError(.runConfiguration, "The run VM configuration is invalid.", underlying: error)
+        }
+
+        return configuration
+    }
+
+    static func makeLinuxRunConfiguration(
+        _ request: RunConfigurationRequest
+    ) throws -> VZVirtualMachineConfiguration {
+        let paths = request.paths
+        let configuration = VZVirtualMachineConfiguration()
+        configuration.platform = VZGenericPlatformConfiguration()
+        configuration.cpuCount = request.cpuCount
+        configuration.memorySize = request.memorySize
+        configuration.bootLoader = try makeEFIBootLoader(paths: paths)
+        configuration.networkDevices = [makeNetworkDevice(macAddress: request.macAddress)]
+
+        configuration.storageDevices = [
+            try makeSystemDisk(paths: paths, stage: .runConfiguration),
+            try makeSeedDisk(paths: paths)
+        ]
+
+        configuration.directorySharingDevices = [
+            makeVirtioFileSystemShare(
+                paths: paths,
+                tag: CloudInitSeed.shareTag,
+                readOnly: request.shareReadOnly
+            )
+        ]
+
+        configuration.serialPorts = [try makeConsoleSerialPort(paths: paths)]
+        configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        configuration.memoryBalloonDevices = [
+            VZVirtioTraditionalMemoryBalloonDeviceConfiguration()
+        ]
+
+        do {
+            try configuration.validate()
+        } catch {
+            throw VivError(
+                .runConfiguration,
+                "The Linux run VM configuration is invalid.",
+                underlying: error
+            )
         }
 
         return configuration

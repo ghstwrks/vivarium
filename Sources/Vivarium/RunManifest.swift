@@ -1,36 +1,5 @@
 import Foundation
 
-/// The provisioned guest account.
-///
-/// The password never reaches `run.json`, a log line, or an argument vector.
-/// It lives in this value and in the child environment of the askpass helper,
-/// and nowhere else.
-struct GuestCredentials: Sendable {
-    let fullName: String
-    let username: String
-    let password: String
-
-    /// Generates a password from the system CSPRNG.
-    ///
-    /// The alphabet excludes characters that macOS account creation has
-    /// historically rejected or that would complicate shell handling, and the
-    /// length is chosen so the result is well beyond guessing even though the
-    /// VM is only reachable on a host-local NAT.
-    static func generate(username: String, fullName: String) -> GuestCredentials {
-        let alphabet = Array("abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789")
-        var password = ""
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        precondition(status == errSecSuccess, "SecRandomCopyBytes failed with \(status).")
-        for byte in bytes {
-            password.append(alphabet[Int(byte) % alphabet.count])
-        }
-        // macOS requires a password that is not trivially weak; a 32-character
-        // mixed-case alphanumeric satisfies every policy the installer applies.
-        return GuestCredentials(fullName: fullName, username: username, password: password)
-    }
-}
-
 /// Everything the acceptance run asserts on, fixed before the VM starts.
 ///
 /// Deciding the tokens, the exit code, and the marker up front is what makes
@@ -85,17 +54,17 @@ struct RunManifest: Codable, Sendable {
     var hostBuild: String
     var hostArchitecture: String
 
-    var ipswPath: String?
-    var ipswSHA256: String?
-    var ipswByteCount: Int64?
-    var restoreImageVersion: String?
-    var restoreImageBuild: String?
+    var sourcePath: String?
+    var sourceSHA256: String?
+    var sourceByteCount: Int64?
+    var guestOSVersion: String?
+    var guestOSBuild: String?
+
+    var guestOS: GuestOS?
 
     var username: String
     var fullName: String
-    /// How to recover the password for a multi-command workflow. The password
-    /// itself is never stored here.
-    var passwordStorage: String
+    var credentialStorage: String
 
     var macAddress: String
     var cpuCount: Int?
@@ -113,9 +82,12 @@ struct RunManifest: Codable, Sendable {
     var finishedAt: Date?
     var outcome: String?
 
+    var os: GuestOS { guestOS ?? .assumedForUnlabelledTemplates }
+
     static func create(
         runID: String,
         bundle: VMBundlePaths,
+        guestOS: GuestOS,
         credentials: GuestCredentials,
         macAddress: String,
         logsInAutomatically: Bool
@@ -130,14 +102,15 @@ struct RunManifest: Codable, Sendable {
             hostOSVersion: "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)",
             hostBuild: HostInfo.buildVersion,
             hostArchitecture: HostInfo.architecture,
-            ipswPath: nil,
-            ipswSHA256: nil,
-            ipswByteCount: nil,
-            restoreImageVersion: nil,
-            restoreImageBuild: nil,
+            sourcePath: nil,
+            sourceSHA256: nil,
+            sourceByteCount: nil,
+            guestOSVersion: nil,
+            guestOSBuild: nil,
+            guestOS: guestOS,
             username: credentials.username,
             fullName: credentials.fullName,
-            passwordStorage: "in-memory only; not persisted",
+            credentialStorage: credentials.storageDescription,
             macAddress: macAddress,
             cpuCount: nil,
             memorySizeBytes: nil,
@@ -160,19 +133,87 @@ struct RunManifest: Codable, Sendable {
     }
 }
 
-/// The record written beside a template bundle.
 struct TemplateManifest: Codable, Sendable {
-    let ipswBuild: String
-    let ipswVersion: String
-    let ipswSHA256: String?
+    let os: GuestOS
+    let osVersion: String
+    let osBuild: String
+    let sourceSHA256: String?
+    let source: String?
     let createdAt: Date
-    /// A digest over the small platform-identity files. The system disk is
-    /// deliberately excluded: it is a 128 GiB sparse image whose full hash
-    /// would cost minutes per template check, and the identity files are what
-    /// determine whether a template is internally consistent.
-    let platformIdentitySHA256: String
+    let platformIdentitySHA256: String?
     let systemDiskByteCount: Int64
-    let createdByRunID: String
+    let systemDiskSHA256: String?
+    let createdByRunID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case os, osVersion, osBuild, sourceSHA256, source, createdAt
+        case platformIdentitySHA256, systemDiskByteCount, systemDiskSHA256, createdByRunID
+        case ipswBuild, ipswVersion, ipswSHA256
+    }
+
+    init(
+        os: GuestOS,
+        osVersion: String,
+        osBuild: String,
+        sourceSHA256: String?,
+        source: String?,
+        createdAt: Date,
+        platformIdentitySHA256: String?,
+        systemDiskByteCount: Int64,
+        systemDiskSHA256: String?,
+        createdByRunID: String?
+    ) {
+        self.os = os
+        self.osVersion = osVersion
+        self.osBuild = osBuild
+        self.sourceSHA256 = sourceSHA256
+        self.source = source
+        self.createdAt = createdAt
+        self.platformIdentitySHA256 = platformIdentitySHA256
+        self.systemDiskByteCount = systemDiskByteCount
+        self.systemDiskSHA256 = systemDiskSHA256
+        self.createdByRunID = createdByRunID
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        os = try container.decodeIfPresent(GuestOS.self, forKey: .os)
+            ?? .assumedForUnlabelledTemplates
+        osVersion = try container.decodeIfPresent(String.self, forKey: .osVersion)
+            ?? container.decode(String.self, forKey: .ipswVersion)
+        osBuild = try container.decodeIfPresent(String.self, forKey: .osBuild)
+            ?? container.decode(String.self, forKey: .ipswBuild)
+        sourceSHA256 = try container.decodeIfPresent(String.self, forKey: .sourceSHA256)
+            ?? container.decodeIfPresent(String.self, forKey: .ipswSHA256)
+        source = try container.decodeIfPresent(String.self, forKey: .source)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        platformIdentitySHA256 = try container.decodeIfPresent(
+            String.self, forKey: .platformIdentitySHA256
+        )
+        systemDiskByteCount = try container.decode(Int64.self, forKey: .systemDiskByteCount)
+        systemDiskSHA256 = try container.decodeIfPresent(String.self, forKey: .systemDiskSHA256)
+        createdByRunID = try container.decodeIfPresent(String.self, forKey: .createdByRunID)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(os, forKey: .os)
+        try container.encode(osVersion, forKey: .osVersion)
+        try container.encode(osBuild, forKey: .osBuild)
+        try container.encodeIfPresent(sourceSHA256, forKey: .sourceSHA256)
+        try container.encodeIfPresent(source, forKey: .source)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encodeIfPresent(platformIdentitySHA256, forKey: .platformIdentitySHA256)
+        try container.encode(systemDiskByteCount, forKey: .systemDiskByteCount)
+        try container.encodeIfPresent(systemDiskSHA256, forKey: .systemDiskSHA256)
+        try container.encodeIfPresent(createdByRunID, forKey: .createdByRunID)
+
+        if os == .macOS {
+            try container.encode(osBuild, forKey: .ipswBuild)
+            try container.encode(osVersion, forKey: .ipswVersion)
+            try container.encodeIfPresent(sourceSHA256, forKey: .ipswSHA256)
+        }
+    }
 }
 
 enum JSONCoding {

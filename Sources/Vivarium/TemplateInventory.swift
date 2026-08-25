@@ -61,9 +61,14 @@ enum TemplateInventory {
         }
     }
 
-    /// The template a command should use when the operator named none.
-    static func newest(in directory: URL = VivariumHome.templates) async -> TemplateSummary? {
-        await summaries(in: directory).first { $0.manifest != nil }
+    static func newest(
+        in directory: URL = VivariumHome.templates,
+        os: GuestOS? = nil
+    ) async -> TemplateSummary? {
+        await summaries(in: directory).first { summary in
+            guard let manifest = summary.manifest else { return false }
+            return os == nil || manifest.os == os
+        }
     }
 
     /// Space actually consumed, via `du`.
