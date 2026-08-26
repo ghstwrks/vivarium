@@ -2,9 +2,9 @@
 
 `action.yml` in the root of this repository is a composite GitHub Action that
 runs a project's tests inside a fresh macOS guest and brings the results back
-out. Every job gets a guest that has never been booted before, and the guest is
-deleted when the job ends: a clean slate that a cached, long-lived runner
-cannot give you.
+out. Every job gets a guest that has never been booted before. By default the
+action reclaims that guest when the job ends, giving a clean slate that a
+cached, long-lived runner cannot provide.
 
 ```yaml
 jobs:
@@ -62,14 +62,16 @@ a hypervisor and a template, not a build environment.
    # a Fedora guest — about half a minute, and nothing to download by hand
    ./viv template create --os fedora
 
-   # a macOS guest — around ninety minutes, from an IPSW downloaded by hand
+   # a macOS guest — a few minutes, from an IPSW downloaded by hand
    ./viv preflight --ipsw ~/Downloads/UniversalMac_27.0_..._Restore.ipsw
    ./viv template create --ipsw ~/Downloads/UniversalMac_27.0_..._Restore.ipsw
    ```
 
-   Every later run clones this in a fraction of a second. A macOS template
-   needs a **local** IPSW, downloaded by hand: there is no download fallback
-   and that is deliberate — see [Why a local IPSW is
+   A measured macOS restore takes around two and a half minutes, though
+   Vivarium allows the installation up to ninety. Every later run clones the
+   template in a fraction of a second. A macOS template needs a **local**
+   IPSW, downloaded by hand: there is no download fallback and that is
+   deliberate — see [Why a local IPSW is
    mandatory](../README.md#why-a-local-ipsw-is-mandatory).
 
    The action does **not** create a template, for either guest. Building one
@@ -260,7 +262,7 @@ never exited; a timeout is not an exit status.
 | `timeout` | manifest's, else 600 | Seconds for the test command alone. |
 | `env` | — | `NAME=value` per line. Where secrets go. |
 | `run-id` | derived | Names the run and its directory. |
-| `keep-vm` | `false` | Keep `VM.bundle` even on a pass. |
+| `keep-vm` | `false` | Keep `VM.bundle` and `Shared/` even on a pass. |
 | `vivarium-home` | `~/.vivarium` | Where templates and runs live. |
 | `viv-path` | — | Use an installed `viv` instead of downloading one. Required when there is no release to match. |
 | `version` | the pinned ref | Release tag to download, overriding the ref. |
@@ -327,9 +329,10 @@ rather than writing over the first one's results. Give those a `run-id`, and an
 
 ## Disk
 
-A run that passes deletes its own guest. A run that **fails keeps everything** —
-bundle, share, results — because the guest that just failed is the most useful
-thing on the host for working out why. On a long-lived runner that is a full
+A passing run deletes its own guest unless `keep-vm` is enabled. A run that
+**fails keeps everything** — bundle, share, results — because the guest that
+just failed is the most useful thing on the host for working out why. On a
+long-lived runner that is a full
 disk by Thursday, so the action runs `viv gc` after every job, which reclaims
 the heavy directories of every finished run and keeps every `results/`.
 

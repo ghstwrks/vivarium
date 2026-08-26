@@ -3,7 +3,7 @@ import Foundation
 /// The stage of the workflow a failure belongs to. Every failure the tool
 /// reports is attributed to exactly one stage so that a failed run says *where*
 /// it broke, not just that it broke.
-enum VivStage: String, Codable, Sendable {
+enum VivStage: String, Codable, Sendable, CaseIterable {
     case preflight
     case bundlePreparation
     case restoreImage
@@ -55,11 +55,9 @@ enum VivStage: String, Codable, Sendable {
 
 /// The tool's single error type.
 ///
-/// The Apple sample this is derived from calls `fatalError` on every failure
-/// path, which destroys the context a first-boot-automation experiment exists
-/// to collect. Every failure here carries the stage, a human-readable message,
-/// the underlying error if there was one, and — where a next step is known — a
-/// concrete command the operator can run to investigate.
+/// Every failure carries its stage, a human-readable message, the underlying
+/// error when available, and concrete inspection commands where a useful next
+/// step is known.
 struct VivError: Error, CustomStringConvertible, Sendable {
     let stage: VivStage
     let message: String
@@ -94,8 +92,8 @@ struct VivError: Error, CustomStringConvertible, Sendable {
     /// `localizedDescription` alone routinely omits for `NSError`s from
     /// Virtualization.
     static func describe(_ error: any Error) -> String {
-        if let pocError = error as? VivError {
-            return pocError.description
+        if let vivError = error as? VivError {
+            return vivError.description
         }
         if let wrapper = error as? InfrastructureFailure {
             // The wrapper says how to exit, not what went wrong; the operator
@@ -163,10 +161,10 @@ struct FailureReport: Codable, Sendable {
         cleanupCompleted: Bool,
         lastReadinessGate: String?
     ) {
-        let pocError = error as? VivError
-        self.stage = pocError?.stage.rawValue ?? stage.rawValue
-        self.message = pocError?.message ?? error.localizedDescription
-        let underlying = pocError?.underlying ?? (pocError == nil ? error : nil)
+        let vivError = error as? VivError
+        self.stage = vivError?.stage.rawValue ?? stage.rawValue
+        self.message = vivError?.message ?? error.localizedDescription
+        let underlying = vivError?.underlying ?? (vivError == nil ? error : nil)
         if let underlying {
             let nsError = underlying as NSError
             self.underlyingDescription = VivError.describe(underlying)
@@ -182,7 +180,7 @@ struct FailureReport: Codable, Sendable {
         self.states = states
         self.bundlePath = bundlePath
         self.cleanupCompleted = cleanupCompleted
-        self.inspectionHints = pocError?.inspectionHints ?? []
+        self.inspectionHints = vivError?.inspectionHints ?? []
         self.lastReadinessGate = lastReadinessGate
     }
 }

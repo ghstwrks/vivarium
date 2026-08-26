@@ -3,21 +3,14 @@ import Virtualization
 
 /// Bridges `VZVirtualMachineDelegate` callbacks into something awaitable.
 ///
-/// Apple's `MacOSVirtualMachineDelegate` calls `exit()` from inside the
-/// delegate methods. That is fine for a sample whose only job is to install,
-/// but here a guest stopping is an ordinary, *expected* event that the
-/// orchestrator has to await and then act on — validating a detached disk, for
-/// instance. The delegate reports; the orchestrator decides.
+/// A guest stopping is an ordinary event that the orchestrator must await and
+/// then act on, such as by validating a detached disk. The delegate reports;
+/// the orchestrator decides.
 ///
-/// A latch rather than an `AsyncStream`. The shutdown path waits twice: once
-/// for `requestStop`, and again after falling back to an in-guest `shutdown -h
-/// now`. `AsyncStream` is single-consumer, and cancelling the first waiter
-/// deinitialises its iterator, which *terminates the stream*. The second wait
-/// then observed an already-finished stream and returned "did not stop" in the
-/// same millisecond it started — so a guest that shut down perfectly well was
-/// destructively killed and the run failed. A latch has no such edge: it
-/// records the terminal outcome once and hands the same answer to every waiter,
-/// early or late.
+/// A latch is used because shutdown can wait once for `requestStop` and again
+/// after an in-guest `shutdown -h now`. It records the terminal outcome once
+/// and returns the same answer to every waiter, including callers that begin
+/// waiting after the event.
 final class VMEventRelay: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
     /// How the guest reached a stopped state.
     enum StopOutcome: Sendable, CustomStringConvertible {

@@ -7,9 +7,8 @@ enum Entitlement {
     /// Whether this binary carries the virtualization entitlement.
     ///
     /// Without it, `VZVirtualMachine(configuration:)` raises an Objective-C
-    /// exception that Swift cannot catch, so the process dies with an opaque
-    /// `NSInvalidArgumentException` roughly ninety minutes into a run. Checking
-    /// at startup converts that into one legible line.
+    /// exception that Swift cannot catch. Checking before installation turns
+    /// that process-ending exception into an actionable error.
     static func hasVirtualizationEntitlement() -> Bool {
         value(for: virtualization) as? Bool ?? false
     }

@@ -2,9 +2,9 @@ import Foundation
 
 /// A project's `viv.json`.
 ///
-/// Every field is optional, and every one of them can be overridden on the
-/// command line: the manifest records what a project usually wants, not what
-/// this invocation must do.
+/// Every field is optional. Invocation-specific options can override the test,
+/// timeout, and environment; the project name and artifact patterns remain the
+/// manifest's description of the project.
 ///
 /// JSON rather than YAML or TOML because `Codable` reads it with no
 /// dependency, and because a project's test command is not a thing worth
@@ -74,6 +74,12 @@ struct VivManifest: Sendable {
         var manifest = VivManifest(artifacts: [], environment: [:])
         manifest.name = try string(fields["name"], key: "name", in: url)
         manifest.test = try string(fields["test"], key: "test", in: url)
+        if manifest.test?.contains("\0") == true {
+            throw VivError(
+                .bundlePreparation,
+                "\(url.path): \"test\" contains a NUL byte, which cannot be passed to a shell."
+            )
+        }
 
         if let raw = fields["artifacts"] {
             guard let patterns = raw as? [String] else {
@@ -105,7 +111,7 @@ struct VivManifest: Sendable {
                 )
             }
             for name in environment.keys.sorted() {
-                try validate(environmentName: name, in: url)
+                try validate(environmentName: name, value: environment[name]!, in: url)
             }
             manifest.environment = environment
         }
@@ -138,7 +144,8 @@ struct VivManifest: Sendable {
         guard !pattern.isEmpty else { throw refuse("is empty") }
         guard !pattern.hasPrefix("/") else { throw refuse("is an absolute path") }
         guard !pattern.hasPrefix("~") else { throw refuse("starts with a home-directory reference") }
-        guard !pattern.contains("\n") else { throw refuse("contains a line break") }
+        guard !pattern.contains(where: \.isNewline) else { throw refuse("contains a line break") }
+        guard !pattern.contains("\0") else { throw refuse("contains a NUL byte") }
         guard !pattern.split(separator: "/").contains("..") else {
             throw refuse("escapes the workdir with \"..\"")
         }
@@ -149,11 +156,12 @@ struct VivManifest: Sendable {
     }
 
     /// The names become `export` statements in the guest, so they have to be
-    /// shell identifiers. The *values* are quoted and may contain anything.
+    /// shell identifiers. Values are quoted and may contain anything except a
+    /// NUL byte, which shell environment variables cannot represent.
     ///
     /// The rules themselves live in `GuestEnvironment`, shared with
     /// `--env-file`, so that a name one of them refuses is refused by both.
-    private static func validate(environmentName name: String, in url: URL) throws {
+    private static func validate(environmentName name: String, value: String, in url: URL) throws {
         guard GuestEnvironment.isUsableName(name) else {
             throw VivError(
                 .bundlePreparation,
@@ -165,6 +173,13 @@ struct VivManifest: Sendable {
             throw VivError(
                 .bundlePreparation,
                 "\(url.path): \"\(name)\" is set by Vivarium and cannot be overridden by \"env\"."
+            )
+        }
+        guard !value.contains("\0") else {
+            throw VivError(
+                .bundlePreparation,
+                "\(url.path): the value of \"\(name)\" contains a NUL byte, which cannot be "
+                    + "represented in a shell environment variable."
             )
         }
     }

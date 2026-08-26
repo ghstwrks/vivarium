@@ -305,15 +305,9 @@ enum ProcessRunner {
 /// A one-shot gate between Foundation's termination callback and the waiting
 /// task.
 ///
-/// This replaces `Process.waitUntilExit()`, which is a run-loop poll performed
-/// on whichever thread calls it. If the child exits before that thread has
-/// installed its wakeup source the event is lost and the thread blocks in
-/// `mach_msg` forever — observed here as a run that sat in address discovery
-/// for over two hours with no child process alive, no pipes open, and a
-/// ten-minute timeout that could never fire because it is only evaluated
-/// between loop iterations. Being edge-triggered by the termination handler
-/// rather than polling removes the race: `signal()` is safe whether it lands
-/// before or after `wait()`.
+/// The termination handler may run before or after `wait()`. Recording the
+/// signal under a lock makes both orders safe and avoids depending on a
+/// run-loop poll to observe process termination.
 final class TerminationLatch: @unchecked Sendable {
     private let lock = NSLock()
     private var hasExited = false

@@ -4,15 +4,10 @@ import Foundation
 ///
 /// Returns `nil` on expiry.
 ///
-/// Polling loops here bound their *total* effort with a deadline
-/// evaluated between attempts, which silently assumes each attempt finishes.
-/// One that never returns therefore hangs the loop for as long as the process
-/// lives, and the outer timeout never gets a chance to fire — exactly the
-/// failure seen when `Process.waitUntilExit()` lost a termination event and a
-/// ten-minute discovery budget overran by two and a half hours. That specific
-/// defect is fixed in `ProcessRunner`; this is the structural guard that keeps
-/// the next one from being unbounded, so a stuck attempt costs one interval and
-/// is retried rather than ending the run.
+/// Polling loops bound their *total* effort with a deadline evaluated between
+/// attempts, which only works if each attempt also finishes. This outer guard
+/// ensures a stuck attempt costs one interval and can be abandoned instead of
+/// blocking the polling loop indefinitely.
 ///
 /// The losing child is cancelled, not killed: Swift cancellation is
 /// cooperative, so an operation blocked in a system call keeps its thread until

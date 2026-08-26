@@ -61,6 +61,14 @@ This project does not yet follow Semantic Versioning strictly — see
   the one 0.1 wrote, the cloud-init documents, and the xz decoder. `just
   test`, and a step in the dogfood workflow. `viv selftest` remains the
   integration test, because it is the half that needs a hypervisor.
+- Unit tests for manifest and environment parsing, and for the run-storage
+  deletion `viv gc` relies on.
+- Unit tests across the surface that can be exercised without a hypervisor:
+  `viv gc`'s classification and its refusals, address discovery's DHCP, ARP,
+  and `ifconfig` parsing, the exit code every stage earns, shell quoting
+  (asserted by running the quoted value back through a shell), the template
+  inventory's ordering and `--os` filtering, and the run directory layout the
+  three lifetimes depend on.
 
 ### Changed
 
@@ -69,7 +77,7 @@ This project does not yet follow Semantic Versioning strictly — see
   optional. **Templates created by 0.1 are read unchanged** — the older
   `ipswBuild`, `ipswVersion`, and `ipswSHA256` are still accepted, and a
   macOS template written now carries both sets of names so that a 0.1 binary
-  can still read it. A restore is ninety minutes of somebody's afternoon.
+  can still read it. Refusing one would cost a restore that is not needed.
 - New templates are named `<os>-<build>.bundle` rather than `<build>.bundle`.
   Existing ones keep their names and work as they always did: what a template
   is comes from its `template.json`, never from its directory name.
@@ -84,6 +92,12 @@ This project does not yet follow Semantic Versioning strictly — see
   `restoreImageVerifiedAsMacOS27OrLater` to `guestImageAccepted` and
   `installSucceeded` to `guestImagePrepared`, because a Fedora template is
   imported rather than restored and neither old name was true of it.
+- The README, the generated CLI help, and the Action documentation now
+  describe what the code does: `--keep-vm` retains both `VM.bundle` and
+  `Shared/`, the `viv.json` fields an invocation can override are named
+  accurately, and the measured restore duration is distinguished from the
+  ninety-minute budget the installation is allowed. Implementation comments
+  describe current invariants rather than past debugging history.
 
 ### Security
 
@@ -101,6 +115,17 @@ This project does not yet follow Semantic Versioning strictly — see
 - macOS's xz decoder stops at the end of the first stream, so a file holding
   several concatenated would decompress to a silently truncated disk image.
   Anything left unread after the stream ends is refused rather than ignored.
+
+### Fixed
+
+- `viv gc --all` now removes dangling symlinks under `runs/` as links. The
+  safety model already refused to follow these entries, but the final removal
+  used an existence check that follows symlinks and therefore treated a link to
+  a missing target as if the link itself did not exist.
+- Manifest validation now rejects NUL bytes in test commands, environment
+  values, and artifact patterns, and rejects every Unicode line separator in
+  artifact patterns. These values are passed through shell strings or a
+  line-oriented here-document and cannot be represented faithfully otherwise.
 
 ## [0.1.0] - 2026-08-10
 

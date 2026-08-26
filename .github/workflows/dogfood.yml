@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "Sources/**"
+      - "Tests/**"
       - "Package.swift"
       - "action.yml"
       - "Scripts/action/**"

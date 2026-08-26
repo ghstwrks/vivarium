@@ -207,13 +207,8 @@ enum DiskImageValidator {
 
     /// Finds the APFS volume whose role is Data.
     ///
-    /// Roles come from `diskutil apfs list`, not from `diskutil info`. An
-    /// earlier version asked `diskutil info -plist` for `APFSVolumeRoles` on
-    /// each volume in turn; that key is simply absent from `info` output, so
-    /// the search silently found nothing and reported "No APFS Data volume
-    /// found" while `disk23s5` sat in the very device list printed alongside
-    /// the error. `diskutil apfs list -plist` reports a `Roles` array per
-    /// volume, and does it for every container in one call.
+    /// Roles come from `diskutil apfs list -plist`, whose per-volume `Roles`
+    /// arrays provide this information for every container in one call.
     ///
     /// Matching stays keyed on role rather than on the name: the name is
     /// localised, and the Signed System Volume must not be the one opened.
