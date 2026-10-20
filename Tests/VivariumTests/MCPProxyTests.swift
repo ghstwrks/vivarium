@@ -38,14 +38,21 @@ private final class Collector: @unchecked Sendable {
 }
 
 /// A server that answers each complete line it reads and records the raw
-/// bytes it was sent, so a test can see exactly what reached it and when.
+/// bytes it was sent, so a test can see exactly what reached it and when. Once
+/// its input reaches EOF it sends `atEOF` and then closes its output, as a
+/// stdio server does when it exits.
 private final class FakeServer: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = Data()
     private var raw = Data()
     private let respond: @Sendable (Data) -> [Data]
 
-    init(input: FileHandle, output: FileHandle, respond: @escaping @Sendable (Data) -> [Data]) {
+    init(
+        input: FileHandle,
+        output: FileHandle,
+        respond: @escaping @Sendable (Data) -> [Data],
+        atEOF: @escaping @Sendable () -> [Data] = { [] }
+    ) {
         self.respond = respond
         Thread.detachNewThread { [self] in
             var pending = Data()
@@ -62,6 +69,8 @@ private final class FakeServer: @unchecked Sendable {
                     }
                 }
             }
+            for reply in atEOF() { try? output.write(contentsOf: reply + Data([0x0A])) }
+            try? output.close()
         }
     }
 
@@ -86,20 +95,29 @@ private struct Harness {
     let proxy: MCPProxy
     let toClient: Collector
 
-    init(retry: (@Sendable (ShareWriteDenial) -> Bool)? = nil) {
+    init(retry: (@Sendable (ShareWriteDenial) -> Bool)? = nil, maxFrameBytes: Int = MCPProxy.defaultMaxFrameBytes) {
         proxy = MCPProxy(
             clientIn: clientIn.fileHandleForReading,
             clientOut: clientOut.fileHandleForWriting,
             serverIn: serverIn.fileHandleForWriting,
             serverOut: serverOut.fileHandleForReading,
             rewriter: rewriter,
-            retryShareWriteDenial: retry
+            retryShareWriteDenial: retry,
+            maxFrameBytes: maxFrameBytes
         )
         toClient = Collector(clientOut.fileHandleForReading)
     }
 
-    func server(_ respond: @escaping @Sendable (Data) -> [Data] = FakeServer.echo) -> FakeServer {
-        FakeServer(input: serverIn.fileHandleForReading, output: serverOut.fileHandleForWriting, respond: respond)
+    func server(
+        _ respond: @escaping @Sendable (Data) -> [Data] = FakeServer.echo,
+        atEOF: @escaping @Sendable () -> [Data] = { [] }
+    ) -> FakeServer {
+        FakeServer(
+            input: serverIn.fileHandleForReading,
+            output: serverOut.fileHandleForWriting,
+            respond: respond,
+            atEOF: atEOF
+        )
     }
 
     func send(_ text: String) throws {
@@ -160,7 +178,7 @@ struct MCPProxyTests {
         try harness.send(frames.joined())
         let expected = Data(frames.joined().utf8)
         #expect(await eventually { harness.toClient.data == expected })
-        #expect(harness.proxy.framesToServer == 3)
+        #expect(await eventually { harness.proxy.framesToServer == 3 })
         #expect(await eventually { harness.proxy.framesToClient == 3 })
 
         harness.proxy.stop()
@@ -223,8 +241,8 @@ struct MCPProxyTests {
         try harness.send("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\"}}\n")
         #expect(await eventually { harness.toClient.data == success + Data([0x0A]) })
         #expect(attempts.value == 2)
-        #expect(harness.proxy.framesToServer == 2)
-        #expect(harness.proxy.framesToClient == 1)
+        #expect(await eventually { harness.proxy.framesToServer == 2 })
+        #expect(await eventually { harness.proxy.framesToClient == 1 })
 
         harness.proxy.stop()
         _ = await running.value
@@ -365,6 +383,129 @@ struct MCPProxyTests {
 
         harness.proxy.stop()
         _ = await running.value
+    }
+
+    @Test("responses the server sends after the client closed its side still reach the client")
+    func deliversResponsesAfterClientEOF() async throws {
+        let late = Data("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"late\"}]}}".utf8)
+        let harness = Harness()
+        _ = harness.server({ _ in [] }, atEOF: { [late] })
+        let running = Task { await harness.proxy.run() }
+        defer { harness.close() }
+
+        try harness.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        try harness.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_tabs\"}}\n")
+        try harness.clientIn.fileHandleForWriting.close()
+
+        guard case .clientEOF = await running.value else {
+            Issue.record("expected clientEOF")
+            return
+        }
+        #expect(await eventually { harness.toClient.data == late + Data([0x0A]) })
+    }
+
+    @Test("a frame past the size limit ends the session")
+    func rejectsOversizedFrames() async throws {
+        let harness = Harness(maxFrameBytes: 100)
+        _ = harness.server()
+        let running = Task { await harness.proxy.run() }
+        defer { harness.close() }
+
+        try harness.send(String(repeating: "x", count: 150))
+        guard case .frameTooLarge = await running.value else {
+            Issue.record("expected frameTooLarge")
+            return
+        }
+    }
+
+    @Test("a complete line past the size limit ends the session, and one at the limit does not")
+    func enforcesTheLimitOnWholeLines() async throws {
+        let atLimit = String(repeating: "y", count: 100)
+        let harness = Harness(maxFrameBytes: 100)
+        _ = harness.server()
+        let running = Task { await harness.proxy.run() }
+        defer { harness.close() }
+
+        try harness.send(atLimit + "\n")
+        #expect(await eventually { harness.toClient.data == Data((atLimit + "\n").utf8) })
+
+        try harness.send(atLimit + "z\n")
+        guard case .frameTooLarge = await running.value else {
+            Issue.record("expected frameTooLarge")
+            return
+        }
+    }
+
+    private static let denialReply = Data("""
+        {"id": 3, "jsonrpc": "2.0", "result": {"content": [{"text": "Tool error: You don\\u2019t have permission to save the file \\u201cx.png\\u201d.", "type": "text"}], "isError": true}}
+        """.utf8)
+
+    @Test("a server that always refuses the write is retried once, then its answer is delivered")
+    func retriesOnlyOnce() async throws {
+        let asked = Counter()
+        let attempts = Counter()
+        let harness = Harness(retry: { _ in _ = asked.increment(); return true })
+        _ = harness.server { _ in _ = attempts.increment(); return [Self.denialReply] }
+        let running = Task { await harness.proxy.run() }
+        defer { harness.close() }
+
+        try harness.send("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\"}}\n")
+        #expect(await eventually { harness.toClient.data == Self.denialReply + Data([0x0A]) })
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(attempts.value == 2)
+        #expect(asked.value == 1)
+        #expect(harness.proxy.framesToClient == 1)
+
+        harness.proxy.stop()
+        _ = await running.value
+    }
+
+    @Test("a callback that declines the retry leaves the first answer to be delivered")
+    func declinedRetryDelivers() async throws {
+        let asked = Counter()
+        let attempts = Counter()
+        let harness = Harness(retry: { _ in _ = asked.increment(); return false })
+        _ = harness.server { _ in _ = attempts.increment(); return [Self.denialReply] }
+        let running = Task { await harness.proxy.run() }
+        defer { harness.close() }
+
+        try harness.send("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\"}}\n")
+        #expect(await eventually { harness.toClient.data == Self.denialReply + Data([0x0A]) })
+        #expect(attempts.value == 1)
+        #expect(asked.value == 1)
+
+        harness.proxy.stop()
+        _ = await running.value
+    }
+
+    @Test("a request that is never answered does not disturb later traffic")
+    func unansweredRequestIsHarmless() async throws {
+        let harness = Harness()
+        _ = harness.server { line in
+            String(decoding: line, as: UTF8.self).contains("\"id\":9") ? [] : [line]
+        }
+        let running = Task { await harness.proxy.run() }
+        defer { harness.close() }
+
+        try harness.send("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"screenshot\"}}\n")
+        let later = "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"ping\"}\n"
+        try harness.send(later)
+        #expect(await eventually { harness.toClient.data == Data(later.utf8) })
+
+        harness.proxy.stop()
+        _ = await running.value
+    }
+
+    @Test("running a proxy a second time returns at once")
+    func runsOnce() async {
+        let harness = Harness()
+        defer { harness.close() }
+        harness.proxy.stop()
+        _ = await harness.proxy.run()
+        guard case .stopped = await harness.proxy.run() else {
+            Issue.record("expected stopped")
+            return
+        }
     }
 }
 
