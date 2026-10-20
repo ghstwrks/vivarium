@@ -714,12 +714,10 @@ final class Orchestrator {
     ///
     /// The virtual machine is an object in this process, so "leave it running"
     /// can only mean "do not return yet": the guest dies with the process
-    /// whatever else happens. SIGINT is taken over rather than left to its
-    /// default disposition, which would kill the process — and the guest —
-    /// before any handler saw it. The wait is a dispatch source on the main
-    /// queue because that is the main actor's own executor: suspending here
-    /// lets the queue run, and the handler arrives back on the actor that owns
-    /// the machine.
+    /// whatever else happens. SIGINT is taken over by a `SignalWatcher` rather
+    /// than left to its default disposition, which would kill the process —
+    /// and the guest — before any handler saw it. Only SIGINT: the hold is for
+    /// a person at a terminal, and any other signal keeps its usual effect.
     private func holdForInspection(reason: String) async {
         let address = report?.guestAddress ?? "an address that was never discovered"
         print("""
@@ -741,23 +739,11 @@ final class Orchestrator {
         // wait ended, which is no use to the person waiting.
         fflush(stdout)
 
-        signal(SIGINT, SIG_IGN)
-        let resumed = AtomicFlag()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-            source.setEventHandler {
-                // A second SIGINT can be delivered before the cancel takes
-                // effect, and resuming a continuation twice is a crash.
-                guard !resumed.value else { return }
-                resumed.set()
-                source.cancel()
-                continuation.resume()
-            }
-            source.resume()
-        }
+        let interrupt = SignalWatcher(signals: [SIGINT])
+        _ = await interrupt.wait()
         // Back to the default disposition, so a second Ctrl-C during the stop
         // below ends the process rather than being swallowed.
-        signal(SIGINT, SIG_DFL)
+        interrupt.stop()
 
         log.warn("Interrupted: force-stopping the guest.")
         await forceStopForCleanup()
