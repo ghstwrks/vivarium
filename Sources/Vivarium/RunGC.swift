@@ -21,6 +21,10 @@ import Darwin
 ///   no report to read).
 /// - `--all` deletes every run directory outright: kept-for-inspection,
 ///   reportless, all of it.
+/// - A browser session's heartbeat overrides all three. A fresh one means
+///   the session is still serving from its bundle, so the run is skipped
+///   whatever the selection; a stale one means the process serving it has
+///   gone, so the run counts as finished. See `SessionHeartbeat`.
 /// - A symlinked entry under `runs/` is always deleted as the link it is,
 ///   never followed into whatever it points at — default mode does not even
 ///   inspect it, because inspecting a real run directory's contents means
@@ -110,11 +114,28 @@ enum RunGC {
             ? try? JSONCoding.read(TestRunReport.self, from: layout.reportJSON, stage: .cleanup)
             : nil
         let hasFailureReport = FileManager.default.fileExists(atPath: layout.failureReport.path)
+        let hasSessionReport = FileManager.default.fileExists(atPath: layout.sessionReport.path)
+        let heartbeat = SessionHeartbeat.state(of: layout.heartbeat, now: now)
         let referenceDate = report?.finishedAt ?? modificationDate(of: entry) ?? now
         let ageDescription = age(from: referenceDate, to: now)
+
+        // A live session's guest is executing from this bundle in another
+        // process, so no selection, `--all` included, deletes any of it.
+        if case let .fresh(beatAge) = heartbeat, !hasSessionReport {
+            return Action(
+                runID: runID, root: entry, targets: [],
+                label: "browser session still serving (heartbeat \(age(seconds: beatAge)) ago), skipped",
+                ageDescription: ageDescription, byteCount: 0, isSkip: true
+            )
+        }
+        let orphanedSession: Bool
+        if case .stale = heartbeat { orphanedSession = true } else { orphanedSession = false }
+        let finished = hasReport || hasFailureReport || hasSessionReport || orphanedSession
+
         let label = label(
             report: report, hasReport: hasReport,
-            hasFailureReport: hasFailureReport, hasBundle: hasBundle
+            hasFailureReport: hasFailureReport, hasSessionReport: hasSessionReport,
+            orphanedSession: orphanedSession, hasBundle: hasBundle
         )
 
         switch selection {
@@ -130,7 +151,7 @@ enum RunGC {
                 return await defaultAction(
                     runID: runID, entry: entry, layout: layout, label: label,
                     hasFailureReport: hasFailureReport, hasBundle: hasBundle,
-                    finished: hasReport || hasFailureReport, ageDescription: ageDescription
+                    finished: finished, ageDescription: ageDescription
                 )
             }
             let bytes = await RunStorage.onDiskByteCount(of: entry) ?? 0
@@ -143,7 +164,7 @@ enum RunGC {
             return await defaultAction(
                 runID: runID, entry: entry, layout: layout, label: label,
                 hasFailureReport: hasFailureReport, hasBundle: hasBundle,
-                finished: hasReport || hasFailureReport, ageDescription: ageDescription
+                finished: finished, ageDescription: ageDescription
             )
         }
     }
@@ -223,7 +244,8 @@ enum RunGC {
     }
 
     private static func label(
-        report: TestRunReport?, hasReport: Bool, hasFailureReport: Bool, hasBundle: Bool
+        report: TestRunReport?, hasReport: Bool, hasFailureReport: Bool,
+        hasSessionReport: Bool, orphanedSession: Bool, hasBundle: Bool
     ) -> String {
         if let report {
             switch report.status {
@@ -233,9 +255,11 @@ enum RunGC {
             }
         }
         if hasFailureReport { return "infrastructure failure" }
+        if hasSessionReport { return "browser session ended" }
         // A report that is there but is not a `viv run` report: a selftest's,
         // which says nothing about a test command's verdict.
         if hasReport { return "finished" }
+        if orphanedSession { return "browser session gone (heartbeat stale)" }
         return hasBundle ? "no report" : "empty"
     }
 
@@ -288,7 +312,11 @@ enum RunGC {
     /// A coarse age for the per-run line: seconds, minutes, hours, or days —
     /// whichever reads best at that magnitude.
     private static func age(from date: Date, to now: Date) -> String {
-        let seconds = max(0, now.timeIntervalSince(date))
+        age(seconds: now.timeIntervalSince(date))
+    }
+
+    private static func age(seconds: TimeInterval) -> String {
+        let seconds = max(0, seconds)
         switch seconds {
         case ..<60: return "\(Int(seconds))s"
         case ..<3600: return "\(Int(seconds / 60))m"

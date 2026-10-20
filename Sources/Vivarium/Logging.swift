@@ -70,7 +70,9 @@ final class Logger: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
-        FileHandle.standardError.write(data)
+        // The throwing write: the other one raises an Objective-C exception,
+        // which ends the process, when nothing is reading standard error.
+        try? FileHandle.standardError.write(contentsOf: data)
         try? fileHandle?.write(contentsOf: data)
     }
 }

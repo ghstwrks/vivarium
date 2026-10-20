@@ -146,6 +146,61 @@ readable by every process on the host, which makes it the wrong place for a
 token. Parsing is literal, not dotenv: everything after the first `=` is the
 value, quotes and `$` included.
 
+### `viv browser [options] [-- <app command…>]`
+
+Serves Safari's own MCP server (`safaridriver --mcp`, which ships with
+Safari 27) from a fresh macOS guest, so a coding agent can look at a web app
+in real Safari that starts from the same state every time:
+
+```sh
+claude mcp add safari -- viv browser --code . --app-port 5173 -- npm run dev
+```
+
+`viv browser` *is* the MCP server as far as the client is concerned: its
+standard input and output carry the stdio transport, newline-delimited
+JSON-RPC, and nothing else ever reaches standard output. Everything Vivarium
+has to say — the log, a banner with the guest's address and the host's, any
+error — goes to standard error. Underneath, it boots a clone of the newest
+macOS template (or `--template <path>`), copies `--code <dir>` into the
+guest's workdir if given, enables Safari's remote automation for the
+provisioned user (no root needed), and runs `safaridriver --mcp` over
+`ssh -T`, with `viv` relaying frames between the two. From a template the
+server is up about twenty seconds after the command starts; a client may
+send its first frame at once, but one whose startup timeout is shorter than
+a minute needs it raised.
+
+Screenshots and page contents land on the run's share, under
+`<home>/runs/<run-id>/Shared/artifacts`: a `screenshot` or
+`get_page_content` call without a `savePath` is given one there, and the
+guest paths in the server's answers are rewritten to the host paths, so the
+agent can open the files directly.
+
+The words after `--` are the app under test, started detached in the
+guest's workdir with its output in `app.log` among the artifacts. It has to
+stay in the foreground: a command that daemonises and returns, such as
+`docker compose up -d`, is reported as having exited. `--app-port <port>`
+waits until it listens, and Safari reaches it at
+`http://localhost:<port>/`. Without an app, Safari reaches a server on the
+host at the guest's gateway address, which the banner and the report give —
+provided that server listens on an address the guest can reach, not only on
+`127.0.0.1`.
+
+The session ends when standard input closes; on SIGINT, SIGTERM, or SIGHUP,
+which during setup stop it in order too, once the guest has started; after
+`--max-lifetime <seconds>` (default two hours); after
+`--idle-timeout <seconds>` with no traffic in either direction (default
+twenty minutes); or when the server or the guest stops. The guest is then
+shut down, the artifacts are copied into `results/artifacts`, and
+`results/session.json` records when the session started and ended, why it
+ended, the guest's and the host's addresses, the phases with their times,
+the frames carried each way, the artifacts, and whether the session was
+`orderly`: ended by the client or the operator, with the guest shutting down
+cleanly afterwards. Only an orderly session deletes its bundle and exits 0;
+any other keeps the bundle for inspection and exits 1. From the moment its
+run directory exists until the teardown is over, the session rewrites
+`<run>/heartbeat` every thirty seconds, which is how `viv gc` tells it apart
+from the remains of one whose process was killed.
+
 ### `viv selftest [options]`
 
 The proof of concept's acceptance run, preserved as Vivarium's own
@@ -186,7 +241,10 @@ lists what would be deleted and deletes nothing. The two widening flags are
 not more of the same: `--older-than <days>` and `--all` delete **whole run
 directories, `results/` included**. `gc` only ever touches `<home>/runs`; it never touches
 `<home>/templates`, and it never touches `~/VRE-POC`, the proof of concept's
-home, which Vivarium does not read or write.
+home, which Vivarium does not read or write. A `viv browser` session whose
+heartbeat is fresh is skipped by every mode, `--all` included, because its
+guest is still running from that bundle; one whose heartbeat is more than
+five minutes old has lost its process, and counts as finished.
 
 ## The `viv.json` manifest
 
@@ -344,6 +402,12 @@ computed by the same code that would do it. Templates, and anything outside
 Your tests failing is not Vivarium failing. A `1` means Vivarium did its job
 completely and correctly and your command was unhappy about something; a
 `70` means Vivarium itself could not get far enough to ask.
+
+`viv browser` has no test command, so the same codes mean the nearest
+thing: `0` when the client or the operator ended the session and the guest
+shut down cleanly, `1` when the MCP server or the guest ended it or the
+guest did not shut down cleanly, and `70` when the session could not be set
+up at all.
 
 ## Continuous integration
 

@@ -47,8 +47,10 @@ enum VivariumMain {
         exit(code)
     }
 
+    /// The throwing write, for the reason `Logger` gives: the other raises an
+    /// exception when nothing is reading.
     private static func write(_ text: String, to handle: FileHandle) {
-        handle.write(Data((text + "\n").utf8))
+        try? handle.write(contentsOf: Data((text + "\n").utf8))
     }
 }
 
@@ -108,6 +110,7 @@ struct Viv: AsyncParsableCommand {
             PreflightCommand.self,
             TemplateCommand.self,
             RunCommand.self,
+            BrowserCommand.self,
             SelftestCommand.self,
             ValidateCommand.self,
             GCCommand.self
@@ -872,7 +875,7 @@ struct RunCommand: AsyncParsableCommand {
             environment.merge(supplied) { _, fromFile in fromFile }
         }
 
-        let identifier = try resolvedRunID()
+        let identifier = try Self.validatedRunID(runID)
 
         let templateRoot = try await Self.resolveTemplate(named: template?.url, os: os)
 
@@ -899,7 +902,7 @@ struct RunCommand: AsyncParsableCommand {
     /// leading dot is refused because `viv gc --all` skips hidden entries, and
     /// a leading dash because the resulting path reads as a flag in every
     /// command anyone would then run against it.
-    private func resolvedRunID() throws -> String? {
+    static func validatedRunID(_ runID: String?) throws -> String? {
         guard let runID else { return nil }
 
         func refuse(_ reason: String) -> ValidationError {
@@ -967,13 +970,235 @@ struct RunCommand: AsyncParsableCommand {
     /// anything the guest's shell would act on gets that layer put back. Words
     /// that need nothing are left alone, so the command in the report reads the
     /// way it was typed.
-    private static func joined(_ words: [String]) -> String {
+    static func joined(_ words: [String]) -> String {
         let safe = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-./=:@+,")
         return words.map { word in
             word.isEmpty || word.unicodeScalars.contains(where: { !safe.contains($0) })
                 ? ShellEscaping.singleQuoted(word)
                 : word
         }.joined(separator: " ")
+    }
+}
+
+// MARK: - browser
+
+struct BrowserCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "browser",
+        abstract: "Serve Safari's MCP server from a fresh macOS guest, over stdio.",
+        discussion: """
+            Boots a fresh macOS guest, prepares Safari for remote automation, \
+            and serves Safari's own MCP server (safaridriver --mcp, Safari 27 \
+            and later) on this command's standard input and output. An agent \
+            gets real Safari, in a guest that starts from the same state every \
+            time:
+
+              claude mcp add safari -- viv browser --code . -- npm run dev
+
+            Standard input and standard output carry the MCP stdio transport, \
+            newline-delimited JSON-RPC, and nothing else: from the moment this \
+            command starts, the server's frames are the only thing written to \
+            standard output. Log lines, the banner giving the guest's and the \
+            host's addresses, and errors all go to standard error. A client \
+            may send its first frame at once; it is read when the server is \
+            up, around twenty seconds after the command starts, so a client \
+            with a startup timeout shorter than a minute should have it \
+            raised.
+
+            Screenshots and page contents are saved on the run's share, in \
+            <home>/runs/<run-id>/Shared/artifacts, and the guest paths in the \
+            server's responses are rewritten to those host paths, so the \
+            client can open the files directly. A screenshot or \
+            get_page_content call without a savePath is given one there.
+
+            The words after -- are the app under test. They are started in \
+            the guest's copy of --code, detached, with their output in app.log \
+            among the artifacts. The command must stay in the foreground: one \
+            that daemonises and returns, such as `docker compose up -d`, is \
+            reported as having exited. With --app-port the session waits until \
+            something in the guest listens on that port, and Safari reaches it \
+            at http://localhost:<port>/. Without an app, Safari reaches a \
+            server on this Mac at the guest's gateway address, which the \
+            banner and the report give. That server must listen on an address \
+            the guest can reach, such as 0.0.0.0, not only on 127.0.0.1.
+
+            The session ends when standard input closes; on SIGINT, SIGTERM, \
+            or SIGHUP, including during setup once the guest has started; \
+            after --max-lifetime; after --idle-timeout with no traffic in \
+            either direction; or when the server or the guest stops. The guest \
+            is then shut down, the artifacts are copied into \
+            results/artifacts, and results/session.json is written. The bundle \
+            is deleted only when the client or the operator ended the session \
+            and the guest shut down cleanly; otherwise it is kept for \
+            inspection.
+
+            Exits 0 when the client or the operator ended the session and the \
+            guest shut down cleanly, 1 when the server or the guest ended it or \
+            the guest did not shut down cleanly, and 70 when the session could \
+            not be set up.
+            """
+    )
+
+    @Option(
+        name: .customLong("template"),
+        help: ArgumentHelp(
+            "Clone this macOS template. Defaults to the newest in the Vivarium home.",
+            valueName: "path"
+        )
+    )
+    var template: PathArgument?
+
+    @Option(
+        name: .customLong("os"),
+        help: ArgumentHelp(
+            "The guest to serve from. Only macos has Safari.",
+            valueName: "name"
+        )
+    )
+    var os: GuestOS?
+
+    @Option(
+        name: .customLong("code"),
+        help: ArgumentHelp(
+            "The directory to copy into the guest's workdir. Without it the workdir is empty.",
+            valueName: "path"
+        )
+    )
+    var code: PathArgument?
+
+    @Option(
+        name: .customLong("run-id"),
+        help: ArgumentHelp(
+            "Name this session's run instead of generating an identifier for it.",
+            discussion: "The same rules as `viv run --run-id`.",
+            valueName: "id"
+        )
+    )
+    var runID: String?
+
+    @Option(
+        name: .customLong("max-lifetime"),
+        help: ArgumentHelp("Seconds the session may serve, whatever its traffic.", valueName: "seconds")
+    )
+    var maxLifetime: Int = Self.defaultMaxLifetimeSeconds
+
+    @Option(
+        name: .customLong("idle-timeout"),
+        help: ArgumentHelp(
+            "Seconds without a frame in either direction before the session ends.",
+            valueName: "seconds"
+        )
+    )
+    var idleTimeout: Int = Self.defaultIdleTimeoutSeconds
+
+    @Option(
+        name: .customLong("app-port"),
+        help: ArgumentHelp(
+            """
+            Wait until the app under test listens on this port in the guest \
+            before serving. Waits up to \(GuestScripts.defaultAppPortTimeoutSeconds) \
+            seconds.
+            """,
+            valueName: "port"
+        )
+    )
+    var appPort: Int?
+
+    /// The app under test, after a bare `--`, keeping its own flags.
+    @Argument(
+        parsing: .postTerminator,
+        help: ArgumentHelp(
+            "The app under test, after --, started detached in the guest's workdir.",
+            valueName: "command"
+        )
+    )
+    var appCommand: [String] = []
+
+    static let defaultMaxLifetimeSeconds = 7200
+    static let defaultIdleTimeoutSeconds = 1200
+
+    func validate() throws {
+        if let os, os != .macOS {
+            throw ValidationError("--os \(os.rawValue) has no Safari; viv browser needs a macOS guest.")
+        }
+        guard maxLifetime > 0 else {
+            throw ValidationError("--max-lifetime must be a positive number of seconds.")
+        }
+        guard idleTimeout > 0 else {
+            throw ValidationError("--idle-timeout must be a positive number of seconds.")
+        }
+        if let appPort {
+            guard (1...65535).contains(appPort) else {
+                throw ValidationError("--app-port must be between 1 and 65535.")
+            }
+            guard !appCommand.isEmpty else {
+                throw ValidationError("--app-port waits for the app after --, and there is none.")
+            }
+        }
+    }
+
+    func run() async throws {
+        let plan = try await makePlan()
+        let stdio = try ReservedStdio.reserve()
+
+        var options = OrchestratorOptions()
+        options.fromTemplate = plan.templateRoot
+        options.runID = plan.runID
+        // Safari is driven in the console session that auto-login opens.
+        options.logsInAutomatically = true
+        options.includesArtifactDisk = false
+        options.writesHeartbeat = true
+
+        let report: BrowserSessionReport
+        do {
+            report = try await withOrchestrator(options) { orchestrator in
+                try await orchestrator.runSession(
+                    plan: plan,
+                    clientInput: stdio.clientInput,
+                    clientOutput: stdio.clientOutput
+                )
+            }
+        } catch {
+            throw InfrastructureFailure(error)
+        }
+        guard report.orderly else { throw ExitCode(ExitStatus.testFailure) }
+    }
+
+    /// Checks everything that can be wrong with the request before a guest
+    /// is booted.
+    func makePlan() async throws -> BrowserSessionPlan {
+        var codeDirectory: URL?
+        if let code {
+            // Resolved for the reason `viv run` gives.
+            let resolved = code.url.resolvingSymlinksInPath().standardizedFileURL
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else {
+                throw ValidationError("\(resolved.path) is not a directory.")
+            }
+            codeDirectory = resolved
+        }
+
+        let identifier = try RunCommand.validatedRunID(runID)
+
+        let templateRoot = try await RunCommand.resolveTemplate(named: template?.url, os: .macOS)
+        let templateOS = try TemplateManager.readManifest(of: TemplatePaths(root: templateRoot)).os
+        guard templateOS == .macOS else {
+            throw ValidationError(
+                "\(templateRoot.path) holds a \(templateOS.displayName) guest; viv browser needs "
+                    + "a macOS one."
+            )
+        }
+
+        return BrowserSessionPlan(
+            runID: identifier,
+            templateRoot: templateRoot,
+            codeDirectory: codeDirectory,
+            appCommand: appCommand.isEmpty ? nil : RunCommand.joined(appCommand),
+            appPort: appPort,
+            maxLifetime: .seconds(maxLifetime),
+            idleTimeout: .seconds(idleTimeout)
+        )
     }
 }
 
@@ -1236,6 +1461,12 @@ struct GCCommand: AsyncParsableCommand {
             the directory's own modification date, when there is no report). \
             --all deletes every run directory outright, kept-for-inspection \
             and reportless ones included.
+
+            A `viv browser` session rewrites <run>/heartbeat every 30 seconds \
+            while it serves. A run whose heartbeat is fresh is skipped by \
+            every mode, --all included, because its guest is still running \
+            from that bundle; one whose heartbeat is more than five minutes \
+            old lost the process serving it, and counts as finished.
             """
     )
 

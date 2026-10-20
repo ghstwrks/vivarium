@@ -469,3 +469,70 @@ struct RunGarbageCollectionTests {
         try body()
     }
 }
+
+/// A browser session's heartbeat, last written `age` seconds before `now`.
+private func writeHeartbeat(for root: URL, age: TimeInterval, now: Date) throws {
+    let layout = RunLayout(runID: root.lastPathComponent, root: root)
+    try Data("beat\n".utf8).write(to: layout.heartbeat)
+    try FileManager.default.setAttributes(
+        [.modificationDate: now.addingTimeInterval(-age)], ofItemAtPath: layout.heartbeat.path
+    )
+}
+
+extension RunGarbageCollectionTests {
+    @Test("a session whose heartbeat is fresh is still serving, and is left alone")
+    func skipsLiveSession() async throws {
+        let runs = try makeRunsRoot()
+        let now = Date()
+        let root = try makeRun("serving", in: runs, bundle: true, shared: true)
+        try writeHeartbeat(for: root, age: 20, now: now)
+
+        let plan = try await RunGC.plan(selection: .heavyRemainsOfFinishedRuns, in: runs, now: now)
+        let entry = try action(plan, "serving")
+        #expect(entry.isSkip)
+        #expect(entry.label.contains("still serving"))
+    }
+
+    @Test("not even --all deletes a session that is still serving")
+    func allSparesLiveSession() async throws {
+        let runs = try makeRunsRoot()
+        let now = Date()
+        let root = try makeRun("serving", in: runs, bundle: true, shared: true)
+        try writeHeartbeat(for: root, age: SessionHeartbeat.staleAfter - 1, now: now)
+
+        let plan = try await RunGC.plan(selection: .all, in: runs, now: now)
+        #expect(try action(plan, "serving").isSkip)
+        try RunGC.execute(plan)
+        #expect(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    @Test("a session whose heartbeat is stale has lost its process, and is reclaimed")
+    func reclaimsOrphanedSession() async throws {
+        let runs = try makeRunsRoot()
+        let now = Date()
+        let root = try makeRun("orphan", in: runs, bundle: true, shared: true)
+        try writeHeartbeat(for: root, age: SessionHeartbeat.staleAfter + 1, now: now)
+
+        let plan = try await RunGC.plan(selection: .heavyRemainsOfFinishedRuns, in: runs, now: now)
+        let entry = try action(plan, "orphan")
+        #expect(entry.isSkip == false)
+        #expect(Set(entry.targets.map(\.lastPathComponent)) == ["VM.bundle", "Shared"])
+        #expect(entry.label.contains("heartbeat stale"))
+    }
+
+    @Test("a session that wrote its report is finished, whatever its heartbeat says")
+    func reclaimsEndedSession() async throws {
+        let runs = try makeRunsRoot()
+        let now = Date()
+        let root = try makeRun("ended", in: runs, bundle: true, shared: true)
+        let layout = RunLayout(runID: "ended", root: root)
+        try FileManager.default.createDirectory(at: layout.results, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: layout.sessionReport)
+        try writeHeartbeat(for: root, age: 5, now: now)
+
+        let plan = try await RunGC.plan(selection: .heavyRemainsOfFinishedRuns, in: runs, now: now)
+        let entry = try action(plan, "ended")
+        #expect(entry.isSkip == false)
+        #expect(entry.label == "browser session ended")
+    }
+}

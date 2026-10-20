@@ -359,8 +359,53 @@ struct MCPProxyTests {
 
         try harness.serverIn.fileHandleForReading.close()
         try harness.send(ping + "\n")
-        guard case .writeFailed(let error) = await running.value else {
-            Issue.record("expected writeFailed")
+        guard case .writeFailed(.server, let error) = await running.value else {
+            Issue.record("expected writeFailed to the server")
+            return
+        }
+        #expect((error as? POSIXError)?.code == .EPIPE)
+    }
+
+    @Test("the client's EOF is observable before a server that keeps its output open finishes")
+    func clientEOFObservable() async throws {
+        let harness = Harness()
+        let running = Task { await harness.proxy.run() }
+        defer { harness.close() }
+
+        try harness.clientIn.fileHandleForWriting.close()
+        let observed = await withTimeout(.seconds(5)) { await harness.proxy.waitForClientEOF() }
+        #expect(observed == true)
+
+        harness.proxy.stop()
+        _ = await running.value
+    }
+
+    @Test("a client that has gone away is a write failure on the client's side")
+    func reportsClientWriteFailure() async throws {
+        let clientIn = Pipe()
+        let clientOut = Pipe()
+        let serverIn = Pipe()
+        let serverOut = Pipe()
+        let proxy = MCPProxy(
+            clientIn: clientIn.fileHandleForReading,
+            clientOut: clientOut.fileHandleForWriting,
+            serverIn: serverIn.fileHandleForWriting,
+            serverOut: serverOut.fileHandleForReading,
+            rewriter: MCPFrameRewriter(mapping: MCPPathMapping(hostArtifactsDirectory: "/host/artifacts"))
+        )
+        defer {
+            try? clientIn.fileHandleForWriting.close()
+            try? serverOut.fileHandleForWriting.close()
+            try? serverIn.fileHandleForReading.close()
+        }
+        try clientOut.fileHandleForReading.close()
+
+        let running = Task { await proxy.run() }
+        try serverOut.fileHandleForWriting.write(
+            contentsOf: Data(#"{"jsonrpc":"2.0","id":1,"result":{}}"#.utf8 + [0x0A])
+        )
+        guard case .writeFailed(.client, let error) = await running.value else {
+            Issue.record("expected writeFailed to the client")
             return
         }
         #expect((error as? POSIXError)?.code == .EPIPE)

@@ -24,6 +24,11 @@ enum VivState: String, Codable, Sendable {
     case preparingGuestWorkdir
     case executingAcceptanceCommand
     case executingTestCommand
+    case launchingApp
+    case configuringBrowser
+    case startingMCPServer
+    case serving
+    case endingSession
     case harvestingArtifacts
     case validatingVirtioFS
     case requestingGuestShutdown
@@ -90,6 +95,13 @@ enum Timeouts {
     /// attempted because SSH was already unavailable.
     static let stopRequestFallback = Duration.seconds(30)
     static let diskAttach = Duration.seconds(120)
+    /// How long the app launch's ssh call may take beyond the app's own
+    /// port wait, which the guest script bounds.
+    static let appLaunchGrace = Duration.seconds(30)
+    static let browserSetup = Duration.seconds(120)
+    /// How long a stopped proxy is given to finish delivering what it had,
+    /// once the server's ssh child has gone.
+    static let proxyDrain = Duration.seconds(5)
 }
 
 /// The machine-readable outcome of a run.
@@ -238,6 +250,9 @@ struct OrchestratorOptions: Sendable {
     var artifactReadOnly = false
     var artifactVolumeName: String?
     var disableRemoteLogin = false
+    /// Write `<run>/heartbeat` from the moment the run directory exists until
+    /// `stopHeartbeat()`, for a run whose process is its only proof of life.
+    var writesHeartbeat = false
 }
 
 /// Owns the run.
@@ -273,8 +288,14 @@ final class Orchestrator {
     private var eventRelay: VMEventRelay?
     private var lastReadinessGate: String?
     private var cleanupCompleted = false
+    private var heartbeat: Task<Void, Never>?
+    /// Set while a browser session runs. The address and SSH readiness loops
+    /// stop waiting once it has caught a signal.
+    private var interruption: SignalWatcher?
     /// Phase timings for `viv run`, in pipeline order.
     private var phases: [PhaseTiming] = []
+    /// When each of `phases` began, index for index.
+    private var phaseStartDates: [Date] = []
     /// When each state was entered, in order, starting from the one the
     /// orchestrator is constructed in. Durations are derived rather than
     /// stored, so that the state a run is *in* is always accounted for — a run
@@ -443,6 +464,9 @@ final class Orchestrator {
         // somewhere to leave failure.json — the copy that survives the bundle.
         if let layout {
             try createDirectory(layout.results, stage: .bundlePreparation)
+            if options.writesHeartbeat {
+                heartbeat = SessionHeartbeat.beat(at: layout.heartbeat)
+            }
         }
         log.attachFile(at: paths.runLog)
         stateLogURL = paths.stateLog
@@ -811,6 +835,7 @@ final class Orchestrator {
         var attempt = 0
 
         while ContinuousClock.now < deadline {
+            try throwIfInterrupted()
             attempt += 1
             guard let candidates = await withTimeout(Timeouts.discoveryAttempt, operation: {
                 await resolver.candidates()
@@ -848,7 +873,7 @@ final class Orchestrator {
             }
 
             log.debug("Attempt \(attempt): no address for \(manifest.macAddress) yet.")
-            try? await Task.sleep(for: delay)
+            await pause(for: delay)
             delay = min(delay * 2, .seconds(15))
         }
 
@@ -880,12 +905,13 @@ final class Orchestrator {
         var lastReason = "no attempt made"
 
         while ContinuousClock.now < deadline {
+            try throwIfInterrupted()
             attempt += 1
 
             if !(await TCPProbe.portIsOpen(host: ssh.address, port: 22, timeout: .seconds(5))) {
                 lastReason = "TCP 22 is not accepting connections"
                 log.debug("Readiness attempt \(attempt): \(lastReason).")
-                try? await Task.sleep(for: delay)
+                await pause(for: delay)
                 delay = min(delay * 2, .seconds(15))
                 continue
             }
@@ -936,7 +962,7 @@ final class Orchestrator {
             }
 
             log.debug("Readiness attempt \(attempt): \(lastReason).")
-            try? await Task.sleep(for: delay)
+            await pause(for: delay)
             delay = min(delay * 2, .seconds(15))
         }
 
@@ -1285,30 +1311,12 @@ final class Orchestrator {
         try Entitlement.require(stage: .preflight)
         let startedAt = Date()
 
-        try await measure("materialise") {
-            try await prepareBundleFromTemplate(plan.templateRoot)
-        }
-        guard let layout else {
-            throw VivError(
-                .bundlePreparation,
-                "A test run needs a run directory under \(VivariumHome.runs.path); "
-                    + "--bundle is not supported by `viv run`."
-            )
-        }
-
-        try await measure("stage code") {
-            transition(to: .stagingCode)
-            _ = try await CodeStager.stage(from: plan.codeDirectory, to: layout.sharedCode)
-            // Created before the guest boots, so the share the guest mounts
-            // already has somewhere to put artifacts. A directory created
-            // later on the host does appear in the guest, but relying on that
-            // makes the run depend on VirtioFS invalidation timing for no
-            // reason.
-            try createDirectory(layout.sharedArtifacts, stage: .codeStaging)
-            try createDirectory(layout.results, stage: .codeStaging)
-        }
-
-        try await startProvisionedGuest()
+        let guest = try await bringUpGuest(
+            templateRoot: plan.templateRoot,
+            codeDirectory: plan.codeDirectory,
+            commandName: "viv run"
+        )
+        let layout = guest.layout
 
         let execution: TestExecution
         let status: TestRunStatus
@@ -1316,9 +1324,7 @@ final class Orchestrator {
         var warnings: [String] = []
         var shutdownError: (any Error)?
         do {
-            let ssh = try await measure("boot to ssh") { try await connectToGuest() }
-
-            try await measure("prepare guest") { try await prepareGuestWorkdir(ssh: ssh) }
+            let ssh = guest.ssh
             execution = try await measure("test") {
                 try await executeTest(ssh: ssh, plan: plan, layout: layout)
             }
@@ -1403,6 +1409,85 @@ final class Orchestrator {
         try JSONCoding.write(report, to: layout.reportJSON)
         try Data(report.markdownText.utf8).write(to: layout.reportMarkdown, options: .atomic)
         return report
+    }
+
+    /// A guest booted from a fresh clone, with the staged code copied into its
+    /// workdir and an authenticated runner to reach it.
+    private struct PreparedGuest {
+        let layout: RunLayout
+        let ssh: SSHCommandRunner
+    }
+
+    /// Everything a workload needs before it starts: clone the template,
+    /// stage the code, boot with provisioning, wait for SSH, and prepare the
+    /// workdir.
+    ///
+    /// A guest that started but could not be reached or prepared is abandoned
+    /// here before the error escapes, so the caller only has to release a
+    /// guest this returned.
+    ///
+    /// - Parameter codeDirectory: the directory to stage, or `nil` to give the
+    ///   guest an empty workdir.
+    private func bringUpGuest(
+        templateRoot: URL,
+        codeDirectory: URL?,
+        commandName: String
+    ) async throws -> PreparedGuest {
+        let layout = try await startGuest(
+            templateRoot: templateRoot, codeDirectory: codeDirectory, commandName: commandName
+        )
+        do {
+            return PreparedGuest(layout: layout, ssh: try await reachGuest())
+        } catch {
+            await abandonGuest(after: error)
+            throw error
+        }
+    }
+
+    /// The first half of `bringUpGuest`: clone, stage, and boot. Nothing it
+    /// leaves behind needs releasing if it throws.
+    private func startGuest(
+        templateRoot: URL,
+        codeDirectory: URL?,
+        commandName: String
+    ) async throws -> RunLayout {
+        try await measure("materialise") {
+            try await prepareBundleFromTemplate(templateRoot)
+        }
+        guard let layout else {
+            throw VivError(
+                .bundlePreparation,
+                "A test run needs a run directory under \(VivariumHome.runs.path); "
+                    + "--bundle is not supported by `\(commandName)`."
+            )
+        }
+
+        try await measure("stage code") {
+            transition(to: .stagingCode)
+            if let codeDirectory {
+                _ = try await CodeStager.stage(from: codeDirectory, to: layout.sharedCode)
+            } else {
+                try createDirectory(layout.sharedCode, stage: .codeStaging)
+            }
+            // Created before the guest boots, so the share the guest mounts
+            // already has somewhere to put artifacts. A directory created
+            // later on the host does appear in the guest, but relying on that
+            // makes the run depend on VirtioFS invalidation timing for no
+            // reason.
+            try createDirectory(layout.sharedArtifacts, stage: .codeStaging)
+            try createDirectory(layout.results, stage: .codeStaging)
+        }
+
+        try await startProvisionedGuest()
+        return layout
+    }
+
+    /// The second half of `bringUpGuest`: find the guest, authenticate, and
+    /// prepare its workdir. The caller releases the guest if this throws.
+    private func reachGuest() async throws -> SSHCommandRunner {
+        let ssh = try await measure("boot to ssh") { try await connectToGuest() }
+        try await measure("prepare guest") { try await prepareGuestWorkdir(ssh: ssh) }
+        return ssh
     }
 
     /// Copies the run log into `results/`, which is the one directory a run
@@ -1597,6 +1682,15 @@ final class Orchestrator {
             }
         }
 
+        let (artifacts, copyWarnings) = await collectSharedArtifacts(layout: layout)
+        return (artifacts, warnings + copyWarnings)
+    }
+
+    /// Lifts the whole of `Shared/artifacts` into `results/artifacts`, keeping
+    /// every file's path relative to the share. Never throws, for the reason
+    /// `harvest` gives.
+    private func collectSharedArtifacts(layout: RunLayout) async -> ([ArtifactEntry], [String]) {
+        var warnings: [String] = []
         do {
             try createDirectory(layout.resultsArtifacts, stage: .harvest)
             let copy = try await ProcessRunner.run(
@@ -1664,7 +1758,11 @@ final class Orchestrator {
             log.info("--keep-vm: keeping \(layout.bundleRoot.path).")
             return []
         }
+        return deleteHeavyRemains(of: layout)
+    }
 
+    /// Deletes a finished run's bundle and share, and returns what went.
+    private func deleteHeavyRemains(of layout: RunLayout) -> [String] {
         // The run log lives inside the bundle, and a logger still holding it
         // open recreates the directory the moment anything else is logged —
         // which is how a deleted bundle came back as an empty one. Its contents
@@ -1690,6 +1788,407 @@ final class Orchestrator {
         return deleted
     }
 
+    // MARK: - Browser sessions
+
+    /// Throws once `interruption` has caught a signal. Never throws outside a
+    /// browser session.
+    private func throwIfInterrupted() throws {
+        guard let signo = interruption?.received else { return }
+        throw VivError(
+            .mcpSession,
+            "Interrupted by \(SessionRace.signalName(signo)) before the session started serving."
+        )
+    }
+
+    /// Sleeps for `duration`, waking early if `interruption` catches a signal.
+    private func pause(for duration: Duration) async {
+        guard let interruption else {
+            try? await Task.sleep(for: duration)
+            return
+        }
+        _ = await withTimeout(duration) { await interruption.wait() }
+    }
+
+    /// Stops rewriting the heartbeat and removes it. Awaits the writer first,
+    /// so a write already under way cannot put the file back.
+    private func stopHeartbeat() async {
+        guard let beating = heartbeat else { return }
+        heartbeat = nil
+        beating.cancel()
+        await beating.value
+        if let layout {
+            try? FileManager.default.removeItem(at: layout.heartbeat)
+        }
+    }
+
+    /// `browser`: serves Safari's MCP server from a fresh guest over
+    /// `clientInput` and `clientOutput` until the session ends, then tears
+    /// the guest down.
+    ///
+    /// Returns a report for every way a session can end once it is serving,
+    /// and throws only when it could not be set up. Nothing is written to
+    /// `clientOutput` but the server's frames.
+    func runSession(
+        plan: BrowserSessionPlan,
+        clientInput: FileHandle,
+        clientOutput: FileHandle
+    ) async throws -> BrowserSessionReport {
+        try Entitlement.require(stage: .preflight)
+        let startedAt = Date()
+
+        let templateOS = try TemplateManager.readManifest(of: TemplatePaths(root: plan.templateRoot)).os
+        guard templateOS == .macOS else {
+            throw VivError(
+                .bundlePreparation,
+                "\(plan.templateRoot.path) holds a \(templateOS.displayName) guest; Safari's MCP "
+                    + "server needs a macOS one."
+            )
+        }
+
+        // Taken over before anything is created, and held to the end. While
+        // the guest is set up, a signal stops the address and SSH waits, and
+        // any step that fails after one arrived ends the session in order: a
+        // Ctrl-C at a terminal also reaches that step's ssh child, which is
+        // often why it failed. A second signal cannot interrupt the teardown.
+        let signals = SignalWatcher(signals: SignalWatcher.sessionSignals)
+        interruption = signals
+        defer {
+            interruption = nil
+            signals.stop()
+        }
+
+        let layout: RunLayout
+        do {
+            layout = try await startGuest(
+                templateRoot: plan.templateRoot,
+                codeDirectory: plan.codeDirectory,
+                commandName: "viv browser"
+            )
+        } catch {
+            await stopHeartbeat()
+            throw error
+        }
+
+        var ssh: SSHCommandRunner?
+        var gateway: String?
+        var served: ServedSession?
+        let end: SessionEnd
+        do {
+            try throwIfInterrupted()
+            let reached = try await reachGuest()
+            ssh = reached
+            if let command = plan.appCommand {
+                try throwIfInterrupted()
+                try await measure("start app") {
+                    try await launchApp(ssh: reached, command: command, port: plan.appPort, layout: layout)
+                }
+            }
+            try throwIfInterrupted()
+            gateway = try await measure("configure browser") { try await configureBrowser(ssh: reached) }
+            try throwIfInterrupted()
+            let session = try await serve(
+                ssh: reached, plan: plan, layout: layout, gateway: gateway, signals: signals,
+                clientInput: clientInput, clientOutput: clientOutput
+            )
+            served = session
+            end = session.end
+        } catch {
+            guard let signo = signals.received else {
+                await abandonGuest(after: error)
+                await stopHeartbeat()
+                throw error
+            }
+            log.warn("Setup stopped after \(SessionRace.signalName(signo)): \(VivError.describe(error))")
+            end = SessionRace.end(forSignal: signo)
+            transition(to: .endingSession)
+            // No proxy ever wrote to it, so the client can have its EOF now.
+            try? clientOutput.close()
+        }
+
+        var warnings: [String] = []
+        var shutdownError: (any Error)?
+        if eventRelay?.hasStopped ?? true {
+            await forceStopForCleanup()
+        } else if let ssh {
+            do {
+                try await measure("shutdown") {
+                    try await shutdown(ssh: ssh, order: platform.runShutdownOrder)
+                }
+            } catch {
+                shutdownError = error
+                warnings.append("the guest did not shut down cleanly: " + VivError.describe(error))
+                log.error("The guest did not shut down cleanly: \(VivError.describe(error))")
+            }
+        } else {
+            // Nothing has run in a guest SSH never reached, so there is nothing
+            // for an in-guest shutdown to flush.
+            log.info("The guest was never reached over SSH; stopping it without an in-guest shutdown.")
+            await forceStopForCleanup()
+        }
+
+        let (artifacts, harvestWarnings) = await measure("harvest") { () async -> ([ArtifactEntry], [String]) in
+            transition(to: .harvestingArtifacts)
+            return await collectSharedArtifacts(layout: layout)
+        }
+        warnings += harvestWarnings
+
+        // Beats until here: gc must not take the bundle of a session that is
+        // still shutting down or harvesting.
+        await stopHeartbeat()
+
+        let orderly = end.reason.isOrderly && shutdownError == nil
+        transition(to: orderly ? .succeeded : .failed)
+        finish(outcome: end.reason.rawValue)
+        preserveRunLog(in: layout)
+        let deleted: [String]
+        if orderly {
+            deleted = deleteHeavyRemains(of: layout)
+        } else {
+            log.info(
+                "Keeping \(layout.root.path): "
+                    + (shutdownError == nil
+                        ? "the session ended because \(end.detail)."
+                        : "the guest did not shut down cleanly.")
+            )
+            deleted = []
+        }
+
+        let report = BrowserSessionReport(
+            runID: manifest.runID,
+            vivariumVersion: Viv.releaseVersion,
+            startedAt: startedAt,
+            servingStartedAt: served?.servingStartedAt,
+            endedAt: Date(),
+            endReason: end.reason,
+            endDetail: end.detail,
+            orderly: orderly,
+            templatePath: plan.templateRoot.path,
+            guestOSVersion: manifest.guestOSVersion,
+            guestUsername: credentials.username,
+            guestAddress: self.report.guestAddress,
+            gatewayAddress: gateway,
+            codeDirectory: plan.codeDirectory?.path,
+            appCommand: plan.appCommand,
+            appPort: plan.appPort,
+            maxLifetimeSeconds: plan.maxLifetime.elapsedSeconds,
+            idleTimeoutSeconds: plan.idleTimeout.elapsedSeconds,
+            phases: zip(phases, phaseStartDates).map {
+                SessionPhaseTiming(name: $0.name, startedAt: $1, seconds: $0.seconds)
+            },
+            states: stateTimings(),
+            framesToServer: served?.framesToServer ?? 0,
+            framesToClient: served?.framesToClient ?? 0,
+            shareWriteRetries: served?.shareWriteRetries ?? 0,
+            artifactCount: artifacts.count,
+            artifacts: artifacts,
+            warnings: warnings,
+            resultsPath: layout.results.path,
+            deletedPaths: deleted
+        )
+        try JSONCoding.write(report, to: layout.sessionReport)
+        log.info(
+            "Session over: \(end.detail). \(report.framesToServer) frame(s) to the server, "
+                + "\(report.framesToClient) to the client; \(artifacts.count) artifact(s) in "
+                + "\(layout.resultsArtifacts.path); report at \(layout.sessionReport.path)."
+        )
+        return report
+    }
+
+    /// What `serve` saw between the server starting and the session ending.
+    private struct ServedSession {
+        let end: SessionEnd
+        let servingStartedAt: Date
+        let framesToServer: Int
+        let framesToClient: Int
+        let shareWriteRetries: Int
+    }
+
+    /// Starts the app under test in the guest, detached, and waits for its
+    /// port when one was given.
+    private func launchApp(ssh: SSHCommandRunner, command: String, port: Int?, layout: RunLayout) async throws {
+        transition(to: .launchingApp)
+        log.info("Starting the app under test in the guest: \(command)")
+
+        let script = platform.scripts.appLaunchScript(command: command, port: port)
+        let result = try await ssh.run(
+            remoteCommand: platform.scripts.remoteCommand(script),
+            timeout: .seconds(GuestScripts.defaultAppPortTimeoutSeconds) + Timeouts.appLaunchGrace,
+            redactedCommand: "<base64-encoded app launch script, \(script.count) characters>"
+        )
+        let appLog = layout.sharedArtifacts.appendingPathComponent(GuestScripts.appLogFilename)
+        guard case .remoteExit(0) = result.outcome else {
+            throw VivError(
+                .appLaunch,
+                "The app under test did not start: \(describe(result.outcome)).\n"
+                    + "  stderr: \(result.stderrText.trimmed(to: 2000))",
+                inspectionHints: ["cat '\(appLog.path)'"]
+            )
+        }
+        log.info(result.stdoutText.trimmed(to: 500))
+    }
+
+    /// Runs the browser setup script, and returns the host's address as the
+    /// guest sees it.
+    private func configureBrowser(ssh: SSHCommandRunner) async throws -> String? {
+        transition(to: .configuringBrowser)
+
+        let result = try await ssh.run(
+            remoteCommand: platform.scripts.remoteCommand(platform.scripts.browserSetupScript),
+            timeout: Timeouts.browserSetup,
+            redactedCommand: "<base64-encoded browser setup script>"
+        )
+        guard case .remoteExit(0) = result.outcome else {
+            throw VivError(
+                .browserSetup,
+                "The guest could not prepare Safari for remote automation: "
+                    + "\(describe(result.outcome)).\n"
+                    + "  stdout: \(result.stdoutText.trimmed(to: 1000))\n"
+                    + "  stderr: \(result.stderrText.trimmed(to: 1000))",
+                inspectionHints: ["cat \(paths.runLog.path)"]
+            )
+        }
+        log.info("Safari is set up for remote automation.")
+
+        if let gateway = GuestGateway.parse(setupOutput: result.stdoutText) {
+            return gateway
+        }
+        let derived = report.guestAddress.flatMap(GuestGateway.derived(fromGuestAddress:))
+        log.warn("The guest reported no default gateway; taking the host to be \(derived ?? "unknown").")
+        return derived
+    }
+
+    /// Starts the MCP server, proxies it to the client until the first
+    /// ending event, and stops the server and the proxy.
+    ///
+    /// Never returns with the server's ssh child still running.
+    private func serve(
+        ssh: SSHCommandRunner,
+        plan: BrowserSessionPlan,
+        layout: RunLayout,
+        gateway: String?,
+        signals: SignalWatcher,
+        clientInput: FileHandle,
+        clientOutput: FileHandle
+    ) async throws -> ServedSession {
+        transition(to: .startingMCPServer)
+
+        guard FileManager.default.createFile(atPath: layout.mcpServerStderr.path, contents: nil),
+              let serverStderr = try? FileHandle(forWritingTo: layout.mcpServerStderr) else {
+            throw VivError(.mcpSession, "Cannot open \(layout.mcpServerStderr.path) for the server's stderr.")
+        }
+        let toServer = Pipe()
+        let fromServer = Pipe()
+        let session: SSHSession
+        do {
+            session = try ssh.spawnSession(
+                remoteCommand: "/usr/bin/safaridriver --mcp",
+                standardInput: .pipe(toServer),
+                standardOutput: .pipe(fromServer),
+                standardError: .fileHandle(serverStderr),
+                stage: .mcpSession
+            )
+        } catch {
+            try? serverStderr.close()
+            throw error
+        }
+        // The child holds its own copy of the descriptor.
+        try? serverStderr.close()
+        log.info("Started the MCP server over ssh as process \(session.process.pid).")
+
+        let retries = ShareWriteRetryCounter()
+        let proxy = MCPProxy(
+            clientIn: clientInput,
+            clientOut: clientOutput,
+            serverIn: toServer.fileHandleForWriting,
+            serverOut: fromServer.fileHandleForReading,
+            rewriter: MCPFrameRewriter(
+                mapping: MCPPathMapping(hostArtifactsDirectory: layout.sharedArtifacts.path)
+            ),
+            retryShareWriteDenial: { retries.retry($0) }
+        )
+        let proxyEnded = OneShot<MCPProxyEnd>()
+        Task.detached { proxyEnded.fulfil(await proxy.run()) }
+
+        transition(to: .serving)
+        let servingStartedAt = Date()
+        log.info(BrowserSessionReport.banner(
+            runID: manifest.runID,
+            guest: "\(credentials.username)@\(ssh.address)",
+            gateway: gateway,
+            appCommand: plan.appCommand,
+            appPort: plan.appPort,
+            sharedArtifacts: layout.sharedArtifacts,
+            maxLifetime: plan.maxLifetime,
+            idleTimeout: plan.idleTimeout
+        ))
+
+        let relay = eventRelay
+        var end = await SessionRace.first(of: [
+            {
+                guard let ended = await proxyEnded.wait() else { return nil }
+                return SessionRace.end(for: ended)
+            },
+            {
+                // The proxy reports a client's EOF only once the server has
+                // answered and closed its output too. The server gets the
+                // drain window for that, and the session ends either way.
+                guard await proxy.waitForClientEOF() else { return nil }
+                _ = await withTimeout(Timeouts.proxyDrain, operation: { await proxyEnded.wait() })
+                return SessionRace.end(for: .clientEOF)
+            },
+            {
+                guard let exit = await session.wait() else { return nil }
+                // A client that closed its input makes the server exit too,
+                // and the proxy, which saw the client go first, says which.
+                if let ended = await withTimeout(Timeouts.proxyDrain, operation: { await proxyEnded.wait() }),
+                   let ended, let proxyEnd = SessionRace.end(for: ended) {
+                    return proxyEnd
+                }
+                return SessionEnd(
+                    reason: .serverExited,
+                    detail: "the ssh process carrying the MCP server ended (\(exit))"
+                )
+            },
+            {
+                guard let signo = await signals.wait() else { return nil }
+                return SessionRace.end(forSignal: signo)
+            },
+            SessionRace.deadline(plan.maxLifetime),
+            SessionRace.idle(after: plan.idleTimeout, lastActivity: { proxy.lastActivity }),
+            {
+                guard let relay, let outcome = await relay.awaitStop() else { return nil }
+                return SessionEnd(reason: .guestStopped, detail: outcome.description)
+            }
+        ]) ?? SessionEnd(reason: .serverExited, detail: "nothing was left that could end the session")
+        // A Ctrl-C at a terminal reaches ssh as well as this process, and ssh
+        // can be first to react; the operator's signal is the reason either way.
+        if !end.reason.isOrderly, let signo = signals.received {
+            end = SessionRace.end(forSignal: signo)
+        }
+        log.info("Ending the session: \(end.detail).")
+
+        transition(to: .endingSession)
+        proxy.stop()
+        let serverExit = await session.terminate()
+        log.info("The MCP server's ssh process ended: \(serverExit).")
+        if await withTimeout(Timeouts.proxyDrain, operation: { await proxyEnded.wait() }) == nil {
+            log.warn("The proxy did not finish within \(Timeouts.proxyDrain) of the server ending.")
+        } else {
+            // EOF for the client now rather than when this process exits after
+            // the teardown. Only once the proxy has finished, because a pump
+            // still writing would otherwise write to a closed descriptor.
+            try? clientOutput.close()
+        }
+
+        return ServedSession(
+            end: end,
+            servingStartedAt: servingStartedAt,
+            framesToServer: proxy.framesToServer,
+            framesToClient: proxy.framesToClient,
+            shareWriteRetries: retries.retryCount
+        )
+    }
+
     private func createDirectory(_ url: URL, stage: VivStage) throws {
         do {
             try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -1704,7 +2203,11 @@ final class Orchestrator {
     /// it got and where it spent the time getting there.
     private func measure<T>(_ name: String, _ body: () async throws -> T) async rethrows -> T {
         let start = ContinuousClock.now
-        defer { phases.append(PhaseTiming(name: name, seconds: start.duration(to: .now).elapsedSeconds)) }
+        let startDate = Date()
+        defer {
+            phases.append(PhaseTiming(name: name, seconds: start.duration(to: .now).elapsedSeconds))
+            phaseStartDates.append(startDate)
+        }
         return try await body()
     }
 
@@ -1818,6 +2321,9 @@ final class Orchestrator {
         case .stagingCode: return .codeStaging
         case .preparingGuestWorkdir: return .sshCommand
         case .executingTestCommand: return .testExecution
+        case .launchingApp: return .appLaunch
+        case .configuringBrowser: return .browserSetup
+        case .startingMCPServer, .serving, .endingSession: return .mcpSession
         case .harvestingArtifacts: return .harvest
         case .requestingGuestShutdown, .waitingForGuestStop, .releasingRunVM: return .guestShutdown
         case .attachingArtifactReadOnly: return .artifactAttach

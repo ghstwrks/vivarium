@@ -10,6 +10,23 @@ This project does not yet follow Semantic Versioning strictly — see
 
 ### Added
 
+- **`viv browser`**, which serves Safari's own MCP server
+  (`safaridriver --mcp`) from a fresh macOS guest to a coding agent over
+  stdio: `claude mcp add safari -- viv browser --code . -- npm run dev`. It
+  boots a clone of a macOS template the way `viv run` does, optionally starts
+  the app under test detached in the guest and waits for its port
+  (`--app-port`), enables Safari's remote automation for the provisioned user
+  without root, and relays the MCP frames between its own stdin and stdout
+  and `safaridriver --mcp` over `ssh -T`. Nothing but those frames reaches
+  stdout. Screenshots and page contents are saved on the run's share and
+  their guest paths rewritten to host paths. The session ends on stdin EOF,
+  SIGINT, SIGTERM, or SIGHUP, `--max-lifetime` (two hours), `--idle-timeout`
+  (twenty minutes), or the server or guest stopping; it then shuts the guest
+  down, harvests the artifacts, and writes `results/session.json`.
+- `viv gc` recognises a browser session by `<run>/heartbeat`, which a
+  serving session rewrites every thirty seconds: a fresh heartbeat is
+  skipped by every mode, `--all` included, and one more than five minutes
+  old counts as a finished run.
 - A per-state timing breakdown in `results/report.json`, `results/failure.json`,
   and `viv selftest`'s report: a `states` array giving every state the run
   entered, when it entered it (as an offset from the start of the run and as a

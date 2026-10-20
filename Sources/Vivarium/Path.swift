@@ -175,6 +175,15 @@ struct RunLayout: Sendable {
     var testStdout: URL { results.appendingPathComponent("test-stdout.txt") }
     var testStderr: URL { results.appendingPathComponent("test-stderr.txt") }
     var failureReport: URL { results.appendingPathComponent("failure.json") }
+    /// `viv browser`'s report, written when its session ends.
+    var sessionReport: URL { results.appendingPathComponent("session.json") }
+    /// What `ssh` and the guest's MCP server wrote to standard error during a
+    /// browser session.
+    var mcpServerStderr: URL { results.appendingPathComponent("mcp-server-stderr.txt") }
+    /// See `SessionHeartbeat`. Outside the bundle and `results/`, because it
+    /// describes the process serving the run rather than anything the run
+    /// produced.
+    var heartbeat: URL { root.appendingPathComponent("heartbeat") }
 
     var paths: VMBundlePaths {
         VMBundlePaths(root: bundleRoot, sharedDirectory: shared)

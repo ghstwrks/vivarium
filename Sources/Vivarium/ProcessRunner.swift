@@ -162,6 +162,9 @@ enum ProcessRunner {
             // Written on a background queue: a large payload would otherwise
             // block here until the child drains it.
             let handle = stdinPipe.fileHandleForWriting
+            // A child that exits without reading makes this write fail
+            // rather than raise SIGPIPE in this process.
+            _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
             DispatchQueue.global(qos: .userInitiated).async {
                 try? handle.write(contentsOf: stdinData)
                 try? handle.close()
