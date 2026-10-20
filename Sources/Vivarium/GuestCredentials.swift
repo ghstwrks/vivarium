@@ -34,12 +34,16 @@ struct GuestCredentials: Sendable {
 
     func inspectionAdvice(username: String, address: String, bundle: URL) -> String {
         switch authentication {
-        case .password:
+        case let .password(password):
             return """
                 The password is generated per run and lives only in this process's \
-                memory: it is never printed, logged, or written down, so there is no \
-                new SSH session to be had. What is inspectable is the run directory \
-                above and any session already open.
+                memory. It is shown here, once, because a held guest exists to be \
+                inspected and this account is the only way in:
+
+                  ssh \(username)@\(address)
+                  password: \(password)
+
+                It dies with the guest; the run directory and bundle never record it.
                 """
         case let .privateKey(path, _):
             return """
