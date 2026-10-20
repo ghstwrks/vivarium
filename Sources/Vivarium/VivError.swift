@@ -20,6 +20,13 @@ enum VivStage: String, Codable, Sendable, CaseIterable {
     /// Running the user's test command in the guest. A failure here is a
     /// statement about the test or the guest it ran in.
     case testExecution
+    /// Starting the app under test in a browser session's guest. A failure
+    /// here is the app's, or its environment's.
+    case appLaunch
+    /// Preparing Safari in the guest for remote automation.
+    case browserSetup
+    /// Starting, serving, and ending a browser session's MCP server.
+    case mcpSession
     /// Collecting what the test produced and getting it back to the host.
     case harvest
     case guestShutdown
@@ -46,8 +53,8 @@ enum VivStage: String, Codable, Sendable, CaseIterable {
              .templateSnapshot, .runConfiguration, .codeStaging, .harvest, .cleanup:
             return false
         case .provisioning, .addressDiscovery, .sshReadiness, .sshCommand,
-             .testExecution, .guestShutdown, .virtioFSValidation, .artifactAttach,
-             .artifactValidation, .acceptance:
+             .testExecution, .appLaunch, .browserSetup, .mcpSession, .guestShutdown,
+             .virtioFSValidation, .artifactAttach, .artifactValidation, .acceptance:
             return true
         }
     }
