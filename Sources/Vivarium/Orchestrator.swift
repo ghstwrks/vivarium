@@ -1285,30 +1285,12 @@ final class Orchestrator {
         try Entitlement.require(stage: .preflight)
         let startedAt = Date()
 
-        try await measure("materialise") {
-            try await prepareBundleFromTemplate(plan.templateRoot)
-        }
-        guard let layout else {
-            throw VivError(
-                .bundlePreparation,
-                "A test run needs a run directory under \(VivariumHome.runs.path); "
-                    + "--bundle is not supported by `viv run`."
-            )
-        }
-
-        try await measure("stage code") {
-            transition(to: .stagingCode)
-            _ = try await CodeStager.stage(from: plan.codeDirectory, to: layout.sharedCode)
-            // Created before the guest boots, so the share the guest mounts
-            // already has somewhere to put artifacts. A directory created
-            // later on the host does appear in the guest, but relying on that
-            // makes the run depend on VirtioFS invalidation timing for no
-            // reason.
-            try createDirectory(layout.sharedArtifacts, stage: .codeStaging)
-            try createDirectory(layout.results, stage: .codeStaging)
-        }
-
-        try await startProvisionedGuest()
+        let guest = try await bringUpGuest(
+            templateRoot: plan.templateRoot,
+            codeDirectory: plan.codeDirectory,
+            commandName: "viv run"
+        )
+        let layout = guest.layout
 
         let execution: TestExecution
         let status: TestRunStatus
@@ -1316,9 +1298,7 @@ final class Orchestrator {
         var warnings: [String] = []
         var shutdownError: (any Error)?
         do {
-            let ssh = try await measure("boot to ssh") { try await connectToGuest() }
-
-            try await measure("prepare guest") { try await prepareGuestWorkdir(ssh: ssh) }
+            let ssh = guest.ssh
             execution = try await measure("test") {
                 try await executeTest(ssh: ssh, plan: plan, layout: layout)
             }
@@ -1403,6 +1383,67 @@ final class Orchestrator {
         try JSONCoding.write(report, to: layout.reportJSON)
         try Data(report.markdownText.utf8).write(to: layout.reportMarkdown, options: .atomic)
         return report
+    }
+
+    /// A guest booted from a fresh clone, with the staged code copied into its
+    /// workdir and an authenticated runner to reach it.
+    private struct PreparedGuest {
+        let layout: RunLayout
+        let ssh: SSHCommandRunner
+    }
+
+    /// Everything a workload needs before it starts: clone the template,
+    /// stage the code, boot with provisioning, wait for SSH, and prepare the
+    /// workdir.
+    ///
+    /// A guest that started but could not be reached or prepared is abandoned
+    /// here before the error escapes, so the caller only has to release a
+    /// guest this returned.
+    ///
+    /// - Parameter codeDirectory: the directory to stage, or `nil` to give the
+    ///   guest an empty workdir.
+    private func bringUpGuest(
+        templateRoot: URL,
+        codeDirectory: URL?,
+        commandName: String
+    ) async throws -> PreparedGuest {
+        try await measure("materialise") {
+            try await prepareBundleFromTemplate(templateRoot)
+        }
+        guard let layout else {
+            throw VivError(
+                .bundlePreparation,
+                "A test run needs a run directory under \(VivariumHome.runs.path); "
+                    + "--bundle is not supported by `\(commandName)`."
+            )
+        }
+
+        try await measure("stage code") {
+            transition(to: .stagingCode)
+            if let codeDirectory {
+                _ = try await CodeStager.stage(from: codeDirectory, to: layout.sharedCode)
+            } else {
+                try createDirectory(layout.sharedCode, stage: .codeStaging)
+            }
+            // Created before the guest boots, so the share the guest mounts
+            // already has somewhere to put artifacts. A directory created
+            // later on the host does appear in the guest, but relying on that
+            // makes the run depend on VirtioFS invalidation timing for no
+            // reason.
+            try createDirectory(layout.sharedArtifacts, stage: .codeStaging)
+            try createDirectory(layout.results, stage: .codeStaging)
+        }
+
+        try await startProvisionedGuest()
+
+        do {
+            let ssh = try await measure("boot to ssh") { try await connectToGuest() }
+            try await measure("prepare guest") { try await prepareGuestWorkdir(ssh: ssh) }
+            return PreparedGuest(layout: layout, ssh: ssh)
+        } catch {
+            await abandonGuest(after: error)
+            throw error
+        }
     }
 
     /// Copies the run log into `results/`, which is the one directory a run
@@ -1597,6 +1638,15 @@ final class Orchestrator {
             }
         }
 
+        let (artifacts, copyWarnings) = await collectSharedArtifacts(layout: layout)
+        return (artifacts, warnings + copyWarnings)
+    }
+
+    /// Lifts the whole of `Shared/artifacts` into `results/artifacts`, keeping
+    /// every file's path relative to the share. Never throws, for the reason
+    /// `harvest` gives.
+    private func collectSharedArtifacts(layout: RunLayout) async -> ([ArtifactEntry], [String]) {
+        var warnings: [String] = []
         do {
             try createDirectory(layout.resultsArtifacts, stage: .harvest)
             let copy = try await ProcessRunner.run(
@@ -1664,7 +1714,11 @@ final class Orchestrator {
             log.info("--keep-vm: keeping \(layout.bundleRoot.path).")
             return []
         }
+        return deleteHeavyRemains(of: layout)
+    }
 
+    /// Deletes a finished run's bundle and share, and returns what went.
+    private func deleteHeavyRemains(of layout: RunLayout) -> [String] {
         // The run log lives inside the bundle, and a logger still holding it
         // open recreates the directory the moment anything else is logged —
         // which is how a deleted bundle came back as an empty one. Its contents
