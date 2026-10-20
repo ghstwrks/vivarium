@@ -113,29 +113,12 @@ struct SSHCommandRunner: Sendable {
         onStdout: (@Sendable (Data) -> Void)? = nil,
         onStderr: (@Sendable (Data) -> Void)? = nil
     ) async throws -> SSHResult {
-        let helper: AskpassHelper?
-        let environment: [String: String]?
-        switch authentication {
-        case let .password(password):
-            let created = try AskpassHelper()
-            helper = created
-            environment = created.environment(password: password)
-        case .privateKey, .unavailable:
-            helper = nil
-            environment = nil
-        }
+        let (helper, environment) = try makeAskpass()
         defer { helper?.remove() }
 
-        let base = Self.baseArguments(
-            knownHostsFile: knownHostsFile, authentication: authentication
+        let (arguments, redacted) = commandLine(
+            remoteCommand: remoteCommand, redactedCommand: redactedCommand
         )
-        var arguments = base
-        arguments.append("\(username)@\(address)")
-        arguments.append(remoteCommand)
-
-        var redacted = base
-        redacted.append("\(username)@\(address)")
-        redacted.append(redactedCommand ?? remoteCommand)
 
         let result = try await ProcessRunner.run(
             "/usr/bin/ssh", arguments,
@@ -150,6 +133,81 @@ struct SSHCommandRunner: Sendable {
         )
 
         return SSHResult(outcome: Self.classify(result), command: result)
+    }
+
+    /// What a long-lived session adds to every other invocation's options.
+    ///
+    /// `-T` refuses a pseudo-terminal, which would rewrite the bytes of a
+    /// protocol carried over the streams. The keepalives end a session whose
+    /// guest has gone silent within about a minute, rather than leaving it
+    /// waiting on a connection that will never answer.
+    static let sessionOptions = [
+        "-T",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=4"
+    ]
+
+    /// Starts `remoteCommand` in the guest and returns while it runs, with
+    /// each of ssh's streams connected as the caller says.
+    ///
+    /// For a guest program that serves for as long as the caller decides.
+    /// The askpass helper a password needs stays on disk until the child
+    /// exits, rather than for one call.
+    func spawnSession(
+        remoteCommand: String,
+        standardInput: ChildStream,
+        standardOutput: ChildStream,
+        standardError: ChildStream,
+        redactedCommand: String? = nil,
+        stage: VivStage
+    ) throws -> SSHSession {
+        let (helper, environment) = try makeAskpass()
+        let (arguments, redacted) = commandLine(
+            remoteCommand: remoteCommand,
+            redactedCommand: redactedCommand,
+            extraOptions: Self.sessionOptions
+        )
+        let process: SpawnedProcess
+        do {
+            process = try ProcessRunner.spawn(
+                "/usr/bin/ssh", arguments,
+                environment: environment,
+                standardInput: standardInput,
+                standardOutput: standardOutput,
+                standardError: standardError,
+                redactedArguments: redacted,
+                stage: stage
+            )
+        } catch {
+            helper?.remove()
+            throw error
+        }
+        return SSHSession(process: process, askpass: helper)
+    }
+
+    /// The askpass helper and environment this runner's credential needs,
+    /// if it needs one.
+    private func makeAskpass() throws -> (AskpassHelper?, [String: String]?) {
+        guard case let .password(password) = authentication else { return (nil, nil) }
+        let helper = try AskpassHelper()
+        return (helper, helper.environment(password: password))
+    }
+
+    /// ssh's argument vector for `remoteCommand`, and the same vector with
+    /// the command replaced by `redactedCommand` for logs.
+    func commandLine(
+        remoteCommand: String,
+        redactedCommand: String? = nil,
+        extraOptions: [String] = []
+    ) -> (arguments: [String], redacted: [String]) {
+        let base = extraOptions + Self.baseArguments(
+            knownHostsFile: knownHostsFile, authentication: authentication
+        )
+        let destination = "\(username)@\(address)"
+        return (
+            base + [destination, remoteCommand],
+            base + [destination, redactedCommand ?? remoteCommand]
+        )
     }
 
     private static func baseArguments(
@@ -207,6 +265,42 @@ struct SSHCommandRunner: Sendable {
             return .transportFailure(detail.isEmpty ? "ssh exited 255 with no diagnostics" : detail)
         }
         return .remoteExit(result.exitCode)
+    }
+}
+
+/// A long-lived ssh child started by `SSHCommandRunner.spawnSession`, and
+/// the askpass helper that authenticated it.
+///
+/// The helper is removed once the child is observed to exit, whether the
+/// holder stopped it or it ended on its own.
+final class SSHSession: Sendable {
+    let process: SpawnedProcess
+    private let askpass: AskpassHelper?
+
+    fileprivate init(process: SpawnedProcess, askpass: AskpassHelper?) {
+        self.process = process
+        self.askpass = askpass
+        if let askpass {
+            Task.detached {
+                _ = await process.wait()
+                askpass.remove()
+            }
+        }
+    }
+
+    /// Waits for ssh to exit. Returns `nil` if the waiting task is cancelled
+    /// first; the child is unaffected.
+    func wait() async -> ProcessExit? {
+        await process.wait()
+    }
+
+    /// Stops ssh and waits for it to exit, removing the askpass helper
+    /// before returning.
+    @discardableResult
+    func terminate() async -> ProcessExit {
+        let exit = await process.terminate()
+        askpass?.remove()
+        return exit
     }
 }
 
