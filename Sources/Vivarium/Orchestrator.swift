@@ -250,6 +250,9 @@ struct OrchestratorOptions: Sendable {
     var artifactReadOnly = false
     var artifactVolumeName: String?
     var disableRemoteLogin = false
+    /// Write `<run>/heartbeat` from the moment the run directory exists until
+    /// `stopHeartbeat()`, for a run whose process is its only proof of life.
+    var writesHeartbeat = false
 }
 
 /// Owns the run.
@@ -285,6 +288,10 @@ final class Orchestrator {
     private var eventRelay: VMEventRelay?
     private var lastReadinessGate: String?
     private var cleanupCompleted = false
+    private var heartbeat: Task<Void, Never>?
+    /// Set while a browser session runs. The address and SSH readiness loops
+    /// stop waiting once it has caught a signal.
+    private var interruption: SignalWatcher?
     /// Phase timings for `viv run`, in pipeline order.
     private var phases: [PhaseTiming] = []
     /// When each of `phases` began, index for index.
@@ -457,6 +464,9 @@ final class Orchestrator {
         // somewhere to leave failure.json — the copy that survives the bundle.
         if let layout {
             try createDirectory(layout.results, stage: .bundlePreparation)
+            if options.writesHeartbeat {
+                heartbeat = SessionHeartbeat.beat(at: layout.heartbeat)
+            }
         }
         log.attachFile(at: paths.runLog)
         stateLogURL = paths.stateLog
@@ -825,6 +835,7 @@ final class Orchestrator {
         var attempt = 0
 
         while ContinuousClock.now < deadline {
+            try throwIfInterrupted()
             attempt += 1
             guard let candidates = await withTimeout(Timeouts.discoveryAttempt, operation: {
                 await resolver.candidates()
@@ -862,7 +873,7 @@ final class Orchestrator {
             }
 
             log.debug("Attempt \(attempt): no address for \(manifest.macAddress) yet.")
-            try? await Task.sleep(for: delay)
+            await pause(for: delay)
             delay = min(delay * 2, .seconds(15))
         }
 
@@ -894,12 +905,13 @@ final class Orchestrator {
         var lastReason = "no attempt made"
 
         while ContinuousClock.now < deadline {
+            try throwIfInterrupted()
             attempt += 1
 
             if !(await TCPProbe.portIsOpen(host: ssh.address, port: 22, timeout: .seconds(5))) {
                 lastReason = "TCP 22 is not accepting connections"
                 log.debug("Readiness attempt \(attempt): \(lastReason).")
-                try? await Task.sleep(for: delay)
+                await pause(for: delay)
                 delay = min(delay * 2, .seconds(15))
                 continue
             }
@@ -950,7 +962,7 @@ final class Orchestrator {
             }
 
             log.debug("Readiness attempt \(attempt): \(lastReason).")
-            try? await Task.sleep(for: delay)
+            await pause(for: delay)
             delay = min(delay * 2, .seconds(15))
         }
 
@@ -1421,6 +1433,24 @@ final class Orchestrator {
         codeDirectory: URL?,
         commandName: String
     ) async throws -> PreparedGuest {
+        let layout = try await startGuest(
+            templateRoot: templateRoot, codeDirectory: codeDirectory, commandName: commandName
+        )
+        do {
+            return PreparedGuest(layout: layout, ssh: try await reachGuest())
+        } catch {
+            await abandonGuest(after: error)
+            throw error
+        }
+    }
+
+    /// The first half of `bringUpGuest`: clone, stage, and boot. Nothing it
+    /// leaves behind needs releasing if it throws.
+    private func startGuest(
+        templateRoot: URL,
+        codeDirectory: URL?,
+        commandName: String
+    ) async throws -> RunLayout {
         try await measure("materialise") {
             try await prepareBundleFromTemplate(templateRoot)
         }
@@ -1449,15 +1479,15 @@ final class Orchestrator {
         }
 
         try await startProvisionedGuest()
+        return layout
+    }
 
-        do {
-            let ssh = try await measure("boot to ssh") { try await connectToGuest() }
-            try await measure("prepare guest") { try await prepareGuestWorkdir(ssh: ssh) }
-            return PreparedGuest(layout: layout, ssh: ssh)
-        } catch {
-            await abandonGuest(after: error)
-            throw error
-        }
+    /// The second half of `bringUpGuest`: find the guest, authenticate, and
+    /// prepare its workdir. The caller releases the guest if this throws.
+    private func reachGuest() async throws -> SSHCommandRunner {
+        let ssh = try await measure("boot to ssh") { try await connectToGuest() }
+        try await measure("prepare guest") { try await prepareGuestWorkdir(ssh: ssh) }
+        return ssh
     }
 
     /// Copies the run log into `results/`, which is the one directory a run
@@ -1760,6 +1790,37 @@ final class Orchestrator {
 
     // MARK: - Browser sessions
 
+    /// Throws once `interruption` has caught a signal. Never throws outside a
+    /// browser session.
+    private func throwIfInterrupted() throws {
+        guard let signo = interruption?.received else { return }
+        throw VivError(
+            .mcpSession,
+            "Interrupted by \(SessionRace.signalName(signo)) before the session started serving."
+        )
+    }
+
+    /// Sleeps for `duration`, waking early if `interruption` catches a signal.
+    private func pause(for duration: Duration) async {
+        guard let interruption else {
+            try? await Task.sleep(for: duration)
+            return
+        }
+        _ = await withTimeout(duration) { await interruption.wait() }
+    }
+
+    /// Stops rewriting the heartbeat and removes it. Awaits the writer first,
+    /// so a write already under way cannot put the file back.
+    private func stopHeartbeat() async {
+        guard let beating = heartbeat else { return }
+        heartbeat = nil
+        beating.cancel()
+        await beating.value
+        if let layout {
+            try? FileManager.default.removeItem(at: layout.heartbeat)
+        }
+    }
+
     /// `browser`: serves Safari's MCP server from a fresh guest over
     /// `clientInput` and `clientOutput` until the session ends, then tears
     /// the guest down.
@@ -1784,45 +1845,71 @@ final class Orchestrator {
             )
         }
 
-        let guest = try await bringUpGuest(
-            templateRoot: plan.templateRoot,
-            codeDirectory: plan.codeDirectory,
-            commandName: "viv browser"
-        )
-        let layout = guest.layout
-        let ssh = guest.ssh
-
-        // Taken over before the setup steps, so a signal during them ends the
-        // session in order as soon as it starts serving rather than killing
-        // the guest. Held until the end, so a second signal cannot interrupt
-        // the teardown.
+        // Taken over before anything is created, and held to the end. While
+        // the guest is set up, a signal stops the address and SSH waits, and
+        // any step that fails after one arrived ends the session in order: a
+        // Ctrl-C at a terminal also reaches that step's ssh child, which is
+        // often why it failed. A second signal cannot interrupt the teardown.
         let signals = SignalWatcher(signals: SignalWatcher.sessionSignals)
-        defer { signals.stop() }
+        interruption = signals
+        defer {
+            interruption = nil
+            signals.stop()
+        }
 
-        let gateway: String?
-        let served: ServedSession
+        let layout: RunLayout
         do {
-            if let command = plan.appCommand {
-                try await measure("start app") {
-                    try await launchApp(ssh: ssh, command: command, port: plan.appPort, layout: layout)
-                }
-            }
-            gateway = try await measure("configure browser") { try await configureBrowser(ssh: ssh) }
-            served = try await serve(
-                ssh: ssh, plan: plan, layout: layout, gateway: gateway, signals: signals,
-                clientInput: clientInput, clientOutput: clientOutput
+            layout = try await startGuest(
+                templateRoot: plan.templateRoot,
+                codeDirectory: plan.codeDirectory,
+                commandName: "viv browser"
             )
         } catch {
-            try? FileManager.default.removeItem(at: layout.heartbeat)
-            await abandonGuest(after: error)
+            await stopHeartbeat()
             throw error
+        }
+
+        var ssh: SSHCommandRunner?
+        var gateway: String?
+        var served: ServedSession?
+        let end: SessionEnd
+        do {
+            try throwIfInterrupted()
+            let reached = try await reachGuest()
+            ssh = reached
+            if let command = plan.appCommand {
+                try throwIfInterrupted()
+                try await measure("start app") {
+                    try await launchApp(ssh: reached, command: command, port: plan.appPort, layout: layout)
+                }
+            }
+            try throwIfInterrupted()
+            gateway = try await measure("configure browser") { try await configureBrowser(ssh: reached) }
+            try throwIfInterrupted()
+            let session = try await serve(
+                ssh: reached, plan: plan, layout: layout, gateway: gateway, signals: signals,
+                clientInput: clientInput, clientOutput: clientOutput
+            )
+            served = session
+            end = session.end
+        } catch {
+            guard let signo = signals.received else {
+                await abandonGuest(after: error)
+                await stopHeartbeat()
+                throw error
+            }
+            log.warn("Setup stopped after \(SessionRace.signalName(signo)): \(VivError.describe(error))")
+            end = SessionRace.end(forSignal: signo)
+            transition(to: .endingSession)
+            // No proxy ever wrote to it, so the client can have its EOF now.
+            try? clientOutput.close()
         }
 
         var warnings: [String] = []
         var shutdownError: (any Error)?
         if eventRelay?.hasStopped ?? true {
             await forceStopForCleanup()
-        } else {
+        } else if let ssh {
             do {
                 try await measure("shutdown") {
                     try await shutdown(ssh: ssh, order: platform.runShutdownOrder)
@@ -1832,6 +1919,11 @@ final class Orchestrator {
                 warnings.append("the guest did not shut down cleanly: " + VivError.describe(error))
                 log.error("The guest did not shut down cleanly: \(VivError.describe(error))")
             }
+        } else {
+            // Nothing has run in a guest SSH never reached, so there is nothing
+            // for an in-guest shutdown to flush.
+            log.info("The guest was never reached over SSH; stopping it without an in-guest shutdown.")
+            await forceStopForCleanup()
         }
 
         let (artifacts, harvestWarnings) = await measure("harvest") { () async -> ([ArtifactEntry], [String]) in
@@ -1840,16 +1932,24 @@ final class Orchestrator {
         }
         warnings += harvestWarnings
 
-        let orderly = served.end.reason.isOrderly && shutdownError == nil
+        // Beats until here: gc must not take the bundle of a session that is
+        // still shutting down or harvesting.
+        await stopHeartbeat()
+
+        let orderly = end.reason.isOrderly && shutdownError == nil
         transition(to: orderly ? .succeeded : .failed)
-        finish(outcome: served.end.reason.rawValue)
+        finish(outcome: end.reason.rawValue)
         preserveRunLog(in: layout)
-        try? FileManager.default.removeItem(at: layout.heartbeat)
         let deleted: [String]
         if orderly {
             deleted = deleteHeavyRemains(of: layout)
         } else {
-            log.info("Keeping \(layout.root.path): the session ended because \(served.end.detail).")
+            log.info(
+                "Keeping \(layout.root.path): "
+                    + (shutdownError == nil
+                        ? "the session ended because \(end.detail)."
+                        : "the guest did not shut down cleanly.")
+            )
             deleted = []
         }
 
@@ -1857,10 +1957,11 @@ final class Orchestrator {
             runID: manifest.runID,
             vivariumVersion: Viv.releaseVersion,
             startedAt: startedAt,
-            servingStartedAt: served.servingStartedAt,
+            servingStartedAt: served?.servingStartedAt,
             endedAt: Date(),
-            endReason: served.end.reason,
-            endDetail: served.end.detail,
+            endReason: end.reason,
+            endDetail: end.detail,
+            orderly: orderly,
             templatePath: plan.templateRoot.path,
             guestOSVersion: manifest.guestOSVersion,
             guestUsername: credentials.username,
@@ -1875,9 +1976,9 @@ final class Orchestrator {
                 SessionPhaseTiming(name: $0.name, startedAt: $1, seconds: $0.seconds)
             },
             states: stateTimings(),
-            framesToServer: served.framesToServer,
-            framesToClient: served.framesToClient,
-            shareWriteRetries: served.shareWriteRetries,
+            framesToServer: served?.framesToServer ?? 0,
+            framesToClient: served?.framesToClient ?? 0,
+            shareWriteRetries: served?.shareWriteRetries ?? 0,
             artifactCount: artifacts.count,
             artifacts: artifacts,
             warnings: warnings,
@@ -1886,8 +1987,8 @@ final class Orchestrator {
         )
         try JSONCoding.write(report, to: layout.sessionReport)
         log.info(
-            "Session over: \(served.end.detail). \(served.framesToServer) frame(s) to the server, "
-                + "\(served.framesToClient) to the client; \(artifacts.count) artifact(s) in "
+            "Session over: \(end.detail). \(report.framesToServer) frame(s) to the server, "
+                + "\(report.framesToClient) to the client; \(artifacts.count) artifact(s) in "
                 + "\(layout.resultsArtifacts.path); report at \(layout.sessionReport.path)."
         )
         return report
@@ -2010,7 +2111,6 @@ final class Orchestrator {
 
         transition(to: .serving)
         let servingStartedAt = Date()
-        let heartbeat = SessionHeartbeat.beat(at: layout.heartbeat)
         log.info(BrowserSessionReport.banner(
             runID: manifest.runID,
             guest: "\(credentials.username)@\(ssh.address)",
@@ -2027,6 +2127,14 @@ final class Orchestrator {
             {
                 guard let ended = await proxyEnded.wait() else { return nil }
                 return SessionRace.end(for: ended)
+            },
+            {
+                // The proxy reports a client's EOF only once the server has
+                // answered and closed its output too. The server gets the
+                // drain window for that, and the session ends either way.
+                guard await proxy.waitForClientEOF() else { return nil }
+                _ = await withTimeout(Timeouts.proxyDrain, operation: { await proxyEnded.wait() })
+                return SessionRace.end(for: .clientEOF)
             },
             {
                 guard let exit = await session.wait() else { return nil }
@@ -2060,12 +2168,16 @@ final class Orchestrator {
         log.info("Ending the session: \(end.detail).")
 
         transition(to: .endingSession)
-        heartbeat.cancel()
         proxy.stop()
         let serverExit = await session.terminate()
         log.info("The MCP server's ssh process ended: \(serverExit).")
         if await withTimeout(Timeouts.proxyDrain, operation: { await proxyEnded.wait() }) == nil {
             log.warn("The proxy did not finish within \(Timeouts.proxyDrain) of the server ending.")
+        } else {
+            // EOF for the client now rather than when this process exits after
+            // the teardown. Only once the proxy has finished, because a pump
+            // still writing would otherwise write to a closed descriptor.
+            try? clientOutput.close()
         }
 
         return ServedSession(

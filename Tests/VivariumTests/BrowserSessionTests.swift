@@ -133,10 +133,23 @@ struct BrowserSessionBookkeepingTests {
         )
         #expect(text.contains("http://192.168.64.1:<port>/"))
         #expect(text.contains("npm run dev, listening on port 5173"))
-        #expect(text.contains("http://localhost:5173/"))
+        #expect(text.contains("Safari reaches it at http://localhost:5173/"))
         #expect(text.contains("/runs/r1/Shared/artifacts"))
         #expect(text.contains("after 2 h"))
         #expect(text.contains("after 20 min without traffic"))
+    }
+
+    @Test("an app without --app-port is said to have no known URL")
+    func bannerWithoutPort() {
+        let text = BrowserSessionReport.banner(
+            runID: "r1", guest: "vivadmin@192.168.64.23", gateway: nil,
+            appCommand: "npm run dev", appPort: nil,
+            sharedArtifacts: URL(fileURLWithPath: "/runs/r1/Shared/artifacts"),
+            maxLifetime: .seconds(60), idleTimeout: .seconds(60)
+        )
+        #expect(text.contains("started without --app-port"))
+        #expect(!text.contains("localhost:"))
+        #expect(text.contains("the guest reported no default gateway"))
     }
 
     @Test("the session report round-trips with its end reason as a word")
@@ -150,6 +163,7 @@ struct BrowserSessionBookkeepingTests {
             endedAt: started.addingTimeInterval(600),
             endReason: .idleTimeout,
             endDetail: "no MCP traffic in either direction for 20 min",
+            orderly: true,
             templatePath: "/templates/macos-26B118.bundle",
             guestOSVersion: "27.2",
             guestUsername: "vivadmin",
@@ -178,6 +192,7 @@ struct BrowserSessionBookkeepingTests {
             try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
         )
         #expect(object["endReason"] as? String == "idleTimeout")
+        #expect(object["orderly"] as? Bool == true)
         #expect(object["gatewayAddress"] as? String == "192.168.64.1")
         #expect(object["framesToServer"] as? Int == 12)
         #expect(object["artifactCount"] as? Int == 1)

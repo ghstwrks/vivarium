@@ -47,8 +47,10 @@ enum VivariumMain {
         exit(code)
     }
 
+    /// The throwing write, for the reason `Logger` gives: the other raises an
+    /// exception when nothing is reading.
     private static func write(_ text: String, to handle: FileHandle) {
-        handle.write(Data((text + "\n").utf8))
+        try? handle.write(contentsOf: Data((text + "\n").utf8))
     }
 }
 
@@ -1011,7 +1013,9 @@ struct BrowserCommand: AsyncParsableCommand {
 
             The words after -- are the app under test. They are started in \
             the guest's copy of --code, detached, with their output in app.log \
-            among the artifacts; with --app-port the session waits until \
+            among the artifacts. The command must stay in the foreground: one \
+            that daemonises and returns, such as `docker compose up -d`, is \
+            reported as having exited. With --app-port the session waits until \
             something in the guest listens on that port, and Safari reaches it \
             at http://localhost:<port>/. Without an app, Safari reaches a \
             server on this Mac at the guest's gateway address, which the \
@@ -1019,15 +1023,19 @@ struct BrowserCommand: AsyncParsableCommand {
             the guest can reach, such as 0.0.0.0, not only on 127.0.0.1.
 
             The session ends when standard input closes; on SIGINT, SIGTERM, \
-            or SIGHUP; after --max-lifetime; after --idle-timeout with no \
-            traffic in either direction; or when the server or the guest \
-            stops. The guest is then shut down, the artifacts are copied into \
+            or SIGHUP, including during setup once the guest has started; \
+            after --max-lifetime; after --idle-timeout with no traffic in \
+            either direction; or when the server or the guest stops. The guest \
+            is then shut down, the artifacts are copied into \
             results/artifacts, and results/session.json is written. The bundle \
-            is deleted unless the server or the guest ended the session.
+            is deleted only when the client or the operator ended the session \
+            and the guest shut down cleanly; otherwise it is kept for \
+            inspection.
 
-            Exits 0 when the client or the operator ended the session, 1 when \
-            the server or the guest did, and 70 when the session could not be \
-            set up.
+            Exits 0 when the client or the operator ended the session and the \
+            guest shut down cleanly, 1 when the server or the guest ended it or \
+            the guest did not shut down cleanly, and 70 when the session could \
+            not be set up.
             """
     )
 
@@ -1139,6 +1147,7 @@ struct BrowserCommand: AsyncParsableCommand {
         // Safari is driven in the console session that auto-login opens.
         options.logsInAutomatically = true
         options.includesArtifactDisk = false
+        options.writesHeartbeat = true
 
         let report: BrowserSessionReport
         do {
@@ -1152,7 +1161,7 @@ struct BrowserCommand: AsyncParsableCommand {
         } catch {
             throw InfrastructureFailure(error)
         }
-        guard report.endReason.isOrderly else { throw ExitCode(ExitStatus.testFailure) }
+        guard report.orderly else { throw ExitCode(ExitStatus.testFailure) }
     }
 
     /// Checks everything that can be wrong with the request before a guest

@@ -33,8 +33,9 @@ enum SessionEndReason: String, Codable, Sendable {
     case proxyFailed
 
     /// Whether the client or the operator ended the session, as opposed to
-    /// the server or the guest failing it. Only such a session earns the
-    /// deletion of its bundle and exit status 0.
+    /// the server or the guest failing it. Only such a session, and only
+    /// with a clean guest shutdown after it, earns the deletion of its bundle
+    /// and exit status 0.
     var isOrderly: Bool {
         switch self {
         case .clientClosed, .signal, .maxLifetime, .idleTimeout: return true
@@ -187,7 +188,10 @@ final class ShareWriteRetryCounter: @unchecked Sendable {
         lock.lock()
         count += 1
         lock.unlock()
-        log.warn("The share refused a write for request \(denial.requestID); sending it once more.")
+        log.info(
+            "The share refused Safari's write for request \(denial.requestID), as it usually "
+                + "does once per session; sending the request again."
+        )
         return true
     }
 
@@ -247,6 +251,10 @@ struct BrowserSessionReport: Codable, Sendable {
     let endedAt: Date
     let endReason: SessionEndReason
     let endDetail: String
+    /// Whether the client or the operator ended the session and the guest
+    /// then shut down cleanly. This alone decides that the bundle was deleted
+    /// and that `viv browser` exits 0.
+    let orderly: Bool
 
     let templatePath: String
     let guestOSVersion: String?
@@ -297,8 +305,9 @@ struct BrowserSessionReport: Codable, Sendable {
                 ?? "unknown — the guest reported no default gateway")
         ]
         if let appCommand {
-            rows.append(("app", appCommand + (appPort.map { ", listening on port \($0)" } ?? "")
-                + " — open http://localhost:\(appPort.map(String.init) ?? "<port>")/ in the guest"))
+            rows.append(("app", appCommand + (appPort.map {
+                ", listening on port \($0) — Safari reaches it at http://localhost:\($0)/"
+            } ?? " — started without --app-port, so nothing waited for it or knows its URL")))
         }
         rows.append(("artifacts", sharedArtifacts.path))
         rows.append(("ends", "on stdin EOF, SIGINT/SIGTERM/SIGHUP, after "
