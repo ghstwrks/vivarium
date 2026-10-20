@@ -208,4 +208,63 @@ struct MCPFrameRewriterTests {
             .replacingOccurrences(of: "\"id\": 5", with: "\"id\": \"abc\"").utf8)
         #expect(rewriter.serverToClient(response).shareWriteDenied?.requestID == .string("abc"))
     }
+
+    // MARK: Guest-chosen paths
+
+    private func response(saying text: String) -> Data {
+        Data("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"\(text)\"}]}}".utf8)
+    }
+
+    private func rewriterWithHostDirectory() throws -> (MCPFrameRewriter, URL) {
+        let root = try temporaryDirectory()
+        let artifacts = root.appendingPathComponent("artifacts")
+        try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
+        return (MCPFrameRewriter(mapping: MCPPathMapping(hostArtifactsDirectory: artifacts.path)), artifacts)
+    }
+
+    @Test("a path that climbs out of the artifacts directory is not rewritten")
+    func refusesParentTraversal() throws {
+        let (rewriter, _) = try rewriterWithHostDirectory()
+        let escaping = response(saying: "Saved to \(Self.guestDirectory)/../../etc/passwd now")
+        #expect(rewriter.serverToClient(escaping).frame == escaping)
+    }
+
+    @Test("a symlink in the artifacts directory is not presented as a host file")
+    func refusesSymlinks() throws {
+        let (rewriter, artifacts) = try rewriterWithHostDirectory()
+        let secret = artifacts.deletingLastPathComponent().appendingPathComponent("secret.txt")
+        try Data("s".utf8).write(to: secret)
+        try FileManager.default.createSymbolicLink(
+            at: artifacts.appendingPathComponent("link.png"), withDestinationURL: secret)
+        let outside = artifacts.deletingLastPathComponent().appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("s".utf8).write(to: outside.appendingPathComponent("inner.png"))
+        try FileManager.default.createSymbolicLink(
+            at: artifacts.appendingPathComponent("dir"), withDestinationURL: outside)
+
+        for name in ["link.png", "dir/inner.png"] {
+            let reply = response(saying: "Saved to '\(Self.guestDirectory)/\(name)'.")
+            #expect(rewriter.serverToClient(reply).frame == reply)
+        }
+    }
+
+    @Test("an existing regular file is rewritten, and a refused path does not stop later ones")
+    func rewritesRegularFiles() throws {
+        let (rewriter, artifacts) = try rewriterWithHostDirectory()
+        try Data("png".utf8).write(to: artifacts.appendingPathComponent("a.png"))
+        let reply = response(saying: "\(Self.guestDirectory)/../x then '\(Self.guestDirectory)/a.png'")
+        let (frame, _) = rewriter.serverToClient(reply)
+        #expect(try text(of: frame) == "\(Self.guestDirectory)/../x then '\(artifacts.path)/a.png'")
+    }
+
+    @Test("a client-chosen savePath outside the share is not watched for denials")
+    func ignoresPathsOutsideTheShare() {
+        let rewriter = makeRewriter()
+        _ = rewriter.clientToServer(call("screenshot", id: 5, arguments: "{\"savePath\":\"/tmp/mine.png\"}"))
+        #expect(rewriter.serverToClient(Self.denialResponse).shareWriteDenied == nil)
+
+        _ = rewriter.clientToServer(call("screenshot", id: 5,
+            arguments: "{\"savePath\":\"\(Self.guestDirectory)/mine.png\"}"))
+        #expect(rewriter.serverToClient(Self.denialResponse).shareWriteDenied != nil)
+    }
 }

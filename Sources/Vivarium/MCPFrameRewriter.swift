@@ -44,7 +44,7 @@ struct ShareWriteDenial: Sendable {
 /// `savePath` is given one inside the guest artifacts directory, so the file
 /// lands on the share instead of in a guest temporary directory the host
 /// cannot see. Toward the client, guest artifact paths in result text become
-/// host paths.
+/// host paths, provided they stay inside the host artifacts directory.
 ///
 /// A frame that needs no change is returned byte for byte. A frame that does is
 /// re-serialised with sorted keys, so its key order and number formatting may
@@ -88,15 +88,19 @@ final class MCPFrameRewriter: @unchecked Sendable {
         }
 
         var forwarded = line
-        if arguments["savePath"] == nil {
+        let writesToShare: Bool
+        if let chosen = arguments["savePath"] {
+            writesToShare = (chosen as? String)?.hasPrefix(mapping.guestArtifactsDirectory + "/") == true
+        } else {
             arguments["savePath"] = savePath(for: tool, format: arguments["format"] as? String)
             params["arguments"] = arguments
             message["params"] = params
             guard let rewritten = Self.serialise(message) else { return line }
             forwarded = rewritten
+            writesToShare = true
         }
 
-        if let id = Self.requestID(of: message) {
+        if writesToShare, let id = Self.requestID(of: message) {
             lock.lock()
             pendingSaves[id] = forwarded
             lock.unlock()
@@ -128,10 +132,7 @@ final class MCPFrameRewriter: @unchecked Sendable {
         var permissionDenied = false
         for index in content.indices {
             guard var item = content[index] as? [String: Any], let text = item["text"] as? String else { continue }
-            let hostText = text.replacingOccurrences(
-                of: mapping.guestArtifactsDirectory + "/",
-                with: mapping.hostArtifactsDirectory + "/"
-            )
+            let hostText = hostPaths(in: text)
             if hostText != text {
                 item["text"] = hostText
                 content[index] = item
@@ -149,6 +150,50 @@ final class MCPFrameRewriter: @unchecked Sendable {
         result["content"] = content
         message["result"] = result
         return (Self.serialise(message) ?? line, denial)
+    }
+
+    /// Replaces each guest artifact path in `text` with its host path.
+    ///
+    /// The guest chooses what the server reports, so a path is only rewritten
+    /// when it resolves to a regular file inside the host artifacts directory;
+    /// any other path is left as the guest wrote it.
+    private func hostPaths(in text: String) -> String {
+        let guestPrefix = mapping.guestArtifactsDirectory + "/"
+        var output = ""
+        var cursor = text.startIndex
+        while let match = text.range(of: guestPrefix, range: cursor..<text.endIndex) {
+            output += text[cursor..<match.lowerBound]
+            let end = text[match.upperBound...].firstIndex(where: Self.endsPath) ?? text.endIndex
+            let relative = text[match.upperBound..<end]
+            if let host = hostPath(forRelative: String(relative)) {
+                output += host
+            } else {
+                output += text[match.lowerBound..<end]
+            }
+            cursor = end
+        }
+        output += text[cursor...]
+        return output
+    }
+
+    private static func endsPath(_ character: Character) -> Bool {
+        character.isWhitespace || "'\"`\u{2018}\u{2019}\u{201C}\u{201D}".contains(character)
+    }
+
+    private func hostPath(forRelative relative: String) -> String? {
+        let directory = URL(fileURLWithPath: mapping.hostArtifactsDirectory).standardizedFileURL.path
+        let candidate = URL(fileURLWithPath: mapping.hostArtifactsDirectory + "/" + relative)
+        guard candidate.standardizedFileURL.path.hasPrefix(directory + "/") else { return nil }
+
+        var status = stat()
+        if lstat(candidate.path, &status) == 0 {
+            guard status.st_mode & S_IFMT == S_IFREG else { return nil }
+            let resolvedDirectory = URL(fileURLWithPath: directory).resolvingSymlinksInPath().path
+            guard candidate.resolvingSymlinksInPath().path.hasPrefix(resolvedDirectory + "/") else { return nil }
+        } else if errno != ENOENT && errno != ENOTDIR {
+            return nil
+        }
+        return mapping.hostArtifactsDirectory + "/" + relative
     }
 
     private func savePath(for tool: SaveTool, format: String?) -> String {
