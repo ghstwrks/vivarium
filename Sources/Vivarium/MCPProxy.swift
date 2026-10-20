@@ -9,10 +9,17 @@ enum MCPProxyEnd: Sendable {
     case serverEOF
     /// `stop()` was called, or the task running the proxy was cancelled.
     case stopped
-    /// A frame could not be delivered, typically because the peer went away.
-    case writeFailed(any Error)
+    /// A frame could not be delivered to `peer`, typically because it went
+    /// away.
+    case writeFailed(MCPPeer, any Error)
     /// A frame grew past the proxy's size limit before its line ended.
     case frameTooLarge
+}
+
+/// One of the two ends an `MCPProxy` writes to.
+enum MCPPeer: Sendable, Equatable {
+    case client
+    case server
 }
 
 /// Carries newline-delimited JSON-RPC frames between an MCP client and an MCP
@@ -284,7 +291,8 @@ final class MCPProxy: @unchecked Sendable {
                 scanned = pending.count
             }
         } catch {
-            return .writeFailed(error)
+            // Each direction writes only to the side it is named for.
+            return .writeFailed(direction == .toServer ? .server : .client, error)
         }
     }
 
@@ -352,7 +360,7 @@ final class MCPProxy: @unchecked Sendable {
             do {
                 try deliver(rewriter.clientToServer(request) + Data([0x0A]), .toServer, counting: true)
             } catch {
-                return .writeFailed(error)
+                return .writeFailed(.server, error)
             }
         }
     }

@@ -29,7 +29,7 @@ enum SessionEndReason: String, Codable, Sendable {
     case idleTimeout
     /// The virtual machine stopped underneath the session.
     case guestStopped
-    /// A frame could not be delivered to one side or the other.
+    /// The proxy could not carry a frame, such as one past its size limit.
     case proxyFailed
 
     /// Whether the client or the operator ended the session, as opposed to
@@ -130,10 +130,17 @@ enum SessionRace {
             return SessionEnd(reason: .serverExited, detail: "the MCP server closed its output")
         case .stopped:
             return nil
-        case let .writeFailed(error):
+        case let .writeFailed(.client, error):
             return SessionEnd(
-                reason: .proxyFailed,
-                detail: "a frame could not be delivered: " + VivError.describe(error)
+                reason: .clientClosed,
+                detail: "the MCP client stopped reading its output ("
+                    + VivError.describe(error) + ")"
+            )
+        case let .writeFailed(.server, error):
+            return SessionEnd(
+                reason: .serverExited,
+                detail: "the MCP server stopped reading its input ("
+                    + VivError.describe(error) + ")"
             )
         case .frameTooLarge:
             return SessionEnd(

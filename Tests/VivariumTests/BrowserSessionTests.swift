@@ -65,7 +65,8 @@ struct SessionRaceTests {
         struct Broken: Error {}
         #expect(SessionRace.end(for: .clientEOF)?.reason == .clientClosed)
         #expect(SessionRace.end(for: .serverEOF)?.reason == .serverExited)
-        #expect(SessionRace.end(for: .writeFailed(Broken()))?.reason == .proxyFailed)
+        #expect(SessionRace.end(for: .writeFailed(.client, Broken()))?.reason == .clientClosed)
+        #expect(SessionRace.end(for: .writeFailed(.server, Broken()))?.reason == .serverExited)
         #expect(SessionRace.end(for: .frameTooLarge)?.reason == .proxyFailed)
         #expect(SessionRace.end(for: .stopped) == nil)
     }
