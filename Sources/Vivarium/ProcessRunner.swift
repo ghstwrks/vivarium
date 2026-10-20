@@ -145,8 +145,8 @@ enum ProcessRunner {
         // exactly once, and a handler attached afterwards races the child: a
         // short-lived process can exit first, and the notification is then lost
         // with nothing left to wake the waiter.
-        let exited = TerminationLatch()
-        process.terminationHandler = { _ in exited.signal() }
+        let exited = OneShot<Void>()
+        process.terminationHandler = { _ in exited.fulfil(()) }
 
         do {
             try process.run()
@@ -275,11 +275,14 @@ enum ProcessRunner {
     /// here and turns any surprise into a run that hangs until someone notices.
     static let defaultTimeout = Duration.seconds(600)
 
+    /// How long a process is given to act on SIGTERM before it is sent SIGKILL.
+    static let terminationGrace = Duration.seconds(5)
+
     /// Waits for the process, terminating it if `timeout` elapses first.
     /// Returns whether the timeout fired.
     private static func waitForExit(
         _ process: Process,
-        exited: TerminationLatch,
+        exited: OneShot<Void>,
         timeout: Duration?
     ) async -> Bool {
         let deadline = timeout ?? defaultTimeout
@@ -289,55 +292,198 @@ enum ProcessRunner {
             guard process.isRunning else { return }
             didTimeOut.set()
             log.warn("Process \(process.processIdentifier) exceeded its timeout; sending SIGTERM.")
-            process.terminate()
-            try await Task.sleep(for: .seconds(5))
-            guard process.isRunning else { return }
-            log.warn("Process \(process.processIdentifier) ignored SIGTERM; sending SIGKILL.")
-            kill(process.processIdentifier, SIGKILL)
+            try await sendTerminationSignals(to: process, grace: terminationGrace)
         }
 
-        await exited.wait()
+        await exited.waitIgnoringCancellation()
         killer.cancel()
         return didTimeOut.value
     }
+
+    /// Sends SIGTERM, then SIGKILL if the process is still running once
+    /// `grace` has passed.
+    ///
+    /// Returns when the signals have been sent, not when the process has
+    /// exited; the caller awaits the exit itself and cancels this once it has
+    /// seen it, which ends the grace period early.
+    fileprivate static func sendTerminationSignals(to process: Process, grace: Duration) async throws {
+        guard process.isRunning else { return }
+        process.terminate()
+        try await Task.sleep(for: grace)
+        guard process.isRunning else { return }
+        log.warn("Process \(process.processIdentifier) ignored SIGTERM; sending SIGKILL.")
+        kill(process.processIdentifier, SIGKILL)
+    }
 }
 
-/// A one-shot gate between Foundation's termination callback and the waiting
-/// task.
-///
-/// The termination handler may run before or after `wait()`. Recording the
-/// signal under a lock makes both orders safe and avoids depending on a
-/// run-loop poll to observe process termination.
-final class TerminationLatch: @unchecked Sendable {
-    private let lock = NSLock()
-    private var hasExited = false
-    private var continuation: CheckedContinuation<Void, Never>?
+extension ProcessRunner {
+    /// Starts `executable` and returns as soon as it is running, handing the
+    /// child to the caller rather than waiting for it.
+    ///
+    /// For a child that lives as long as the caller decides, such as one
+    /// serving a protocol over the streams it is given. Unlike `run`, nothing
+    /// here imposes a timeout, creates a pipe, or nulls standard input: each
+    /// stream is connected exactly as the caller says.
+    static func spawn(
+        _ executable: String,
+        _ arguments: [String],
+        environment: [String: String]? = nil,
+        standardInput: ChildStream,
+        standardOutput: ChildStream,
+        standardError: ChildStream,
+        redactedArguments: [String]? = nil,
+        stage: VivStage
+    ) throws -> SpawnedProcess {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        if let environment {
+            process.environment = environment
+        }
+        if let stream = standardInput.processValue { process.standardInput = stream }
+        if let stream = standardOutput.processValue { process.standardOutput = stream }
+        if let stream = standardError.processValue { process.standardError = stream }
 
-    func signal() {
-        lock.lock()
-        guard !hasExited else { return lock.unlock() }
-        hasExited = true
-        let waiter = continuation
-        continuation = nil
-        lock.unlock()
-        waiter?.resume()
+        let description = ([executable] + (redactedArguments ?? arguments)).joined(separator: " ")
+        let exited = OneShot<ProcessExit>()
+        let terminationRequested = AtomicFlag()
+        // Installed before `run()` for the same reason as in `run`: a child
+        // that exits at once would otherwise never be observed to exit.
+        process.terminationHandler = { ended in
+            let exit = ProcessExit(
+                status: ended.terminationStatus,
+                reason: ended.terminationReason,
+                wasTerminated: terminationRequested.value
+            )
+            log.debug("\(description) -> \(exit)")
+            exited.fulfil(exit)
+        }
+
+        do {
+            try process.run()
+        } catch {
+            throw VivError(stage, "Failed to launch \(executable).", underlying: error)
+        }
+
+        return SpawnedProcess(
+            process: process,
+            description: description,
+            exited: exited,
+            terminationRequested: terminationRequested
+        )
     }
+}
 
-    func wait() async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            lock.lock()
-            if hasExited {
-                lock.unlock()
-                continuation.resume()
-            } else {
-                self.continuation = continuation
-                lock.unlock()
-            }
+/// Where one of a spawned child's standard streams is connected.
+enum ChildStream {
+    /// The same stream this process has.
+    case inherited
+    /// `/dev/null`.
+    case nullDevice
+    /// A file handle the caller opened and keeps: the child gets a duplicate
+    /// of its descriptor, so the caller's copy stays open until it closes it.
+    case fileHandle(FileHandle)
+    /// A pipe whose other end the caller reads or writes. The child's end is
+    /// closed in this process once the child has launched, so closing the
+    /// caller's end of a standard-input pipe delivers EOF to the child.
+    case pipe(Pipe)
+
+    /// What `Process` expects for this stream, or `nil` to keep its default,
+    /// which is inheritance.
+    fileprivate var processValue: Any? {
+        switch self {
+        case .inherited: return nil
+        case .nullDevice: return FileHandle.nullDevice
+        case let .fileHandle(handle): return handle
+        case let .pipe(pipe): return pipe
         }
     }
 }
 
-/// A one-way boolean shared between the waiting task and the timeout task.
+/// How a spawned child ended.
+struct ProcessExit: Sendable, Equatable, CustomStringConvertible {
+    /// The exit code, or the signal number when `reason` is `.uncaughtSignal`.
+    let status: Int32
+    let reason: Process.TerminationReason
+    /// Whether `SpawnedProcess.terminate()` had been called by the time the
+    /// child ended, which tells an exit the holder caused from one it did not.
+    let wasTerminated: Bool
+
+    var succeeded: Bool { reason == .exit && status == 0 }
+
+    var description: String {
+        (reason == .exit ? "exit \(status)" : "signal \(status)")
+            + (wasTerminated ? " (terminated)" : "")
+    }
+}
+
+/// A child started by `ProcessRunner.spawn`, owned by whoever holds this.
+///
+/// The child's lifetime is not bound to this object or to any task: dropping
+/// the handle, or cancelling a task waiting on it, leaves the child running.
+/// The holder ends it with `terminate()`, or learns from `wait()` that it
+/// ended on its own.
+final class SpawnedProcess: Sendable {
+    let pid: pid_t
+    /// The executable and its redacted arguments, for log lines.
+    let description: String
+
+    private let process: Process
+    private let exited: OneShot<ProcessExit>
+    private let terminationRequested: AtomicFlag
+
+    fileprivate init(
+        process: Process,
+        description: String,
+        exited: OneShot<ProcessExit>,
+        terminationRequested: AtomicFlag
+    ) {
+        self.process = process
+        self.pid = process.processIdentifier
+        self.description = description
+        self.exited = exited
+        self.terminationRequested = terminationRequested
+    }
+
+    /// Whether the child has yet to be observed to exit. Never suspends.
+    var isRunning: Bool { exited.value == nil }
+
+    /// How the child ended, or `nil` while it is still running. Never suspends.
+    var exit: ProcessExit? { exited.value }
+
+    /// Waits for the child to exit.
+    ///
+    /// Returns `nil` if the waiting task is cancelled first, which makes this
+    /// safe to race against other events in a task group; the child itself is
+    /// unaffected. Safe to call repeatedly, and after the child has exited.
+    func wait() async -> ProcessExit? {
+        await exited.wait()
+    }
+
+    /// Stops the child and waits for it to exit: SIGTERM, then SIGKILL if it
+    /// is still running after `grace`.
+    ///
+    /// The signals are sent from a task of their own, so cancelling the caller
+    /// does not interrupt the escalation. Returns at once if the child has
+    /// already exited.
+    @discardableResult
+    func terminate(grace: Duration = ProcessRunner.terminationGrace) async -> ProcessExit {
+        if let exit { return exit }
+        terminationRequested.set()
+        log.info("Stopping process \(pid) (\(description)); sending SIGTERM.")
+        let process = self.process
+        let escalation = Task {
+            try await ProcessRunner.sendTerminationSignals(to: process, grace: grace)
+        }
+        guard let exit = await exited.waitIgnoringCancellation() else {
+            preconditionFailure("a spawned process's exit latch is never closed")
+        }
+        escalation.cancel()
+        return exit
+    }
+}
+
+/// A one-way boolean shared between tasks and callbacks.
 final class AtomicFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var flag = false
