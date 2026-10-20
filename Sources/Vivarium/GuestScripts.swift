@@ -127,6 +127,105 @@ struct GuestScripts: Sendable {
         """
     }
 
+    /// How long `appLaunchScript` waits for the app's port by default.
+    static let defaultAppPortTimeoutSeconds = 120
+
+    /// The file in `$VIV_ARTIFACTS` that a launched app's output goes to.
+    static let appLogFilename = "app.log"
+
+    /// The line prefix `browserSetupScript` reports the guest's default
+    /// gateway under, on stdout.
+    static let gatewayLinePrefix = "gateway "
+
+    /// Starts the app under test in the workdir, detached, and waits for its
+    /// port when one is given.
+    ///
+    /// The app outlives the ssh session that starts it and ends with the
+    /// guest. Its stdin is `/dev/null`: this script itself arrives on the
+    /// shell's stdin, and a child left reading it would swallow the rest of
+    /// the script. The port counts as open once either loopback address
+    /// accepts a connection, because a dev server bound to `localhost` may
+    /// listen on `::1` alone.
+    func appLaunchScript(
+        command: String,
+        port: Int?,
+        portTimeoutSeconds: Int = GuestScripts.defaultAppPortTimeoutSeconds
+    ) -> String {
+        var script = """
+        set -eu
+
+        cd "\(Self.workdirShellExpression)"
+        export VIV_ARTIFACTS=\(ShellEscaping.singleQuoted(artifactsGuestPath))
+        log="$VIV_ARTIFACTS/\(Self.appLogFilename)"
+
+        /usr/bin/nohup \(shellExecutable) -c \(ShellEscaping.singleQuoted(command)) \\
+            </dev/null >>"$log" 2>&1 &
+        app=$!
+        printf 'viv: the app is running as pid %s\\n' "$app"
+        """
+
+        guard let port else { return script }
+        script += """
+
+
+        port=\(port)
+        limit=\(portTimeoutSeconds)
+        waited=0
+        until /usr/bin/nc -z 127.0.0.1 "$port" >/dev/null 2>&1 \\
+            || /usr/bin/nc -z ::1 "$port" >/dev/null 2>&1; do
+            if ! kill -0 "$app" 2>/dev/null; then
+                printf 'viv: the app exited before anything listened on port %s\\n' "$port" >&2
+                /usr/bin/tail -n 40 "$log" >&2 || true
+                exit 31
+            fi
+            if [ "$waited" -ge "$limit" ]; then
+                printf 'viv: nothing listened on port %s within %s seconds\\n' "$port" "$limit" >&2
+                /usr/bin/tail -n 40 "$log" >&2 || true
+                exit 32
+            fi
+            /bin/sleep 1
+            waited=$((waited + 1))
+        done
+        printf 'viv: port %s accepted a connection after %s seconds\\n' "$port" "$waited"
+        """
+        return script
+    }
+
+    /// Prepares Safari for remote automation, keeps the display awake, and
+    /// reports the guest's default gateway. macOS guests only.
+    ///
+    /// Needs no root: the per-user `AllowRemoteAutomation` preference is all
+    /// `safaridriver --mcp` requires. Raising the ten-minute display sleep
+    /// with `pmset` would need root, so a detached `caffeinate` holds the
+    /// display awake instead, until the guest shuts down. The gateway is the
+    /// host as the guest sees it, printed on stdout after
+    /// `gatewayLinePrefix`, and empty when the guest has no default route.
+    var browserSetupScript: String {
+        """
+        set -eu
+
+        if [ ! -x /usr/bin/safaridriver ]; then
+            printf 'viv: /usr/bin/safaridriver is missing, so this guest has no Safari MCP server\\n' >&2
+            exit 40
+        fi
+
+        webdriver="$HOME/Library/WebDriver"
+        plist="$webdriver/com.apple.Safari.plist"
+        /bin/mkdir -p "$webdriver"
+        # `add` refuses a key that is already there, as it is in a template
+        # that was prepared by hand.
+        if ! /usr/libexec/PlistBuddy -c 'add AllowRemoteAutomation bool true' "$plist" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c 'set AllowRemoteAutomation true' "$plist"
+        fi
+
+        /usr/bin/nohup /usr/bin/caffeinate -dims </dev/null >/dev/null 2>&1 &
+        /usr/bin/defaults -currentHost write com.apple.screensaver idleTime -int 0 || true
+
+        gateway=$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/gateway:/ { print $2; exit }')
+        printf '\(Self.gatewayLinePrefix)%s\\n' "$gateway"
+        """
+    }
+
     func harvestScript(patterns: [String]) -> String {
         let artifacts = ShellEscaping.singleQuoted(artifactsGuestPath)
 
