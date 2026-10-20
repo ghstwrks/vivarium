@@ -366,6 +366,20 @@ struct MCPProxyTests {
         #expect((error as? POSIXError)?.code == .EPIPE)
     }
 
+    @Test("the client's EOF is observable before a server that keeps its output open finishes")
+    func clientEOFObservable() async throws {
+        let harness = Harness()
+        let running = Task { await harness.proxy.run() }
+        defer { harness.close() }
+
+        try harness.clientIn.fileHandleForWriting.close()
+        let observed = await withTimeout(.seconds(5)) { await harness.proxy.waitForClientEOF() }
+        #expect(observed == true)
+
+        harness.proxy.stop()
+        _ = await running.value
+    }
+
     @Test("a client that has gone away is a write failure on the client's side")
     func reportsClientWriteFailure() async throws {
         let clientIn = Pipe()

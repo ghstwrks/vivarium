@@ -89,6 +89,7 @@ final class MCPProxy: @unchecked Sendable {
     private let toServerDone = OneShot<Void>()
     private let toClientDone = OneShot<Void>()
     private let resenderDone = OneShot<Void>()
+    private let clientInputEnded = OneShot<Void>()
 
     /// - Parameters:
     ///   - retryShareWriteDenial: Asked when the server reports that the share
@@ -250,6 +251,14 @@ final class MCPProxy: @unchecked Sendable {
         serverInputClosed = true
         try? serverIn.close()
         serverWriteLock.unlock()
+        clientInputEnded.fulfil(())
+    }
+
+    /// Waits for the client to close its input, which `run()` reports only
+    /// once the server has also finished. Returns `false` if the waiting task
+    /// is cancelled first.
+    func waitForClientEOF() async -> Bool {
+        await clientInputEnded.wait() != nil
     }
 
     private func pump(_ direction: Direction) -> MCPProxyEnd {
