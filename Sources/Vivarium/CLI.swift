@@ -1236,6 +1236,12 @@ struct GCCommand: AsyncParsableCommand {
             the directory's own modification date, when there is no report). \
             --all deletes every run directory outright, kept-for-inspection \
             and reportless ones included.
+
+            A `viv browser` session rewrites <run>/heartbeat every 30 seconds \
+            while it serves. A run whose heartbeat is fresh is skipped by \
+            every mode, --all included, because its guest is still running \
+            from that bundle; one whose heartbeat is more than five minutes \
+            old lost the process serving it, and counts as finished.
             """
     )
 
