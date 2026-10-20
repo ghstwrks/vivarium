@@ -81,12 +81,17 @@ final class VMEventRelay: NSObject, VZVirtualMachineDelegate, @unchecked Sendabl
         }
     }
 
-    /// Whether the guest has already been observed to stop.
-    var hasStopped: Bool {
+    /// How the guest stopped, if it already has. Never suspends, so a caller
+    /// can check between steps without starting a wait it would then have to
+    /// cancel.
+    var currentOutcome: StopOutcome? {
         lock.lock()
         defer { lock.unlock() }
-        return outcome != nil
+        return outcome
     }
+
+    /// Whether the guest has already been observed to stop.
+    var hasStopped: Bool { currentOutcome != nil }
 
     /// Releases every waiter, for teardown paths where nothing more will arrive.
     func finish() {
@@ -97,7 +102,9 @@ final class VMEventRelay: NSObject, VZVirtualMachineDelegate, @unchecked Sendabl
         for continuation in pending { continuation.resume(returning: nil) }
     }
 
-    private func record(_ newOutcome: StopOutcome) {
+    /// Records how the guest stopped and releases every waiter with it. The
+    /// delegate callbacks report through this.
+    func record(_ newOutcome: StopOutcome) {
         lock.lock()
         // First terminal event wins: a stop followed by an error report should
         // not rewrite history into a failure.
